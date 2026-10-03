@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.webp" alt="Tanki Flashback" width="100%">
+</p>
+
 # Tanki Flashback
 
 Сервер для старого клиента танков и браузерный клиент к нему на патченом Ruffle: игра, которая
