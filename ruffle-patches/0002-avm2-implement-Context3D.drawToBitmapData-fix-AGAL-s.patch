@@ -1,0 +1,358 @@
+From 8254db80d75b302f0509642d1e7a2c12d85c0313 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 19:45:47 +0300
+Subject: [PATCH 02/17] avm2: implement Context3D.drawToBitmapData, fix AGAL
+ swizzle on short vectors, drop Erase blends
+
+---
+ .../avm2/globals/flash/display/bitmap_data.rs |  6 ++
+ .../avm2/globals/flash/display/graphics.rs    |  6 ++
+ .../avm2/globals/flash/display3D/Context3D.as |  4 +-
+ .../globals/flash/display3D/context_3d.rs     | 57 +++++++++++++++++++
+ core/src/avm2/object/context3d_object.rs      | 13 +++++
+ core/src/display_object.rs                    | 12 +++-
+ core/src/drawing.rs                           | 37 ++++++++++++
+ render/naga-agal/src/builder.rs               | 18 ++++++
+ 8 files changed, 149 insertions(+), 4 deletions(-)
+
+diff --git a/core/src/avm2/globals/flash/display/bitmap_data.rs b/core/src/avm2/globals/flash/display/bitmap_data.rs
+index 57ca11ff..9575d3bd 100644
+--- a/core/src/avm2/globals/flash/display/bitmap_data.rs
++++ b/core/src/avm2/globals/flash/display/bitmap_data.rs
+@@ -457,6 +457,7 @@ pub fn set_pixel32<'gc>(
+     this: Value<'gc>,
+     args: &[Value<'gc>],
+ ) -> Result<Value<'gc>, Error<'gc>> {
++
+     let this = this.as_object().unwrap();
+ 
+     if let Some(bitmap_data) = this.as_bitmap_data() {
+@@ -485,6 +486,7 @@ pub fn set_pixels<'gc>(
+     this: Value<'gc>,
+     args: &[Value<'gc>],
+ ) -> Result<Value<'gc>, Error<'gc>> {
++
+     let this = this.as_object().unwrap();
+ 
+     let rectangle = args.get_object(activation, 0, "rect")?;
+@@ -749,6 +751,7 @@ pub fn lock<'gc>(
+     _this: Value<'gc>,
+     _args: &[Value<'gc>],
+ ) -> Result<Value<'gc>, Error<'gc>> {
++
+     // `BitmapData.lock` tells Flash Player to temporarily stop updating the player's
+     // dirty region for any Bitmap stage instances displaying this BitmapData.
+     // Normally, each call to `setPixel` etc. causes Flash to update the player dirty
+@@ -768,6 +771,7 @@ pub fn unlock<'gc>(
+     _this: Value<'gc>,
+     _args: &[Value<'gc>],
+ ) -> Result<Value<'gc>, Error<'gc>> {
++
+     // No effect (see comments for `lock`).
+     Ok(Value::Undefined)
+ }
+@@ -1062,6 +1066,7 @@ pub fn fill_rect<'gc>(
+     this: Value<'gc>,
+     args: &[Value<'gc>],
+ ) -> Result<Value<'gc>, Error<'gc>> {
++
+     let this = this.as_object().unwrap();
+ 
+     let rectangle = args.get_object(activation, 0, "rect")?;
+@@ -1130,6 +1135,7 @@ pub fn apply_filter<'gc>(
+     this: Value<'gc>,
+     args: &[Value<'gc>],
+ ) -> Result<Value<'gc>, Error<'gc>> {
++
+     let this = this.as_object().unwrap();
+ 
+     if let Some(dest_bitmap) = this.as_bitmap_data() {
+diff --git a/core/src/avm2/globals/flash/display/graphics.rs b/core/src/avm2/globals/flash/display/graphics.rs
+index fdfdf3ed..7ad581f3 100644
+--- a/core/src/avm2/globals/flash/display/graphics.rs
++++ b/core/src/avm2/globals/flash/display/graphics.rs
+@@ -75,6 +75,7 @@ pub fn begin_bitmap_fill<'gc>(
+         let is_repeating = args.get_bool(2);
+         let is_smoothed = args.get_bool(3);
+ 
++
+         let handle = bitmap.bitmap_handle(activation.gc(), activation.context.renderer);
+ 
+         let bitmap = ruffle_render::bitmap::BitmapInfo {
+@@ -1067,6 +1068,8 @@ pub fn draw_triangles<'gc>(
+             "winding behavior"
+         );
+ 
++
++
+         draw_triangles_internal(
+             activation,
+             &mut drawing,
+@@ -1379,6 +1382,7 @@ fn draw_triangles_internal<'gc>(
+     {
+         let original_fill = drawing.current_fill_style().cloned();
+ 
++
+         for (points, [i0, i1, i2]) in data
+             .iter_triangles_with_vertex_indices()
+             .filter(|&(tri, _)| !culling.cull(tri))
+@@ -1400,6 +1404,7 @@ fn draw_triangles_internal<'gc>(
+                 is_repeating,
+             }));
+ 
++
+             let [a, b, c] = points;
+             drawing.draw_command(DrawCommand::MoveTo(a));
+             drawing.draw_command(DrawCommand::LineTo(b));
+@@ -1471,6 +1476,7 @@ pub fn line_bitmap_style<'gc>(
+         let is_repeating = args.get_bool(2);
+         let is_smoothed = args.get_bool(3);
+ 
++
+         let handle = bitmap.bitmap_handle(activation.gc(), activation.context.renderer);
+ 
+         let bitmap = ruffle_render::bitmap::BitmapInfo {
+diff --git a/core/src/avm2/globals/flash/display3D/Context3D.as b/core/src/avm2/globals/flash/display3D/Context3D.as
+index 9765ce0d..4a88c6a7 100644
+--- a/core/src/avm2/globals/flash/display3D/Context3D.as
++++ b/core/src/avm2/globals/flash/display3D/Context3D.as
+@@ -203,9 +203,7 @@ package flash.display3D {
+             actionOnDepthPassStencilFail:String = "keep"
+         ):void;
+ 
+-        public function drawToBitmapData(destination:BitmapData):void {
+-            stub_method("flash.display3D.Context3D", "drawToBitmapData");
+-        }
++        public native function drawToBitmapData(destination:BitmapData):void;
+ 
+         public native function dispose(recreate:Boolean = true):void;
+     }
+diff --git a/core/src/avm2/globals/flash/display3D/context_3d.rs b/core/src/avm2/globals/flash/display3D/context_3d.rs
+index 1051b409..55bfe418 100644
+--- a/core/src/avm2/globals/flash/display3D/context_3d.rs
++++ b/core/src/avm2/globals/flash/display3D/context_3d.rs
+@@ -192,6 +192,7 @@ pub fn draw_triangles<'gc>(
+     this: Value<'gc>,
+     args: &[Value<'gc>],
+ ) -> Result<Value<'gc>, Error<'gc>> {
++
+     let this = this.as_object().unwrap();
+ 
+     if let Some(context) = this.as_context_3d() {
+@@ -839,3 +840,59 @@ pub fn dispose<'gc>(
+         .clear_context3d(activation.gc());
+     Ok(Value::Undefined)
+ }
++
++/// Implements `Context3D.drawToBitmapData`.
++///
++/// Копирует текущий бэкбуфер контекста в переданный BitmapData. Игра использует это, чтобы
++/// показать результат 3D-рендера обычным `Bitmap` — так устроено превью танка в гараже
++/// ProTanki: без этой операции панель остаётся залитой цветом очистки бэкбуфера.
++pub fn draw_to_bitmap_data<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Value<'gc>,
++    args: &[Value<'gc>],
++) -> Result<Value<'gc>, Error<'gc>> {
++    let this = this.as_object().unwrap();
++
++    let Some(context) = this.as_context_3d() else {
++        return Ok(Value::Undefined);
++    };
++
++    let destination = args.get_object(activation, 0, "destination")?;
++    let Some(destination) = destination.as_bitmap_data() else {
++        return Ok(Value::Undefined);
++    };
++    destination.check_valid(activation)?;
++
++
++
++    let source = context.back_buffer_handle();
++
++    let mut commands = ruffle_render::commands::CommandList::new();
++    ruffle_render::commands::CommandHandler::render_bitmap(
++        &mut commands,
++        source,
++        ruffle_render::transform::Transform::default(),
++        false,
++        ruffle_render::bitmap::PixelSnapping::Never,
++    );
++
++    let region = ruffle_render::bitmap::PixelRegion::for_whole_size(
++        destination.width(),
++        destination.height(),
++    );
++    let (target, _) = destination.overwrite_cpu_pixels_from_gpu(activation.gc());
++    let handle = destination.bitmap_handle(activation.gc(), activation.context.renderer);
++    let quality = activation.context.stage.quality();
++
++    if let Some(sync_handle) = activation
++        .context
++        .renderer
++        .render_offscreen(handle, commands, quality, region)
++    {
++        target
++            .borrow_mut(activation.gc())
++            .set_gpu_dirty(activation.gc(), sync_handle, region);
++    }
++
++    Ok(Value::Undefined)
++}
+diff --git a/core/src/avm2/object/context3d_object.rs b/core/src/avm2/object/context3d_object.rs
+index f77568c1..a64f6b38 100644
+--- a/core/src/avm2/object/context3d_object.rs
++++ b/core/src/avm2/object/context3d_object.rs
+@@ -226,6 +226,7 @@ impl<'gc> Context3DObject<'gc> {
+         first_index: u32,
+         mut num_triangles: i32,
+     ) {
++
+         if num_triangles == -1 {
+             // FIXME - should we error if the number of indices isn't a multiple of 3?
+             num_triangles = (index_buffer.count() / 3) as i32;
+@@ -273,6 +274,7 @@ impl<'gc> Context3DObject<'gc> {
+         });
+     }
+ 
++
+     pub fn set_render_to_texture(
+         self,
+         texture: Rc<dyn Texture>,
+@@ -280,6 +282,7 @@ impl<'gc> Context3DObject<'gc> {
+         anti_alias: u32,
+         surface_selector: u32,
+     ) {
++
+         self.with_context_3d(|ctx| {
+             ctx.process_command(Context3DCommand::SetRenderToTexture {
+                 texture,
+@@ -291,6 +294,7 @@ impl<'gc> Context3DObject<'gc> {
+     }
+ 
+     pub fn set_render_to_back_buffer(self) {
++
+         self.with_context_3d(|ctx| ctx.process_command(Context3DCommand::SetRenderToBackBuffer));
+     }
+ 
+@@ -299,8 +303,17 @@ impl<'gc> Context3DObject<'gc> {
+     }
+ 
+     // Renders our finalized frame to the screen, as part of the Ruffle rendering process.
++    /// Handle бэкбуфера — им же Stage3D композитится на сцену.
++    ///
++    /// Нужен `Context3D.drawToBitmapData`: игра рисует кадр на GPU, а затем копирует его в
++    /// BitmapData и показывает как обычный Bitmap (так устроено превью танка в гараже).
++    pub fn back_buffer_handle(self) -> ruffle_render::bitmap::BitmapHandle {
++        self.with_context_3d(|context3d| context3d.bitmap_handle())
++    }
++
+     pub fn render(self, context: &mut RenderContext<'_, 'gc>) {
+         self.with_context_3d(|context3d| {
++
+             if context3d.should_render() {
+                 let handle = context3d.bitmap_handle();
+ 
+diff --git a/core/src/display_object.rs b/core/src/display_object.rs
+index daaa0ece..baa70b8e 100644
+--- a/core/src/display_object.rs
++++ b/core/src/display_object.rs
+@@ -1150,7 +1150,17 @@ pub fn render_base<'gc>(
+             } else {
+                 RenderBlendMode::Builtin(blend_mode.try_into().unwrap())
+             };
+-            context.commands.blend(sub_commands, render_blend_mode);
++            // Erase punches a hole through the layer it sits in — that is how Flash content cuts a
++            // window in the UI for the Stage3D layer underneath (ProTanki does this for the garage
++            // tank preview). Ruffle's layer tracking does not reach the erase through the
++            // intermediate containers this content uses, so the rect was composited as an opaque
++            // fill and covered the 3D view. Dropping it leaves the hole, which is what the content
++            // expects; erasing already-drawn pixels of the same layer is not supported either way.
++            if matches!(blend_mode, ExtendedBlendMode::Erase) {
++                // nothing to draw: the hole is the effect
++            } else {
++                context.commands.blend(sub_commands, render_blend_mode);
++            }
+         }
+     }
+ 
+diff --git a/core/src/drawing.rs b/core/src/drawing.rs
+index 8722613f..4827d93b 100644
+--- a/core/src/drawing.rs
++++ b/core/src/drawing.rs
+@@ -114,6 +114,43 @@ impl Drawing {
+         self.new_fill(style, Some(self.default_winding_rule));
+     }
+ 
++    /// Число накопленных путей — используется диагностикой (у мешей их сотни).
++    pub fn path_count(&self) -> usize {
++        self.paths.len()
++    }
++
++    /// Краткое описание первой заливки — для диагностики перекрывающих фигур.
++    pub fn first_fill_debug(&self) -> String {
++        for path in &self.paths {
++            if let DrawingPath::Fill(fill) = path {
++                return match &fill.style {
++                    FillStyle::Color(c) => format!("color rgba({},{},{},{})", c.r, c.g, c.b, c.a),
++                    FillStyle::Bitmap { id, .. } => format!("bitmap#{id}"),
++                    other => format!("{other:?}"),
++                };
++            }
++        }
++        "нет заливки".into()
++    }
++
++    /// Все заливки drawing'а — для диагностики перекрывающих поверхностей.
++    pub fn all_fills_debug(&self) -> String {
++        let mut out = Vec::new();
++        for path in &self.paths {
++            if let DrawingPath::Fill(fill) = path {
++                out.push(match &fill.style {
++                    FillStyle::Color(c) => format!("color({},{},{},{})", c.r, c.g, c.b, c.a),
++                    FillStyle::Bitmap { id, .. } => {
++                        let size = self.bitmaps.get(*id as usize).map(|b| (b.width, b.height));
++                        format!("bitmap#{id}{size:?}")
++                    }
++                    other => format!("{other:?}"),
++                });
++            }
++        }
++        out.join(", ")
++    }
++
+     /// Current fill style, if any.
+     ///
+     /// Needed by `Graphics.drawTriangles`: with uvt data it textures each triangle with the
+diff --git a/render/naga-agal/src/builder.rs b/render/naga-agal/src/builder.rs
+index d3c5c677..8ecd2513 100644
+--- a/render/naga-agal/src/builder.rs
++++ b/render/naga-agal/src/builder.rs
+@@ -1048,6 +1048,24 @@ impl<'a> NagaBuilder<'a> {
+             _ => unreachable!(),
+         });
+ 
++        // AGAL lets a swizzle name components the source register does not have: reading `.z` of a
++        // float2 attribute is legal there and yields the register's padding. Naga is stricter and
++        // rejects the module ("Swizzle component Z is outside of vector size Bi"), which aborts
++        // shader compilation and takes the whole player down with it. Widen the source to a vec4
++        // (padded with 0,0,0,1, matching how Flash fills unused components) whenever the swizzle
++        // reaches past it, so the pattern is always in range.
++        let used_components = swizzle_flags.iter().copied().max().unwrap_or(0) + 1;
++        let available_components = match source_type {
++            VertexAttributeFormat::Float1 => 1,
++            VertexAttributeFormat::Float2 => 2,
++            VertexAttributeFormat::Float3 => 3,
++            VertexAttributeFormat::Float4 | VertexAttributeFormat::Bytes4 => 4,
++        };
++
++        if used_components > available_components && source_type != VertexAttributeFormat::Float4 {
++            base_expr = source_type.extend_to_float4(base_expr, self)?;
++        }
++
+         Ok(self.evaluate_expr(Expression::Swizzle {
+             size: output,
+             vector: base_expr,
+-- 
+2.51.1.windows.1
+

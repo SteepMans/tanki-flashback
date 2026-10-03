@@ -1,0 +1,456 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>TO</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #101010; color: #ccc;
+               font: 12px/1.45 Consolas, monospace; overflow: hidden; }
+  #player { position: absolute; inset: 0; }
+  #player > * { width: 100% !important; height: 100% !important; }
+  /* Полоса лога и счётчик показываются только в режиме отладки: ?debug=1 или клавиша F8. */
+  body.debug #player { inset: 0 0 160px 0; }
+  #log { display: none; position: absolute; left: 0; right: 0; bottom: 0; height: 160px;
+         overflow-y: auto; background: #000; border-top: 1px solid #333;
+         padding: 4px 8px; white-space: pre-wrap; }
+  body.debug #log { display: block; }
+  .err { color: #ff6b6b; }
+  .warn { color: #ffd166; }
+  .ok { color: #7ee787; }
+</style>
+</head>
+<body>
+<div id="player"></div>
+<div id="log"></div>
+
+<script>
+// ── Режим отладки ─────────────────────────────────────────────────────────────────────────────
+// Обычному игроку ни полоса логов, ни счётчик кадров не нужны — без них игра занимает всё окно.
+// Включается адресом (?debug=1, а также ?log=debug и ?log=trace) или клавишей F8 прямо в игре.
+const params = new URLSearchParams(location.search);
+
+// Чёткость текста. В клиенте нет вшитых шрифтов: движок рисует подписи своим запасным шрифтом
+// без хинтинга, поэтому мелкий текст выглядит мыльным. Множитель разрешения заставляет рисовать
+// кадр подробнее экрана, браузер сжимает его обратно — текст становится чётче ценой нагрузки
+// на видеокарту. По умолчанию включён (x2), переключается флажком «Чёткая отрисовка (x2)» в
+// настройках игры (вкладка «Игра»), а ?render=<число> задаёт множитель принудительно.
+const RENDER_SCALE_KEY = "to.renderScale2x";
+const renderScaleForced = Number(params.get("render")) || 0;
+const renderScaleOn = () => localStorage.getItem(RENDER_SCALE_KEY) !== "0";
+const applyRenderScale = () => {
+  window.ruffleRenderScale = renderScaleForced || (renderScaleOn() ? 2 : 1);
+};
+// Флажок в настройках дёргает этот хук через ExternalInterface: без аргумента — узнать текущее
+// значение при отрисовке окна настроек, с аргументом — сохранить новое. Множитель движок
+// перечитывает каждый кадр, так что перезапуск не нужен.
+window.ruffleRenderScale2x = (value) => {
+  if (value !== undefined) {
+    localStorage.setItem(RENDER_SCALE_KEY, value ? "1" : "0");
+    applyRenderScale();
+  }
+  return renderScaleOn();
+};
+applyRenderScale();
+
+// ?nofusion=1 — выключить склейку инструкций в интерпретаторе. Нужно, чтобы сравнивать
+// «до/после» на одной сборке: разброс между двумя сборками больше самой разницы.
+window.ruffleNoFusion = params.get("nofusion") === "1";
+// ?nonative=1 — считать горячие методы движка байткодом, как раньше. Нужно, чтобы сверять
+// картинку и скорость нативных замен с оригиналом на одной сборке.
+window.ruffleNoNativePaths = params.get("nonative") === "1";
+// ?noic=1 — выключить инлайн-кэши обращений к свойствам: имя свойства будет искаться в таблице
+// методов каждый раз, как раньше.
+window.ruffleNoInlineCaches = params.get("noic") === "1";
+// ?ops=1 — считать выполненные инструкции по видам. Само по себе заметно замедляет игру, зато
+// показывает, на что уходит кадр; для замеров скорости не включать.
+window.ruffleTraceOps = params.get("ops") === "1";
+// ?validatenative=1 — считать и нативно, и байткодом, сверяя ответы. Медленно, зато доказывает
+// совпадение на живой сцене; расхождения пишутся в лог как «native mismatch».
+window.ruffleValidateNative = params.get("validatenative") === "1";
+// ?nosocketwake=1 — не будить плеер на каждом входящем пакете сокета, а доставлять их раз в
+// кадр, как раньше. Нужно, чтобы мерить вклад немедленной доставки в пинг на одной сборке.
+window.ruffleNoSocketWake = params.get("nosocketwake") === "1";
+// ?catchup=1 — вернуть догон кадров фильма (до пяти за тик), как в обычном Ruffle. По умолчанию
+// догон выключен: кадры сверх одного за тик никто не увидит, а их ActionScript занимает главный
+// поток и задерживает события сокета. Флаг нужен для сравнения «до/после» на одной сборке.
+window.ruffleFrameCatchup = params.get("catchup") === "1";
+// ?hitches=1 — писать отдельную строку на каждый провал кадра. По умолчанию раз в секунду
+// печатается сводка: при сплошных провалах отдельные строки и читать невозможно, и сама печать
+// съедает кадр. Отдельные строки нужны, когда ловишь единичный провал.
+window.ruffleHitchEveryFrame = params.get("hitches") === "1";
+const debugMode = {
+  on: params.get("debug") === "1" || ["debug", "trace"].includes(params.get("log") || ""),
+  listeners: [],
+  set(value) {
+    this.on = value;
+    document.body.classList.toggle("debug", value);
+    this.listeners.forEach((fn) => fn(value));
+  },
+};
+addEventListener("keydown", (e) => {
+  if (e.key === "F8") debugMode.set(!debugMode.on);
+});
+addEventListener("DOMContentLoaded", () => debugMode.set(debugMode.on));
+document.body.classList.toggle("debug", debugMode.on);
+
+// ── Панель логов: Ruffle пишет ошибки в консоль, а нам их надо видеть на странице ──────────────
+// Хранится только хвост. Раньше полоса росла без предела: узел DOM на каждую строку и
+// `scrollTop = scrollHeight` следом, то есть принудительный пересчёт вёрстки контейнера, в котором
+// к концу часа игры десятки тысяч детей. Замер за 16 минут боя: 18 400 -> 23 200 узлов страницы.
+// Пока панель спрятана (обычный режим, без F8), узлы не строятся вовсе — только строки в буфере.
+const logEl = document.getElementById("log");
+const LOG_LIMIT = 300;
+const logBuffer = [];
+function logNode(entry) {
+  const line = document.createElement("div");
+  if (entry.cls) line.className = entry.cls;
+  line.textContent = entry.text;
+  return line;
+}
+function redrawLog() {
+  logEl.textContent = "";
+  for (const entry of logBuffer) logEl.appendChild(logNode(entry));
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function say(msg, cls) {
+  const entry = { text: new Date().toLocaleTimeString() + "  " + msg, cls };
+  logBuffer.push(entry);
+  if (logBuffer.length > LOG_LIMIT) logBuffer.shift();
+  if (!debugMode.on) return;
+  logEl.appendChild(logNode(entry));
+  while (logEl.childElementCount > LOG_LIMIT) logEl.removeChild(logEl.firstChild);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+// Включили полосу клавишей F8 — показываем накопленный хвост; выключили — освобождаем узлы.
+debugMode.listeners.push((on) => (on ? redrawLog() : (logEl.textContent = "")));
+// Декодер MP3 (symphonia) сыплет предупреждениями на каждый кадр звука и топит в них полезные
+// строки — в панель их не пускаем.
+const NOISE = /symphonia|mpa: invalid main_data_begin|estimating duration from bitrate/;
+
+for (const level of ["log", "info", "warn", "error"]) {
+  const orig = console[level].bind(console);
+  console[level] = (...args) => {
+    orig(...args);
+    if (args.some((a) => NOISE.test(String(a)))) return;
+    say(args.map((a) => (a && a.stack) ? a.stack : String(a)).join(" "),
+        level === "error" ? "err" : level === "warn" ? "warn" : null);
+  };
+}
+window.addEventListener("error", (e) => say("page error: " + e.message, "err"));
+window.addEventListener("unhandledrejection", (e) => say("promise: " + e.reason, "err"));
+
+// ── Конфиг Ruffle ─────────────────────────────────────────────────────────────────────────────
+// Браузер не умеет сырой TCP: Ruffle подменяет flash.net.Socket на WebSocket к proxyUrl, а
+// websockify на той стороне разворачивает поток обратно в TCP до игрового порта. Байты не
+// трогаются, формат кадра (int32 длина | int32 packetId | тело) остаётся прежним.
+const ORIGIN = location.protocol + "//" + location.host;
+// На проде всегда wss через тот же хост и путь /ws (его терминирует ingress) — даже если
+// страницу открыли по http (порт 1338 снаружи закрыт файрволом, ws:// повис бы в pending).
+// Прямой ws://host:1338 остаётся только для локальной разработки.
+const LOCAL_DEV = ["localhost", "127.0.0.1"].includes(location.hostname);
+const WS = LOCAL_DEV && location.protocol !== "https:"
+    ? "ws://" + location.hostname + ":1338"
+    : "wss://" + location.host + "/ws";
+
+// Сборка Ruffle: ?ruffle=stable — релиз 0.5.0, иначе сегодняшний nightly. Обе лежат рядом,
+// переключение нужно, чтобы отделять баги игры от багов эмулятора (например, Error #2130 на
+// SharedObject.flush()).
+// ?ruffle=stable — релиз 0.5.0, ?ruffle=nightly — сборка апстрима, по умолчанию — своя
+// (ruffle-src/ + ruffle-patches/): в ней реализовано наложение текстур в drawTriangles.
+const BUILD = { stable: "ruffle", nightly: "ruffle-nightly" }[
+  new URLSearchParams(location.search).get("ruffle")] || "ruffle-local";
+window.RufflePlayer = window.RufflePlayer || {};
+window.RufflePlayer.config = {
+  publicPath: "/web/" + BUILD + "/",
+  // Ruffle сопоставляет host+port точно, поэтому КАЖДЫЙ адрес, на который может пойти клиент,
+  // должен быть перечислен здесь. Все варианты уводим в один и тот же websockify, а он — в
+  // локальный игровой порт 1337.
+  //
+  // Третья запись обязательна, хотя адрес и не наш. Клиент забирает config.xml, но всё равно
+  // пробует запасной адрес, зашитый в его собственный library.swf, и без этой записи получает
+  // "Connection error" ещё до экрана входа. Запись не ведёт наружу — ровно наоборот: она
+  // перехватывает попытку и уводит её на локальный сервер, так же как urlRewriteRules ниже
+  // перехватывает телеметрию. Если у вашей сборки клиента запасной адрес другой, подставьте его.
+  socketProxy: [
+    { host: "127.0.0.1", port: 1337, proxyUrl: WS },
+    { host: "localhost", port: 1337, proxyUrl: WS },
+    { host: "194.67.196.216", port: 25565, proxyUrl: WS }
+  ],
+  // Клиент шлёт POST'ы на зашитый в library.swf адрес телеметрии:
+  //   'http://755779336:19402/aborigine'   (755779336 = 0x2D0C4708 = 45.12.71.8)
+  // В браузере это выглядит как запросы на сторонний сервер, которые CORS блокирует на чтении
+  // ответа, но САМИ ЗАПРОСЫ УХОДЯТ (один вернул 413 Payload Too Large). Локальному стенду это не
+  // нужно и данные наружу слать незачем — уводим на свою заглушку.
+  urlRewriteRules: [
+    [/^https?:\/\/(45\.12\.71\.8|755779336):19402\/.*$/, "/web/noop"]
+  ],
+  autoplay: "on",
+  unmuteOverlay: "hidden",
+  contextMenu: "off",
+  splashScreen: false,
+  // ?log=debug / ?log=trace — поднять подробность логов Ruffle. На trace он печатает работу
+  // display-list и загрузчиков, что и нужно, чтобы поймать, где теряется экран гаража.
+  logLevel: new URLSearchParams(location.search).get("log") || "info",
+  allowScriptAccess: true,
+  // noScale, а не showAll: игра верстает интерфейс вручную от stage.stageWidth/stageHeight
+  // (так же делает и десктопный клиент — StandaloneLoader ставит stage.scaleMode = noScale).
+  // При showAll сцена остаётся 800x800 из заголовка SWF и растягивается, а панели, привязанные к
+  // правому краю, уезжают за пределы этих 800 и просто не видны — в лобби оставался один чат,
+  // гараж не показывался вовсе.
+  scale: "noScale",
+  // Качество отрисовки: на нём завязано сглаживание текста. Клиент по умолчанию просит
+  // низкое (у него своя настройка графики), из-за чего подписи выглядят мылом.
+  quality: new URLSearchParams(location.search).get("quality") || "high",
+  // Частота кадров задаётся В ИГРЕ: настройки -> «Графика» -> «Предельная частота кадров»
+  // (ползунок до 120, патч browser-fps-slider). Значение оттуда уходит в stage.frameRate, а
+  // Ruffle слушает этот setter, только пока частота НЕ задана здесь. Поэтому по умолчанию null;
+  // ?fps=<число> оставлен как отладочная заглушка и на время своего действия отключает ползунок.
+  frameRate: Number(new URLSearchParams(location.search).get("fps")) || null,
+  wmode: "direct"
+};
+
+(async () => {
+  say("грузим Ruffle (" + BUILD + ")…");
+  await import("/web/" + BUILD + "/ruffle.js");
+
+  const player = window.RufflePlayer.newest().createPlayer();
+  document.getElementById("player").appendChild(player);
+
+  // Prelauncher.swf НЕ используется: он AIR-only (NativeApplication, NativeWindow, File,
+  // FileStream, Screen, flash.desktop, flash.filesystem) — в браузере падает сразу, отсюда был
+  // чёрный экран. Loader.swf (GameLoader) чист от AIR и сам тянет config.xml → library.swf → Game,
+  // базовый адрес берёт из flashvar `resources`.
+  // Имена flashvar'ов сняты с байткода GameLoader:
+  //   config    -> URL конфига целиком: configLoader.load(parameters.config + "?rand=" + random)
+  //   resources -> база для библиотеки: parameters.resources + "/" + ("hardware.swf"|"software.swf")
+  //   force_gpu -> isGpuEnabled() = GPUCapabilities.gpuEnabled || parameters.force_gpu
+  // GPU форсируем: сервер раздаёт только hardware.swf, software.swf на нём нет (404), поэтому
+  // падение проверки Stage3D увело бы загрузчик в тупик.
+  say("грузим Loader.swf (config=" + ORIGIN + "/config.xml)…", "ok");
+  try {
+    await player.ruffle().load({
+      url: "/Loader.swf",
+      parameters: {
+        config: ORIGIN + "/config.xml",
+        // Не ORIGIN: на Stage3D Ruffle умирает — его транслятор AGAL -> WGSL выдаёт невалидный
+        // шейдер ("Swizzle component Z is outside of vector size Bi"), wgpu его отклоняет, и
+        // Ruffle паникует на первом же drawTriangles, унося весь инстанс. Поэтому подсовываем
+        // программный рендерер ProTanki (webclient/sw/, взят с официального зеркала): в нём нет
+        // ни одного обращения к display3D/Context3D/Stage3D. GameLoader сам выбирает между
+        // hardware.swf и software.swf по своей проверке GPU, поэтому в /web/sw/ лежит одна и та
+        // же CPU-версия под обоими именами — какую бы ветку он ни выбрал.
+        // По умолчанию — аппаратный рендерер (Stage3D). Он заработал после починки трансляции
+        // AGAL: запись в отдельные компоненты приёмника брала нулевую компоненту источника, из-за
+        // чего преобразованные позиции схлопывались и сцена оставалась пустой.
+        // ?sw=1 — вернуться на программный рендерер из /web/sw (медленный, но не требует GPU).
+        resources: new URLSearchParams(location.search).get("sw") === "1"
+            ? ORIGIN + "/web/sw"
+            : ORIGIN,
+        // Вторая ступень: onComplete после движка вызывает loadLibrary(), а тот грузит ровно
+        // parameters.swf — полный URL игровой библиотеки (в ней класс Game). Затем onComplete
+        // приходит второй раз, уже с engineLoaded=true, и делает getDefinition("Game").
+        // Не /library.swf с ресурсного сервера, а браузерная копия из webclient/: в ней патчем
+        // browser-nostorage заглушен SharedObject.flush() подсистемы кэша ресурсов. Под Ruffle он
+        // бросал Error #2130, исключение вылетало из dispatchEvent в BatchTextureConstructor и
+        // обрывало догрузку (гараж не открывался). Десктопный клиент получает оригинал и свой
+        // дисковый кэш сохраняет. Пересборка:
+        //   node scripts/patch-client.js --only browser-nostorage \
+        //        --base resources/library.swf --out webclient/library.swf
+        swf: ORIGIN + "/web/library.swf",
+        force_gpu: "1",
+        lang: "RU",
+        locale: "RU"
+        // debug НЕ передавать: в onComplete ветка `if (parameters.debug) { log("complete"); return; }`
+        // стоит ПЕРЕД инициализацией, поэтому с этим флагом загрузчик молча замирает на "complete".
+      },
+      allowNetworking: "all",
+      allowScriptAccess: true
+    });
+    say("SWF загружен, дальше — сама игра.", "ok");
+  } catch (err) {
+    say("не удалось загрузить SWF: " + err, "err");
+  }
+})();
+
+// ── Профилировщик поверх игры ─────────────────────────────────────────────────────────────────
+// Раз в секунду Ruffle кладёт замеры в window.ruffleStats: частота, время ActionScript и
+// отрисовки, худший кадр за секунду, вызовы Stage3D, а в развёрнутом режиме — ещё и список самых
+// горячих методов игры. Показываем это графиком и таблицей, чтобы просадку было видно сразу.
+//
+//   F8  — режим отладки (панель логов снизу + этот профилировщик)
+//   F9  — свернуть/развернуть: в развёрнутом виде включается счётчик горячих методов игры
+//         (он сам по себе стоит несколько процентов кадра, поэтому по умолчанию выключен)
+(() => {
+  const HISTORY = 120;                 // секунд на графике
+  const BUDGET_60 = 1000 / 60;         // 16.7 мс — бюджет кадра для 60 кадров в секунду
+  const BUDGET_30 = 1000 / 30;         // 33.3 мс — ниже этого уже заметный провал
+  const history = [];
+  let expanded = false;
+
+  const panel = document.createElement("div");
+  // Слева по центру экрана: сверху мешает панель с чатом и счётом, снизу — панель припасов.
+  panel.style.cssText = "position:absolute;left:12px;top:50%;transform:translateY(-50%);z-index:10;" +
+      "background:rgba(0,0,0,.68);border:1px solid #333;padding:6px 10px;color:#ccc;" +
+      "font:11px/1.35 Consolas,monospace;pointer-events:none;white-space:pre;text-align:left;" +
+      "display:none";
+
+  const text = document.createElement("div");
+  text.style.textAlign = "center";
+  const chart = document.createElement("canvas");
+  chart.width = 320;
+  chart.height = 72;
+  chart.style.cssText = "display:block;margin:4px auto 2px";
+  const legend = document.createElement("div");
+  legend.style.cssText = "text-align:center;color:#777";
+  legend.textContent = "frame ms  •  ActionScript  •  render      lines: 16.7 / 33.3 ms";
+  const methods = document.createElement("div");
+  methods.style.cssText = "margin-top:6px;border-top:1px solid #333;padding-top:4px;color:#bbb";
+  const errors = document.createElement("div");
+  errors.style.cssText = "margin-top:6px;border-top:1px solid #333;padding-top:4px;color:#ff9b9b";
+
+  panel.append(text, chart, legend, methods, errors);
+  document.body.append(panel);
+
+  // Последние ошибки со стеком: в бою полоса логов перекрывается игрой, а знать, что сыпется,
+  // нужно именно во время игры.
+  const lastErrors = [];
+  const noteError = (message) => {
+    const line = String(message).split("\n").slice(0, 4).join("\n");
+    if (lastErrors[lastErrors.length - 1] === line) return;
+    lastErrors.push(line);
+    if (lastErrors.length > 3) lastErrors.shift();
+  };
+  const origError = console.error.bind(console);
+  console.error = (...args) => {
+    origError(...args);
+    noteError(args.map((a) => (a && a.stack) ? a.stack : String(a)).join(" "));
+  };
+  addEventListener("error", (e) => noteError(e.error && e.error.stack ? e.error.stack : e.message));
+
+  addEventListener("keydown", (e) => {
+    if (e.key !== "F9") return;
+    expanded = !expanded;
+    // Счётчик горячих методов включаем только в развёрнутом режиме: он не бесплатный.
+    window.ruffleTraceMethods = expanded;
+    methods.style.display = expanded ? "block" : "none";
+    errors.style.display = expanded ? "block" : "none";
+  });
+  methods.style.display = "none";
+  errors.style.display = "none";
+
+  const pen = chart.getContext("2d");
+  const plot = (values, limit, color, fill) => {
+    pen.beginPath();
+    values.forEach((value, i) => {
+      const x = chart.width - (values.length - i) * (chart.width / HISTORY);
+      const y = chart.height - Math.min(value / limit, 1) * chart.height;
+      i ? pen.lineTo(x, y) : pen.moveTo(x, y);
+    });
+    pen.strokeStyle = color;
+    pen.lineWidth = fill ? 1.5 : 1;
+    pen.stroke();
+  };
+  const rule = (ms, limit, color) => {
+    const y = chart.height - Math.min(ms / limit, 1) * chart.height;
+    pen.strokeStyle = color;
+    pen.setLineDash([3, 3]);
+    pen.beginPath();
+    pen.moveTo(0, y);
+    pen.lineTo(chart.width, y);
+    pen.stroke();
+    pen.setLineDash([]);
+  };
+
+  setInterval(() => {
+    const s = window.ruffleStats;
+    if (!s) return;
+
+    const inBattle = (s.draws || 0) > 0 && (s.sceneWidth || 0) > window.innerWidth * 0.6;
+    panel.style.display = debugMode.on && inBattle ? "block" : "none";
+    if (panel.style.display === "none") return;
+
+    history.push(s);
+    if (history.length > HISTORY) history.shift();
+
+    const frameMs = (s.asMs || 0) + (s.renderMs || 0) + (s.drawMs || 0);
+    const slow = s.slowFrames || 0;
+    // Технические подписи оставлены на английском: так они совпадают с логами движка.
+    text.textContent =
+        "FPS " + (s.fps || 0).toFixed(0).padStart(3) + "   frame " + frameMs.toFixed(1) + " ms" +
+        "   worst " + (s.worstMs || 0).toFixed(1) + " ms" +
+        (slow ? "   hitches " + slow + "/s" : "") + "\n" +
+        "ActionScript " + (s.asMs || 0).toFixed(1) + " ms   render " + (s.renderMs || 0).toFixed(1) + " ms" +
+        "   Stage3D " + (s.drawMs || 0).toFixed(1) + " ms\n" +
+        "draws " + Math.round(s.draws || 0) + "   submits " + Math.round(s.submits || 0) +
+        "   commands " + Math.round(s.commands || 0) +
+        (window.ruffleRenderScale > 1 ? "   render x" + window.ruffleRenderScale : "") + "\n" +
+        // Вклад эмулятора в пинг: сколько входящие пакеты ждали до ActionScript и сколько
+        // исходящие — до WebSocket. Если пинг большой, а тут доли миллисекунды — очередь не в клиенте.
+        // q — ожидание WS-события в очереди главного потока (event.timeStamp -> обработчик):
+        // недостающая часть пинга, которую метка прихода не видела.
+        "socket q " + (s.socketQueueMs || 0).toFixed(1) + "/" + (s.socketQueueMaxMs || 0).toFixed(0) +
+        "   in " + (s.socketInMs || 0).toFixed(1) + "/" + (s.socketInMaxMs || 0).toFixed(1) +
+        "   out " + (s.socketOutMs || 0).toFixed(1) + "/" + (s.socketOutMaxMs || 0).toFixed(1) +
+        " ms   " + Math.round(s.socketInPerSec || 0) + " in/s" + "\n" +
+        // Разбор худшего промежутка секунды: если пик не объясняется AS/render/gc, значит
+        // «прочее» — ожидание браузера или видеокарты (проверка гипотезы про суперсэмплинг).
+        "spike " + (s.worstGapMs || 0).toFixed(0) + " ms = AS " + (s.worstGapAsMs || 0).toFixed(0) +
+        " + rnd " + (s.worstGapRenderMs || 0).toFixed(0) + " + gc " + (s.worstGapGcMs || 0).toFixed(0) +
+        " + other " + (s.worstGapOtherMs || 0).toFixed(0) +
+        "   RAF " + (s.rafIntervalMs || 0).toFixed(1) + " ms, late " + (s.rafLateMs || 0).toFixed(0) +
+        " ms/s, miss " + Math.round(s.rafMissed || 0) + "\n" +
+        // Кадры фильма — то, что считает встроенный счётчик FPS игры; сброшенные кадры выкинул
+        // предохранитель накопителя после провала.
+        "movie " + (s.framesRun || 0).toFixed(0) + "/s run, " + (s.framesDropped || 0).toFixed(0) +
+        "/s dropped (" + (s.movieFrameMs ? (1000 / s.movieFrameMs).toFixed(0) : "?") + " fps set)" +
+        // Счётчик расхождений режима сверки: не ноль — видно сразу.
+        ((s.nativeMismatches || []).length
+            ? "\nMISMATCH " + s.nativeMismatches.map(([n, c]) => n + " x" + c).join("  ")
+            : "");
+
+    pen.clearRect(0, 0, chart.width, chart.height);
+    pen.strokeStyle = "#333";
+    pen.lineWidth = 1;
+    pen.strokeRect(0.5, 0.5, chart.width - 1, chart.height - 1);
+    // Шкала графика — 50 мс: так виден и бюджет 60 кадров, и провалы вдвое хуже.
+    rule(BUDGET_60, 50, "#3d5a3d");
+    rule(BUDGET_30, 50, "#5a3d3d");
+    plot(history.map((h) => (h.asMs || 0) + (h.renderMs || 0) + (h.drawMs || 0)), 50, "#e0e0e0", true);
+    plot(history.map((h) => h.asMs || 0), 50, "#ffd166");
+    plot(history.map((h) => (h.renderMs || 0) + (h.drawMs || 0)), 50, "#7aa2f7");
+    // Худший кадр секунды — красными засечками поверх графика.
+    history.forEach((h, i) => {
+      if (!(h.worstMs > BUDGET_30)) return;
+      const x = chart.width - (history.length - i) * (chart.width / HISTORY);
+      const y = chart.height - Math.min(h.worstMs / 50, 1) * chart.height;
+      pen.fillStyle = "#ff6b6b";
+      pen.fillRect(x - 1, y - 1, 2, 2);
+    });
+
+    if (!expanded) return;
+
+    const hot = s.hotMethods || [];
+    const total = s.opsPerSecond || 0;
+    methods.textContent = hot.length
+        ? "hot ActionScript methods (" + Math.round(total / 1000) + "k ops/s, " +
+          Math.round((s.callsPerSecond || 0) / 1000) + "k calls/s)\n" +
+          hot.map(([name, ops, calls]) =>
+              "  " + (100 * ops / (total || 1)).toFixed(1).padStart(5) + "%  " +
+              String(Math.round(calls)).padStart(6) + " calls/s  " + name).join("\n")
+        : "hot ActionScript methods: собираю…";
+
+    errors.textContent = lastErrors.length
+        ? "last errors:\n" + lastErrors.map((e) => "  " + e.replace(/\n/g, "\n  ")).join("\n")
+        : "";
+
+    // Что режим сверки реально сравнил: без этого «ноль расхождений» может значить, что замена
+    // ни разу не исполнилась.
+    if (window.ruffleValidateNative && s.validated) {
+      methods.textContent += "\nvalidated: " +
+          (s.validated.length ? s.validated.join(", ") : "пока ничего");
+    }
+  }, 1000);
+})();
+</script>
+</body>
+</html>

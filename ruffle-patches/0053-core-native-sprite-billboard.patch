@@ -1,0 +1,608 @@
+From 0a608cd40938871ee6bc67d5302087914febd5f2 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 11:58:56 +0300
+Subject: [PATCH 2/3] core: native sprite billboard assembly from the pools
+
+---
+ core/src/avm2/fast_paths.rs | 550 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 550 insertions(+)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 525c11d2..b0dd78c7 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -90,6 +90,8 @@ pub enum NativeMethod {
+     PadTexture,
+     /// Освещение спрайта точечными, прожекторными и трубчатыми источниками.
+     CalculateLight,
++    /// Сборка билборда спрайта: четыре вершины, грань и звенья из пулов.
++    SpriteBillboard,
+     /// Обход KD-дерева при вставке динамики с выходом в интерпретатор на collectPlanes.
+     KdCollectPlanes,
+ }
+@@ -124,6 +126,7 @@ impl NativeMethod {
+             // отладочной записи метода.
+             ("521423108862310899123423632234", "padTextureDuplicated") => Some(Self::PadTexture),
+             ("Sprite3D", "calculateLight") => Some(Self::CalculateLight),
++            ("Sprite3D", "c7108d08") => Some(Self::SpriteBillboard),
+             ("KDContainer", "d33b25fe") => Some(Self::KdCollectPlanes),
+             _ => None,
+         }
+@@ -4397,6 +4400,474 @@ fn calculate_light<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'g
+     Some(Value::Undefined)
+ }
+ 
++/// Номера слотов сборки билборда (`Sprite3D.c7108d08`).
++#[derive(Clone, Copy)]
++struct SpriteSlots {
++    /// Открытые поля спрайта.
++    width: usize,
++    height: usize,
++    auto_size: usize,
++    material: usize,
++    perspective_scale: usize,
++    rotation: usize,
++    origin: [usize; 2],
++    top_left_uv: [usize; 2],
++    bottom_right_uv: [usize; 2],
++    clipping: usize,
++    /// culling и матрица — движковые.
++    culling: usize,
++    m: [usize; 12],
++    /// Камера.
++    near_clipping: usize,
++    far_clipping: usize,
++    focal_length: usize,
++    view_size: [usize; 2],
++    camera_last_vertex: usize,
++    camera_last_face: usize,
++    /// Вершина, грань, звено.
++    vertex_camera: [usize; 3],
++    vertex_uv: [usize; 2],
++    vertex_next: usize,
++    vertex_transform_id: usize,
++    vertex_draw_id: usize,
++    face_material: usize,
++    face_wrapper: usize,
++    face_next: usize,
++    wrapper_vertex: usize,
++    wrapper_next: usize,
++    /// Статические пулы трёх классов.
++    vertex_collector: usize,
++    face_collector: usize,
++    wrapper_collector: usize,
++    /// texture на классе материала спрайта (для autoSize); None — материалов ещё не видели.
++    material_texture: Option<usize>,
++    sprite_vtable: u32,
++    camera_vtable: u32,
++    vertex_vtable: u32,
++    face_vtable: u32,
++    wrapper_vtable: u32,
++}
++
++thread_local! {
++    static SPRITE_SLOTS: RefCell<Option<SpriteSlots>> = const { RefCell::new(None) };
++    static SPRITE_HOPELESS: Cell<bool> = const { Cell::new(false) };
++    /// Таблицы методов классов материалов: наследует ли класс TextureMaterial. Нужно ветке
++    /// autoSize — она повторяет `istypelate` байткода.
++    static TEXTURE_MATERIAL_KINDS: RefCell<Vec<(u32, bool)>> = const { RefCell::new(Vec::new()) };
++}
++
++/// Класс движка по имени из домена вызывающего кода — то, что байткод делает через getlex.
++fn engine_class<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    name: &'static str,
++) -> Option<Object<'gc>> {
++    let namespace = crate::avm2::namespace::Namespace::package(
++        AvmString::new_utf8(activation.gc(), "alternativa.engine3d.core"),
++        crate::avm2::api_version::ApiVersion::VM_INTERNAL,
++        activation.strings(),
++    );
++    let name = crate::avm2::QName::new(namespace, AvmString::new_utf8(activation.gc(), name));
++    activation
++        .domain()
++        .get_defined_value(activation, name)
++        .ok()?
++        .as_object()
++}
++
++fn sprite_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++    camera: Object<'gc>,
++) -> Option<SpriteSlots> {
++    if let Some(slots) = SPRITE_SLOTS.with(|cache| *cache.borrow()) {
++        return Some(slots);
++    }
++    if SPRITE_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Option<SpriteSlots> {
++        let vertex_class = engine_class(activation, "Vertex")?.as_class_object()?;
++        let face_class = engine_class(activation, "Face")?.as_class_object()?;
++        let wrapper_class = engine_class(activation, "Wrapper")?.as_class_object()?;
++        let vertex_vt = vertex_class.instance_vtable();
++        let face_vt = face_class.instance_vtable();
++        let wrapper_vt = wrapper_class.instance_vtable();
++
++        Some(SpriteSlots {
++            width: slot_of(activation, this, "width", false)?,
++            height: slot_of(activation, this, "height", false)?,
++            auto_size: slot_of(activation, this, "autoSize", false)?,
++            material: slot_of(activation, this, "material", false)?,
++            perspective_scale: slot_of(activation, this, "perspectiveScale", false)?,
++            rotation: slot_of(activation, this, "rotation", false)?,
++            origin: [
++                slot_of(activation, this, "originX", false)?,
++                slot_of(activation, this, "originY", false)?,
++            ],
++            top_left_uv: [
++                slot_of(activation, this, "topLeftU", false)?,
++                slot_of(activation, this, "topLeftV", false)?,
++            ],
++            bottom_right_uv: [
++                slot_of(activation, this, "bottomRightU", false)?,
++                slot_of(activation, this, "bottomRightV", false)?,
++            ],
++            clipping: slot_of(activation, this, "clipping", false)?,
++            culling: slot_of(activation, this, "culling", true)?,
++            m: {
++                let names = [
++                    "ma", "mb", "mc", "md", "me", "mf", "mg", "mh", "mi", "mj", "mk", "ml",
++                ];
++                let mut m = [0usize; 12];
++                for at in 0..12 {
++                    m[at] = slot_of(activation, this, names[at], true)?;
++                }
++                m
++            },
++            near_clipping: slot_of(activation, camera, "nearClipping", false)?,
++            far_clipping: slot_of(activation, camera, "farClipping", false)?,
++            focal_length: slot_of(activation, camera, "focalLength", true)?,
++            view_size: [
++                slot_of(activation, camera, "viewSizeX", true)?,
++                slot_of(activation, camera, "viewSizeY", true)?,
++            ],
++            camera_last_vertex: slot_of(activation, camera, "lastVertex", true)?,
++            camera_last_face: slot_of(activation, camera, "lastFace", true)?,
++            vertex_camera: [
++                slot_of_vtable(activation, vertex_vt, "cameraX", true)?,
++                slot_of_vtable(activation, vertex_vt, "cameraY", true)?,
++                slot_of_vtable(activation, vertex_vt, "cameraZ", true)?,
++            ],
++            vertex_uv: [
++                slot_of_vtable(activation, vertex_vt, "u", false)?,
++                slot_of_vtable(activation, vertex_vt, "v", false)?,
++            ],
++            vertex_next: slot_of_vtable(activation, vertex_vt, "next", true)?,
++            vertex_transform_id: slot_of_vtable(activation, vertex_vt, "transformId", true)?,
++            vertex_draw_id: slot_of_vtable(activation, vertex_vt, "drawId", true)?,
++            face_material: slot_of_vtable(activation, face_vt, "material", false)?,
++            face_wrapper: slot_of_vtable(activation, face_vt, "wrapper", true)?,
++            face_next: slot_of_vtable(activation, face_vt, "next", true)?,
++            wrapper_vertex: slot_of_vtable(activation, wrapper_vt, "vertex", true)?,
++            wrapper_next: slot_of_vtable(activation, wrapper_vt, "next", true)?,
++            vertex_collector: slot_of(activation, vertex_class.into(), "collector", true)?,
++            face_collector: slot_of(activation, face_class.into(), "collector", true)?,
++            wrapper_collector: slot_of(activation, wrapper_class.into(), "collector", true)?,
++            material_texture: None,
++            sprite_vtable: this.vtable().id(),
++            camera_vtable: camera.vtable().id(),
++            vertex_vtable: vertex_vt.id(),
++            face_vtable: face_vt.id(),
++            wrapper_vtable: wrapper_vt.id(),
++        })
++    };
++    match resolve(activation) {
++        Some(slots) => {
++            SPRITE_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            Some(slots)
++        }
++        None => {
++            SPRITE_HOPELESS.with(|flag| flag.set(true));
++            None
++        }
++    }
++}
++
++/// Наследует ли класс материала TextureMaterial — как `istypelate` байткода, с кэшем по таблице
++/// методов класса.
++fn is_texture_material<'gc>(material: Object<'gc>) -> bool {
++    let key = material.vtable().id();
++    if let Some(known) = TEXTURE_MATERIAL_KINDS.with(|cache| {
++        cache
++            .borrow()
++            .iter()
++            .find(|(vtable, _)| *vtable == key)
++            .map(|(_, is)| *is)
++    }) {
++        return known;
++    }
++    let mut is = false;
++    let mut class = Some(material.instance_class());
++    while let Some(current) = class {
++        if &*current.name().local_name().to_utf8_lossy() == "TextureMaterial" {
++            is = true;
++            break;
++        }
++        class = current.super_class();
++    }
++    TEXTURE_MATERIAL_KINDS.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        if cache.len() < 64 {
++            cache.push((key, is));
++        }
++    });
++    is
++}
++
++/// Пул-классы билборда: добываются от учётных цепочек камеры и домена один раз на вызов.
++struct SpritePools<'gc> {
++    vertex_class: Object<'gc>,
++    face_class: Object<'gc>,
++    wrapper_class: Object<'gc>,
++}
++
++/// Взять вершину из пула (или новую) и сбросить её номера — как Vertex.create/createList.
++fn sprite_take_vertex<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    pools: &SpritePools<'gc>,
++    slots: &SpriteSlots,
++) -> Option<Object<'gc>> {
++    let vertex = conflict_take(
++        activation,
++        pools.vertex_class,
++        slots.vertex_collector,
++        slots.vertex_next,
++        slots.vertex_vtable,
++    )?;
++    let mc = activation.gc();
++    vertex.set_slot_no_coerce(slots.vertex_transform_id, Value::Integer(0), mc);
++    vertex.set_slot_no_coerce(slots.vertex_draw_id, Value::Integer(0), mc);
++    Some(vertex)
++}
++
++/// `Sprite3D.c7108d08` — сборка билборда: спрайт превращается в четыре вершины в координатах
++/// камеры, грань и цепочку звеньев, всё из пулов; попутно уточняются биты отсечения. Пылевые
++/// билборды дают семь-четырнадцать тысяч таких вызовов в секунду — четыре-девять процентов кадра.
++fn sprite_billboard<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let camera = activation.local_register(1).as_object()?;
++    let mut slots = sprite_slots(activation, this, camera)?;
++    if this.vtable().id() != slots.sprite_vtable || camera.vtable().id() != slots.camera_vtable {
++        return None;
++    }
++
++    let num = |object: Object<'gc>, slot: usize| {
++        object.get_slot(slot).try_as_f64().unwrap_or(f64::NAN)
++    };
++
++    // Прескан до первой записи: culling, материал ветки autoSize, учётные цепочки, классы пулов.
++    let culling_in = match this.get_slot(slots.culling) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let auto_size = this.get_slot(slots.auto_size) == Value::Bool(true);
++    let material_value = this.get_slot(slots.material);
++    let mut auto_bitmap: Option<Object<'gc>> = None;
++    if auto_size && let Some(material) = material_value.as_object() {
++        if is_texture_material(material) {
++            if slots.material_texture.is_none() {
++                slots.material_texture = Some(slot_of(activation, material, "texture", false)?);
++                SPRITE_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            }
++            let texture = material.get_slot(slots.material_texture?);
++            if let Some(bitmap) = texture.as_object() {
++                bitmap.as_bitmap_data()?;
++                auto_bitmap = Some(bitmap);
++            }
++        }
++    }
++    let last_vertex = camera.get_slot(slots.camera_last_vertex).as_object()?;
++    let last_face = camera.get_slot(slots.camera_last_face).as_object()?;
++    if last_vertex.vtable().id() != slots.vertex_vtable
++        || last_face.vtable().id() != slots.face_vtable
++    {
++        return None;
++    }
++    let pools = SpritePools {
++        vertex_class: last_vertex.instance_class().class_object()?.into(),
++        face_class: last_face.instance_class().class_object()?.into(),
++        wrapper_class: match last_face.get_slot(slots.face_wrapper).as_object() {
++            Some(wrapper) if wrapper.vtable().id() == slots.wrapper_vtable => {
++                wrapper.instance_class().class_object()?.into()
++            }
++            _ => engine_class(activation, "Wrapper")?,
++        },
++    };
++
++    // В режиме сверки требуем запас в пулах — иначе оба прохода построили бы разные объекты.
++    if crate::method_stats::validate_native_paths() {
++        let enough = conflict_pool_len(pools.vertex_class, slots.vertex_collector, slots.vertex_next)
++            >= 8
++            && conflict_pool_len(pools.face_class, slots.face_collector, slots.face_next) >= 2
++            && conflict_pool_len(
++                pools.wrapper_class,
++                slots.wrapper_collector,
++                slots.wrapper_next,
++            ) >= 8;
++        if !enough {
++            return None;
++        }
++    }
++
++    let mc = activation.gc();
++
++    // Дальше — дословно байткод. Первая запись: culling &= 60 (до проверки дальности!).
++    let mut culling = culling_in & 60;
++    this.set_slot_no_coerce(slots.culling, Value::Integer(culling), mc);
++
++    let z = num(this, slots.m[11]); // l29 = ml
++    if z <= num(camera, slots.near_clipping) || z >= num(camera, slots.far_clipping) {
++        return Some(Value::Null);
++    }
++
++    let mut width = num(this, slots.width); // l11
++    let mut height = num(this, slots.height); // l24
++    let tl_u = num(this, slots.top_left_uv[0]);
++    let tl_v = num(this, slots.top_left_uv[1]);
++    let br_u = num(this, slots.bottom_right_uv[0]);
++    let br_v = num(this, slots.bottom_right_uv[1]);
++    if let Some(bitmap) = auto_bitmap {
++        let data = bitmap.as_bitmap_data()?;
++        width = f64::from(data.width()) * (br_u - tl_u);
++        height = f64::from(data.height()) * (br_v - tl_v);
++    }
++
++    let ppx = num(camera, slots.focal_length) / num(camera, slots.view_size[0]); // l25
++    let ppy = num(camera, slots.focal_length) / num(camera, slots.view_size[1]); // l19
++
++    // Средний масштаб трёх осей матрицы, с поправкой перспективы.
++    let m = |at: usize| num(this, slots.m[at]);
++    let mut scale = {
++        let a = ((m(0) / ppx) * (m(0) / ppx) + (m(4) / ppy) * (m(4) / ppy) + m(8) * m(8)).sqrt();
++        let b = ((m(1) / ppx) * (m(1) / ppx) + (m(5) / ppy) * (m(5) / ppy) + m(9) * m(9)).sqrt();
++        let c = ((m(2) / ppx) * (m(2) / ppx) + (m(6) / ppy) * (m(6) / ppy) + m(10) * m(10)).sqrt();
++        (a + b + c) / 3.0
++    };
++    if this.get_slot(slots.perspective_scale) != Value::Bool(true) {
++        scale /= num(camera, slots.focal_length) / z;
++    }
++
++    let origin_x = num(this, slots.origin[0]);
++    let origin_y = num(this, slots.origin[1]);
++    let rotation = num(this, slots.rotation);
++
++    // Геометрия четырёх углов и отсечение — три ветки, как в байткоде.
++    let corners: [(f64, f64); 4];
++    if rotation == 0.0 {
++        let sx = scale * width * ppx; // l4
++        let sy = scale * height * ppy; // l15
++        let left = m(3) - origin_x * sx; // l10
++        let top = m(7) - origin_y * sy; // l2
++        let right = left + sx; // l7
++        let bottom = top + sy; // l23
++        if culling > 0 && (left > z || top > z || right < -z || bottom < -z) {
++            return Some(Value::Null);
++        }
++        corners = [(left, top), (left, bottom), (right, bottom), (right, top)];
++    } else {
++        let sin_scale = -(rotation.sin()) * scale; // l13
++        let cos_scale = rotation.cos() * scale; // l5
++        let ax = cos_scale * width * ppx; // l20
++        let ay = -sin_scale * width * ppy; // l21
++        let bx = sin_scale * height * ppx; // l9
++        let by = cos_scale * height * ppy; // l3
++        let left = m(3) - origin_x * ax - origin_y * bx; // l10
++        let top = m(7) - origin_x * ay - origin_y * by; // l2
++        let p2 = (left + bx, top + by); // l12, l28
++        let p3 = (left + ax + bx, top + ay + by); // l7, l23
++        let p4 = (left + ax, top + ay); // l16, l22
++        if culling > 0 {
++            let xs = [left, p2.0, p3.0, p4.0];
++            let ys = [top, p2.1, p3.1, p4.1];
++            let clipping_exact = this.get_slot(slots.clipping) == Value::Integer(1);
++            // Каждая пара (бит, «все четыре за плоскостью?», «все четыре строго внутри?»).
++            let checks: [(i32, [f64; 4], bool); 4] = [
++                (4, xs, true),
++                (8, xs, false),
++                (16, ys, true),
++                (32, ys, false),
++            ];
++            for (bit, values, negated) in checks {
++                if culling & bit != 0 {
++                    let outside = values.iter().all(|value| {
++                        if negated { z <= -*value } else { z <= *value }
++                    });
++                    if outside {
++                        return Some(Value::Null);
++                    }
++                    if clipping_exact {
++                        let inside = values.iter().all(|value| {
++                            if negated { z > -*value } else { z > *value }
++                        });
++                        if inside {
++                            culling &= !bit;
++                            this.set_slot_no_coerce(
++                                slots.culling,
++                                Value::Integer(culling),
++                                mc,
++                            );
++                        }
++                    }
++                }
++            }
++        }
++        corners = [(left, top), p2, p3, p4];
++    }
++
++    // Четыре вершины из пула, связанные цепочкой — как Vertex.createList(4).
++    let mut vertices = [this; 4];
++    for at in 0..4 {
++        vertices[at] = sprite_take_vertex(activation, &pools, &slots)?;
++    }
++    let mc = activation.gc();
++    for at in 0..3 {
++        vertices[at].set_slot_no_coerce(
++            slots.vertex_next,
++            Value::Object(vertices[at + 1]),
++            mc,
++        );
++    }
++
++    let uvs = [(tl_u, tl_v), (tl_u, br_v), (br_u, br_v), (br_u, tl_v)];
++    for at in 0..4 {
++        let vertex = vertices[at];
++        set(vertex, slots.vertex_camera[0], corners[at].0, mc);
++        set(vertex, slots.vertex_camera[1], corners[at].1, mc);
++        set(vertex, slots.vertex_camera[2], z, mc);
++        set(vertex, slots.vertex_uv[0], uvs[at].0, mc);
++        set(vertex, slots.vertex_uv[1], uvs[at].1, mc);
++    }
++
++    // Учёт кадра и грань со звеньями.
++    last_vertex.set_slot_no_coerce(slots.vertex_next, Value::Object(vertices[0]), mc);
++    camera.set_slot_no_coerce(slots.camera_last_vertex, Value::Object(vertices[3]), mc);
++
++    let face = conflict_take(
++        activation,
++        pools.face_class,
++        slots.face_collector,
++        slots.face_next,
++        slots.face_vtable,
++    )?;
++    let mc = activation.gc();
++    face.set_slot_no_coerce(slots.face_material, material_value, mc);
++    last_face.set_slot_no_coerce(slots.face_next, Value::Object(face), mc);
++    camera.set_slot_no_coerce(slots.camera_last_face, Value::Object(face), mc);
++
++    let mut tail: Option<Object<'gc>> = None;
++    for vertex in vertices {
++        let wrapper = conflict_take(
++            activation,
++            pools.wrapper_class,
++            slots.wrapper_collector,
++            slots.wrapper_next,
++            slots.wrapper_vtable,
++        )?;
++        let mc = activation.gc();
++        match tail {
++            Some(tail) => {
++                tail.set_slot_no_coerce(slots.wrapper_next, Value::Object(wrapper), mc)
++            }
++            None => face.set_slot_no_coerce(slots.face_wrapper, Value::Object(wrapper), mc),
++        }
++        wrapper.set_slot_no_coerce(slots.wrapper_vertex, Value::Object(vertex), mc);
++        tail = Some(wrapper);
++    }
++
++    Some(Value::Object(face))
++}
++
+ /// Пересекает ли сфера габаритный ящик — общее ядро для нативных вызовов и самой замены.
+ fn sphere_hits_bound(sphere: &[f64; 4], bound: &[f64; 6]) -> bool {
+     let [x, y, z, w] = *sphere;
+@@ -5402,6 +5873,83 @@ pub fn snapshot<'gc>(
+         });
+     }
+ 
++    // Сборка билборда: пишутся биты отсечения, пулы и учётные цепочки камеры; сверяется
++    // возвращённая грань. Пулы откатываются целиком, чтобы оба прохода взяли те же объекты.
++    if native == NativeMethod::SpriteBillboard {
++        let this = activation.local_register(0).as_object()?;
++        let camera = activation.local_register(1).as_object()?;
++        let slots = sprite_slots(activation, this, camera)?;
++        let last_vertex = camera.get_slot(slots.camera_last_vertex).as_object()?;
++        let last_face = camera.get_slot(slots.camera_last_face).as_object()?;
++        if last_vertex.vtable().id() != slots.vertex_vtable
++            || last_face.vtable().id() != slots.face_vtable
++        {
++            return None;
++        }
++        let pools = [
++            (
++                Object::from(last_vertex.instance_class().class_object()?),
++                slots.vertex_collector,
++                slots.vertex_next,
++            ),
++            (
++                Object::from(last_face.instance_class().class_object()?),
++                slots.face_collector,
++                slots.face_next,
++            ),
++            (
++                match last_face.get_slot(slots.face_wrapper).as_object() {
++                    Some(wrapper) if wrapper.vtable().id() == slots.wrapper_vtable => {
++                        Object::from(wrapper.instance_class().class_object()?)
++                    }
++                    _ => engine_class(activation, "Wrapper")?,
++                },
++                slots.wrapper_collector,
++                slots.wrapper_next,
++            ),
++        ];
++        let mut links = Vec::new();
++        for (class_obj, collector, next_slot) in pools {
++            links.push((class_obj, collector, class_obj.get_slot(collector)));
++            let mut node = class_obj.get_slot(collector).as_object();
++            let mut count = 0usize;
++            while let Some(current) = node {
++                links.push((current, next_slot, current.get_slot(next_slot)));
++                node = current.get_slot(next_slot).as_object();
++                count += 1;
++                if count >= 100_000 {
++                    return None;
++                }
++            }
++        }
++        links.push((
++            camera,
++            slots.camera_last_vertex,
++            camera.get_slot(slots.camera_last_vertex),
++        ));
++        links.push((
++            camera,
++            slots.camera_last_face,
++            camera.get_slot(slots.camera_last_face),
++        ));
++        links.push((
++            last_vertex,
++            slots.vertex_next,
++            last_vertex.get_slot(slots.vertex_next),
++        ));
++        links.push((last_face, slots.face_next, last_face.get_slot(slots.face_next)));
++
++        let fields = vec![(
++            Place::IntSlot(this, slots.culling),
++            this.get_slot(slots.culling).try_as_f64().unwrap_or(0.0),
++        )];
++        return Some(Snapshot {
++            fields,
++            links,
++            vectors: Vec::new(),
++        });
++    }
++
+     // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
+     // делается один раз за сессию и на чужом объекте запомнил бы неудачу навсегда.
+     if !matches!(
+@@ -5434,6 +5982,7 @@ pub fn snapshot<'gc>(
+         | NativeMethod::SortByAverageZ
+         | NativeMethod::PadTexture
+         | NativeMethod::CalculateLight
++        | NativeMethod::SpriteBillboard
+         | NativeMethod::KdCollectPlanes => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+@@ -5523,6 +6072,7 @@ pub fn run<'gc>(
+         NativeMethod::SortByAverageZ => Ok(sort_faces_entry(activation)),
+         NativeMethod::PadTexture => Ok(pad_texture(activation)),
+         NativeMethod::CalculateLight => Ok(calculate_light(activation)),
++        NativeMethod::SpriteBillboard => Ok(sprite_billboard(activation)),
+         NativeMethod::ComposeAndAppend => {
+             let mut run = || -> Option<Value<'gc>> {
+                 let this = activation.local_register(0).as_object()?;
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,40 @@
+From 2fe6680243a51bb3174e8a41072a86c7723a2cec Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 05:52:52 +0300
+Subject: [PATCH 11/17] core: limit the Stage3D erase hole to layers smaller
+ than the stage
+
+---
+ core/src/display_object.rs | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/core/src/display_object.rs b/core/src/display_object.rs
+index c3c701d2..ed2327e4 100644
+--- a/core/src/display_object.rs
++++ b/core/src/display_object.rs
+@@ -1208,8 +1208,20 @@ fn show_stage3d_through_hole<'gc>(this: DisplayObject<'gc>, context: &mut Render
+                 y_max: Twips::from_pixels(stage3d.y() + size.1 as f64),
+             };
+ 
+-            // Окно должно приходиться на этот слой, иначе это стирание не про Stage3D.
+-            if !hole.intersects(&layer) {
++            // Окно должно целиком приходиться на слой, иначе это стирание не про Stage3D.
++            let inside = hole.x_min >= layer.x_min
++                && hole.y_min >= layer.y_min
++                && hole.x_max <= layer.x_max
++                && hole.y_max <= layer.y_max;
++            if !inside {
++                continue;
++            }
++
++            // Слой во весь экран и так виден везде, где его не закрыл интерфейс, — вырезать в нём
++            // окно незачем. Пропускаем такой случай, чтобы стирание внутри боевого интерфейса
++            // не выводило сцену поверх него.
++            let stage = context.stage.view_bounds();
++            if layer.width() >= stage.width() && layer.height() >= stage.height() {
+                 continue;
+             }
+ 
+-- 
+2.51.1.windows.1
+

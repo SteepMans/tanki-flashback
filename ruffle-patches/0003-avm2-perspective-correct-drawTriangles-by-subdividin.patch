@@ -1,0 +1,202 @@
+From a649d4f4f5299082557f940e3ad7fc3e31aa0f9d Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 21:59:31 +0300
+Subject: [PATCH 03/17] avm2: perspective-correct drawTriangles by subdividing
+ on uvt divisor
+
+---
+ .../avm2/globals/flash/display/graphics.rs    | 152 +++++++++++++++---
+ 1 file changed, 126 insertions(+), 26 deletions(-)
+
+diff --git a/core/src/avm2/globals/flash/display/graphics.rs b/core/src/avm2/globals/flash/display/graphics.rs
+index 7ad581f3..33b92748 100644
+--- a/core/src/avm2/globals/flash/display/graphics.rs
++++ b/core/src/avm2/globals/flash/display/graphics.rs
+@@ -1237,11 +1237,12 @@ impl TriangleData {
+ 
+ /// Per-vertex texture coordinates from the `uvtData` argument of `Graphics.drawTriangles`.
+ ///
+-/// Flash accepts either 2 (`u`, `v`) or 3 (`u`, `v`, `t`) values per vertex. The `t` component is
+-/// the perspective divisor; it is parsed and ignored here, so texturing is affine per triangle.
+-/// Content that needs perspective correction (software 3D engines) subdivides triangles finely
+-/// enough that the difference is not noticeable.
+-fn parse_uvt_data<'gc>(uvt_data: &Object<'gc>, vertex_count: usize) -> Option<Vec<[f64; 2]>> {
++/// Flash accepts either 2 (`u`, `v`) or 3 (`u`, `v`, `t`) values per vertex. `t` is the perspective
++/// divisor: with it a triangle must be sampled perspective-correctly, otherwise the texture visibly
++/// swims and skews across large, steeply angled faces. A bitmap fill can only be affine, so `t` is
++/// kept here and used later to subdivide such triangles until the affine error is negligible.
++/// Vertices without `t` get `1.0`, which makes the subdivision test a no-op for them.
++fn parse_uvt_data<'gc>(uvt_data: &Object<'gc>, vertex_count: usize) -> Option<Vec<[f64; 3]>> {
+     let storage = uvt_data.as_vector_storage()?;
+     let values = storage.storage();
+ 
+@@ -1257,11 +1258,118 @@ fn parse_uvt_data<'gc>(uvt_data: &Object<'gc>, vertex_count: usize) -> Option<Ve
+     Some(
+         values
+             .chunks_exact(stride)
+-            .map(|uvt| [uvt[0].as_f64(), uvt[1].as_f64()])
++            .map(|uvt| {
++                let t = if stride == 3 { uvt[2].as_f64() } else { 1.0 };
++                // A non-positive divisor means the vertex is at or behind the eye; there is nothing
++                // sensible to divide by, so fall back to plain affine for it.
++                let t = if t.is_finite() && t > 0.0 { t } else { 1.0 };
++                [uvt[0].as_f64(), uvt[1].as_f64(), t]
++            })
+             .collect(),
+     )
+ }
+ 
++/// One corner of a triangle being textured: screen position, texture coordinates and divisor.
++#[derive(Clone, Copy)]
++struct TexturedVertex {
++    point: Point<Twips>,
++    uv: [f64; 2],
++    t: f64,
++}
++
++impl TexturedVertex {
++    /// Perspective-correct midpoint of an edge.
++    ///
++    /// Screen position is halfway, but the texture coordinate is not: it has to be interpolated in
++    /// `u*t, v*t, t` space and divided back, which is exactly what a perspective-correct rasterizer
++    /// does per pixel.
++    fn midpoint(self, other: Self) -> Self {
++        let t = (self.t + other.t) / 2.0;
++        let mix = |a: f64, b: f64| (a * self.t + b * other.t) / (self.t + other.t) ;
++
++        Self {
++            point: Point::new(
++                Twips::new((self.point.x.get() + other.point.x.get()) / 2),
++                Twips::new((self.point.y.get() + other.point.y.get()) / 2),
++            ),
++            uv: [mix(self.uv[0], other.uv[0]), mix(self.uv[1], other.uv[1])],
++            t,
++        }
++    }
++}
++
++/// Draws one textured triangle, subdividing it while the perspective divisors of its corners
++/// differ enough for affine sampling to be visibly wrong.
++///
++/// A bitmap fill is affine, so a face seen at a steep angle would have its texture skewed and
++/// swimming as the model turns. Splitting the triangle at perspective-correct edge midpoints halves
++/// that error each time; a handful of levels is enough for the distortion to disappear, and flat-on
++/// faces (equal divisors) are drawn directly without any extra work.
++#[expect(clippy::too_many_arguments)]
++fn draw_textured_triangle(
++    drawing: &mut Drawing,
++    corners: [TexturedVertex; 3],
++    bitmap_id: u16,
++    is_smoothed: bool,
++    is_repeating: bool,
++    bitmap_width: f64,
++    bitmap_height: f64,
++    depth: u8,
++) {
++    const MAX_DEPTH: u8 = 4;
++    /// Ratio between the largest and smallest divisor a triangle may have before it is split.
++    const MAX_DIVISOR_RATIO: f64 = 1.08;
++
++    let [a, b, c] = corners;
++
++    let min_t = a.t.min(b.t).min(c.t);
++    let max_t = a.t.max(b.t).max(c.t);
++
++    if depth < MAX_DEPTH && min_t > 0.0 && max_t / min_t > MAX_DIVISOR_RATIO {
++        // Split into four by the edge midpoints — the usual 1-to-4 subdivision, which keeps the
++        // triangle's shape and needs no vertex ordering bookkeeping.
++        let ab = a.midpoint(b);
++        let bc = b.midpoint(c);
++        let ca = c.midpoint(a);
++
++        for sub in [[a, ab, ca], [ab, b, bc], [ca, bc, c], [ab, bc, ca]] {
++            draw_textured_triangle(
++                drawing,
++                sub,
++                bitmap_id,
++                is_smoothed,
++                is_repeating,
++                bitmap_width,
++                bitmap_height,
++                depth + 1,
++            );
++        }
++
++        return;
++    }
++
++    let Some(matrix) = uv_triangle_matrix(
++        [a.uv, b.uv, c.uv],
++        [a.point, b.point, c.point],
++        bitmap_width,
++        bitmap_height,
++    ) else {
++        return; // degenerate in texture space — nothing to sample
++    };
++
++    drawing.set_fill_style(Some(FillStyle::Bitmap {
++        id: bitmap_id,
++        matrix,
++        is_smoothed,
++        is_repeating,
++    }));
++
++    drawing.draw_command(DrawCommand::MoveTo(a.point));
++    drawing.draw_command(DrawCommand::LineTo(b.point));
++    drawing.draw_command(DrawCommand::LineTo(c.point));
++    drawing.draw_command(DrawCommand::LineTo(a.point));
++}
++
+ /// Builds the bitmap fill matrix that maps a triangle's texture space onto its screen position.
+ ///
+ /// The fill matrix of `FillStyle::Bitmap` maps bitmap *pixels* to shape *twips* (see
+@@ -1382,34 +1490,26 @@ fn draw_triangles_internal<'gc>(
+     {
+         let original_fill = drawing.current_fill_style().cloned();
+ 
+-
+         for (points, [i0, i1, i2]) in data
+             .iter_triangles_with_vertex_indices()
+             .filter(|&(tri, _)| !culling.cull(tri))
+         {
+-            let Some(matrix) = uv_triangle_matrix(
+-                [uvs[i0], uvs[i1], uvs[i2]],
+-                points,
+-                size.width as f64,
+-                size.height as f64,
+-            ) else {
+-                continue; // degenerate in texture space — nothing to sample
+-            };
+-
++            let corners = [
++                TexturedVertex { point: points[0], uv: [uvs[i0][0], uvs[i0][1]], t: uvs[i0][2] },
++                TexturedVertex { point: points[1], uv: [uvs[i1][0], uvs[i1][1]], t: uvs[i1][2] },
++                TexturedVertex { point: points[2], uv: [uvs[i2][0], uvs[i2][1]], t: uvs[i2][2] },
++            ];
+ 
+-            drawing.set_fill_style(Some(FillStyle::Bitmap {
++            draw_textured_triangle(
++                drawing,
++                corners,
+                 id,
+-                matrix,
+                 is_smoothed,
+                 is_repeating,
+-            }));
+-
+-
+-            let [a, b, c] = points;
+-            drawing.draw_command(DrawCommand::MoveTo(a));
+-            drawing.draw_command(DrawCommand::LineTo(b));
+-            drawing.draw_command(DrawCommand::LineTo(c));
+-            drawing.draw_command(DrawCommand::LineTo(a));
++                size.width as f64,
++                size.height as f64,
++                0,
++            );
+         }
+ 
+         // Leave the fill as the caller set it, so drawing that follows is unaffected.
+-- 
+2.51.1.windows.1
+

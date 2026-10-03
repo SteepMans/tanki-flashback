@@ -1,0 +1,354 @@
+From 43cd20f06f3f95b93a864f5bec65b3e8ca56a448 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 12:08:06 +0300
+Subject: [PATCH 16/17] render: upload and sample the full mip chain of Stage3D
+ textures
+
+---
+ .../flash/display3D/textures/cube_texture.rs  |  1 +
+ .../display3D/textures/rectangle_texture.rs   |  3 ++
+ .../flash/display3D/textures/texture.rs       | 21 ++--------
+ core/src/avm2/object/context3d_object.rs      |  7 ++++
+ render/src/backend.rs                         |  3 ++
+ render/wgpu/src/context3d/current_pipeline.rs | 16 ++++++--
+ render/wgpu/src/context3d/mod.rs              | 40 +++++++++++++++++--
+ 7 files changed, 66 insertions(+), 25 deletions(-)
+
+diff --git a/core/src/avm2/globals/flash/display3D/textures/cube_texture.rs b/core/src/avm2/globals/flash/display3D/textures/cube_texture.rs
+index dfce9388..9b504821 100644
+--- a/core/src/avm2/globals/flash/display3D/textures/cube_texture.rs
++++ b/core/src/avm2/globals/flash/display3D/textures/cube_texture.rs
+@@ -99,6 +99,7 @@ pub fn upload_from_bitmap_data<'gc>(
+                     texture.handle(),
+                     // FIXME - is this right?
+                     side,
++                    mip_level,
+                 );
+             } else {
+                 avm2_stub_method!(
+diff --git a/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs b/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
+index e02ec889..2c3b4044 100644
+--- a/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
++++ b/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
+@@ -48,6 +48,8 @@ pub fn upload_from_bitmap_data<'gc>(
+                 &source.sync(activation.context.renderer).borrow(),
+                 texture.handle(),
+                 0,
++                // У прямоугольных текстур мип-уровней не бывает.
++                0,
+             );
+ 
+             if empty {
+@@ -56,6 +58,7 @@ pub fn upload_from_bitmap_data<'gc>(
+                     texture.handle(),
+                     source,
+                     0,
++                    0,
+                 );
+             }
+         } else {
+diff --git a/core/src/avm2/globals/flash/display3D/textures/texture.rs b/core/src/avm2/globals/flash/display3D/textures/texture.rs
+index 26d0cb79..e47e9059 100644
+--- a/core/src/avm2/globals/flash/display3D/textures/texture.rs
++++ b/core/src/avm2/globals/flash/display3D/textures/texture.rs
+@@ -18,15 +18,6 @@ pub fn do_copy<'gc>(
+     side: u32,
+     mip_level: u32,
+ ) -> Result<(), Error<'gc>> {
+-    if mip_level != 0 {
+-        avm2_stub_method!(
+-            activation,
+-            "flash.display3D.textures.Texture",
+-            "uploadFromByteArray",
+-            "with miplevel != 0"
+-        );
+-        return Ok(());
+-    }
+ 
+     // FIXME - see if we can avoid this intermediate BitmapData, and copy
+     // directly from a buffer to the target GPU texture
+@@ -63,6 +54,7 @@ pub fn do_copy<'gc>(
+         &bitmap_data.sync(activation.context.renderer).borrow(),
+         texture.handle(),
+         side,
++        mip_level,
+     );
+     Ok(())
+ }
+@@ -124,7 +116,7 @@ pub fn upload_from_bitmap_data<'gc>(
+ 
+         if let Some(source) = source_obj.as_bitmap_data() {
+             let mip_level = args.get_u32(1);
+-            if mip_level == 0 {
++            {
+                 let empty = {
+                     let data = source.sync(activation.context.renderer);
+                     let data = data.borrow();
+@@ -140,6 +132,7 @@ pub fn upload_from_bitmap_data<'gc>(
+                     &source.sync(activation.context.renderer).borrow(),
+                     texture.handle(),
+                     0,
++                    mip_level,
+                 );
+ 
+                 if empty {
+@@ -148,15 +141,9 @@ pub fn upload_from_bitmap_data<'gc>(
+                         texture.handle(),
+                         source,
+                         0,
++                        mip_level,
+                     );
+                 }
+-            } else {
+-                avm2_stub_method!(
+-                    activation,
+-                    "flash.display3D.textures.Texture",
+-                    "uploadFromBitmapData",
+-                    "with miplevel != 0"
+-                );
+             }
+         } else {
+             unreachable!("Argument is BitmapData-typed");
+diff --git a/core/src/avm2/object/context3d_object.rs b/core/src/avm2/object/context3d_object.rs
+index f79ab7f3..cc63857f 100644
+--- a/core/src/avm2/object/context3d_object.rs
++++ b/core/src/avm2/object/context3d_object.rs
+@@ -71,6 +71,7 @@ impl<'gc> Context3DObject<'gc> {
+         texture: Rc<dyn Texture>,
+         source: crate::bitmap::bitmap_data::BitmapData<'gc>,
+         layer: u32,
++        mip_level: u32,
+     ) {
+         let mut pending = unlock!(Gc::write(mc, self.0), Context3DData, pending_uploads).borrow_mut();
+ 
+@@ -79,6 +80,7 @@ impl<'gc> Context3DObject<'gc> {
+                 texture,
+                 source,
+                 layer,
++                mip_level,
+                 attempts: 0,
+             });
+         }
+@@ -119,6 +121,7 @@ impl<'gc> Context3DObject<'gc> {
+                     &upload.source.sync(context.renderer).borrow(),
+                     upload.texture.clone(),
+                     upload.layer,
++                    upload.mip_level,
+                 );
+                 continue;
+             }
+@@ -434,6 +437,7 @@ impl<'gc> Context3DObject<'gc> {
+         source: &BitmapRawData<'gc>,
+         dest: Rc<dyn Texture>,
+         layer: u32,
++        mip_level: u32,
+     ) {
+         // Note - Flash appears to allow a source that's larger than the destination.
+         // Let's leave in this assertion to see if there any real SWFS relying on this
+@@ -458,6 +462,7 @@ impl<'gc> Context3DObject<'gc> {
+                 source_height: source.height(),
+                 dest,
+                 layer,
++                mip_level,
+             })
+         });
+     }
+@@ -471,6 +476,7 @@ impl<'gc> Context3DObject<'gc> {
+                 source_height: dest.height(),
+                 dest,
+                 layer,
++                mip_level: 0,
+             })
+         });
+     }
+@@ -609,6 +615,7 @@ struct PendingUpload<'gc> {
+     texture: Rc<dyn Texture>,
+     source: crate::bitmap::bitmap_data::BitmapData<'gc>,
+     layer: u32,
++    mip_level: u32,
+     attempts: u32,
+ }
+ 
+diff --git a/render/src/backend.rs b/render/src/backend.rs
+index 09446f9b..ec8e8339 100644
+--- a/render/src/backend.rs
++++ b/render/src/backend.rs
+@@ -602,6 +602,9 @@ pub enum Context3DCommand<'a> {
+         source_height: u32,
+         dest: Rc<dyn Texture>,
+         layer: u32,
++        /// Уровень детализации: 0 — полный размер, дальше идут уменьшенные копии. Содержимое
++        /// заливает всю цепочку само, а без неё поверхности в движении рябят.
++        mip_level: u32,
+     },
+     SetTextureAt {
+         sampler: u32,
+diff --git a/render/wgpu/src/context3d/current_pipeline.rs b/render/wgpu/src/context3d/current_pipeline.rs
+index e2e9b132..469cdd57 100644
+--- a/render/wgpu/src/context3d/current_pipeline.rs
++++ b/render/wgpu/src/context3d/current_pipeline.rs
+@@ -181,7 +181,7 @@ struct PipelineKey {
+ struct BindGroupKey {
+     shaders: usize,
+     texture_infos: [Option<ShaderTextureInfo>; 8],
+-    textures: [Option<(usize, bool)>; 8],
++    textures: [Option<(usize, bool, u32)>; 8],
+     samplers: [SamplerConfig; 8],
+ }
+ 
+@@ -204,6 +204,9 @@ pub struct BoundTextureData {
+     pub id: Rc<dyn Texture>,
+     pub view: TextureView,
+     pub cube: bool,
++    /// Сколько уровней детализации видит шейдер. Содержимое доливает их по ходу загрузки,
++    /// поэтому число входит в ключ кеша: иначе осталась бы привязка со старой цепочкой.
++    pub mip_levels: u32,
+ }
+ 
+ impl CurrentPipeline {
+@@ -327,6 +330,7 @@ impl CurrentPipeline {
+             (None, None) => true,
+             (Some(old), Some(new)) => {
+                 old.cube == new.cube
++                    && old.mip_levels == new.mip_levels
+                     && std::ptr::eq(
+                         Rc::as_ptr(&old.id) as *const (),
+                         Rc::as_ptr(&new.id) as *const (),
+@@ -721,9 +725,13 @@ impl CurrentPipeline {
+             shaders: shaders_id,
+             texture_infos,
+             textures: std::array::from_fn(|i| {
+-                self.bound_textures[i]
+-                    .as_ref()
+-                    .map(|texture| (Rc::as_ptr(&texture.id) as *const () as usize, texture.cube))
++                self.bound_textures[i].as_ref().map(|texture| {
++                    (
++                        Rc::as_ptr(&texture.id) as *const () as usize,
++                        texture.cube,
++                        texture.mip_levels,
++                    )
++                })
+             }),
+             samplers: self.sampler_configs,
+         };
+diff --git a/render/wgpu/src/context3d/mod.rs b/render/wgpu/src/context3d/mod.rs
+index 28b0e423..7f978c38 100644
+--- a/render/wgpu/src/context3d/mod.rs
++++ b/render/wgpu/src/context3d/mod.rs
+@@ -602,6 +602,10 @@ pub struct VertexBufferWrapper {
+ #[derive(Debug)]
+ pub struct TextureWrapper {
+     pub(super) texture: wgpu::Texture,
++    /// Сколько уровней детализации подряд, начиная с полного размера, уже залито содержимым.
++    /// Выборка идёт только по ним: если бы шейдер читал незаполненные уровни, дальние
++    /// поверхности стали бы чёрными.
++    pub(super) filled_mip_levels: Cell<u32>,
+ }
+ 
+ impl IndexBuffer for IndexBufferWrapper {}
+@@ -723,6 +727,15 @@ impl Context3D for WgpuContext3D {
+             ));
+         }
+ 
++        // Содержимое заливает уменьшенные копии само (Context3D.uploadFromBitmapData с номером
++        // уровня), поэтому текстура заводится сразу с полной цепочкой: без неё поверхности в
++        // движении рябят, потому что выборка идёт по одному полноразмерному уровню.
++        let mip_level_count = if matches!(format, TextureFormat::Bc3RgbaUnorm) {
++            1 // у сжатых форматов уровни должны быть кратны блоку — не рискуем
++        } else {
++            (width.max(height) as f32).log2().floor() as u32 + 1
++        };
++
+         let texture = self.descriptors.device.create_texture(&TextureDescriptor {
+             label: None,
+             size: Extent3d {
+@@ -730,14 +743,17 @@ impl Context3D for WgpuContext3D {
+                 height,
+                 depth_or_array_layers: 1,
+             },
+-            mip_level_count: 1,
++            mip_level_count,
+             sample_count: 1,
+             dimension: TextureDimension::D2,
+             format,
+             view_formats: &[format],
+             usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST | render_attachment,
+         });
+-        Ok(Rc::new(TextureWrapper { texture }))
++        Ok(Rc::new(TextureWrapper {
++            texture,
++            filled_mip_levels: Cell::new(0),
++        }))
+     }
+ 
+     fn create_cube_texture(
+@@ -775,7 +791,10 @@ impl Context3D for WgpuContext3D {
+                 | TextureUsages::COPY_DST
+                 | TextureUsages::RENDER_ATTACHMENT,
+         });
+-        Ok(Rc::new(TextureWrapper { texture }))
++        Ok(Rc::new(TextureWrapper {
++            texture,
++            filled_mip_levels: Cell::new(0),
++        }))
+     }
+ 
+     fn upload_shaders(
+@@ -1225,6 +1244,9 @@ impl WgpuContext3D {
+                     base_array_layer: surface_selector,
+                     array_layer_count: Some(1),
+                     dimension: Some(wgpu::TextureViewDimension::D2),
++                    // Цель отрисовки — всегда ровно один уровень: вид с целой цепочкой
++                    // видеокарта как цель не принимает.
++                    mip_level_count: Some(1),
+                     ..Default::default()
+                 };
+ 
+@@ -1530,6 +1552,7 @@ impl WgpuContext3D {
+                 source_height,
+                 dest,
+                 layer,
++                mip_level,
+             } => {
+                 // Текстура могла попасть в уже записанные вызовы, поэтому их надо отправить
+                 // до заливки новых пикселей.
+@@ -1621,7 +1644,7 @@ impl WgpuContext3D {
+                     },
+                     wgpu::TexelCopyTextureInfo {
+                         texture: &dest.texture,
+-                        mip_level: 0,
++                        mip_level,
+                         origin: wgpu::Origin3d {
+                             x: 0,
+                             y: 0,
+@@ -1636,6 +1659,11 @@ impl WgpuContext3D {
+                         depth_or_array_layers: 1,
+                     },
+                 );
++
++                // Уровни приходят по порядку; запоминаем длину заполненной части цепочки.
++                if mip_level == dest.filled_mip_levels.get() {
++                    dest.filled_mip_levels.set(mip_level + 1);
++                }
+             }
+             Context3DCommand::SetTextureAt {
+                 sampler,
+@@ -1651,11 +1679,15 @@ impl WgpuContext3D {
+                         view.dimension = Some(wgpu::TextureViewDimension::Cube);
+                         view.array_layer_count = Some(6);
+                     }
++                    // Незаполненные уровни в выборку не отдаём.
++                    let filled = texture_wrapper.filled_mip_levels.get().max(1);
++                    view.mip_level_count = Some(filled.min(texture_wrapper.texture.mip_level_count()));
+ 
+                     Some(BoundTextureData {
+                         view: texture_wrapper.texture.create_view(&view),
+                         id: texture,
+                         cube,
++                        mip_levels: view.mip_level_count.unwrap_or(1),
+                     })
+                 } else {
+                     None
+-- 
+2.51.1.windows.1
+

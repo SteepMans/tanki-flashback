@@ -1,0 +1,102 @@
+From 645d4f6a57c8175e2ed878974a1cf75b75548d77 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 23:34:42 +0300
+Subject: [PATCH 2/2] web: report frame hitches once a second instead of once a
+ frame
+
+---
+ web/src/lib.rs | 38 +++++++++++++++++++++++++++++++++-----
+ 1 file changed, 33 insertions(+), 5 deletions(-)
+
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 3d73e036..998be39e 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1131,15 +1131,15 @@ impl RuffleHandle {
+         // Кроме средних за секунду считаем ХУДШИЙ кадр и число кадров дольше 33 мс: провалы
+         // частоты видны только так, в среднем они растворяются.
+         thread_local! {
+-            static FRAME_STATS: std::cell::RefCell<(web_time::Instant, u32, u32, f32, f32, f32, u32)> =
+-                std::cell::RefCell::new((web_time::Instant::now(), 0, 0, 0.0, 0.0, 0.0, 0));
++            static FRAME_STATS: std::cell::RefCell<(web_time::Instant, u32, u32, f32, f32, f32, u32, f32)> =
++                std::cell::RefCell::new((web_time::Instant::now(), 0, 0, 0.0, 0.0, 0.0, 0, 0.0));
+         }
+ 
+-        FRAME_STATS.with_borrow_mut(|(started, ticks, renders, tick_ms, render_ms, worst_ms, slow_frames)| {
++        FRAME_STATS.with_borrow_mut(|(started, ticks, renders, tick_ms, render_ms, worst_ms, slow_frames, hitch_ms)| {
+             let frame_ms = (tick_time + render_time).as_secs_f32() * 1000.0;
+             // Каждый провал пишем отдельной строкой с разбором: по ней сразу видно, кто виноват —
+             // код игры, отрисовка или сборка мусора. Иначе провал теряется в среднем за секунду.
+-            if frame_ms > 33.0 {
++            if frame_ms > 33.0 && ruffle_core::method_stats::hitch_every_frame() {
+                 // Если включён счётчик методов (F9 в профилировщике), к строке провала
+                 // добавляется разбор: какой код игры съел именно этот кадр.
+                 let detail = if ruffle_core::method_stats::enabled() {
+@@ -1165,7 +1165,7 @@ impl RuffleHandle {
+                     if rendered { "" } else { ", кадр не рисовался" },
+                     detail,
+                 );
+-            } else if ruffle_core::method_stats::enabled() {
++            } else if ruffle_core::method_stats::hitch_every_frame() {
+                 ruffle_core::method_stats::reset_frame();
+             }
+             if frame_ms > *worst_ms {
+@@ -1173,6 +1173,7 @@ impl RuffleHandle {
+             }
+             if frame_ms > 33.0 {
+                 *slow_frames += 1;
++                *hitch_ms += frame_ms;
+             }
+             *ticks += 1;
+             *renders += u32::from(rendered);
+@@ -1199,6 +1200,28 @@ impl RuffleHandle {
+                 if ruffle_core::method_stats::enabled() {
+                     let (total_ops, total_calls) = ruffle_core::method_stats::take_total();
+                     let rows = ruffle_core::method_stats::take_top(10);
++                    // Сводка о провалах за секунду. Одна строка вместо двух-трёх десятков, и
++                    // доли методов в ней посчитаны по всей секунде, а не по одному кадру: по
++                    // одному кадру они скачут так, что по ним ничего не решишь.
++                    if *slow_frames > 0 {
++                        let mut detail = String::new();
++                        for (name, ops, _) in rows.iter().take(4) {
++                            detail.push_str(&format!(
++                                "; {name} {:.0}%",
++                                100.0 * *ops as f32 / total_ops.max(1) as f32
++                            ));
++                        }
++                        tracing::warn!(
++                            "провалов {} за {:.1} с: худший {:.1} мс, средний {:.1} мс, всего кадров {}, {} тыс. инструкций/с{}",
++                            *slow_frames,
++                            elapsed,
++                            *worst_ms,
++                            *hitch_ms / *slow_frames as f32,
++                            *ticks,
++                            (total_ops as f32 / elapsed / 1000.0) as u32,
++                            detail,
++                        );
++                    }
+                     let list = js_sys::Array::new();
+                     for (name, ops, calls) in rows {
+                         let row = js_sys::Array::new();
+@@ -1266,6 +1289,7 @@ impl RuffleHandle {
+             *render_ms = 0.0;
+             *worst_ms = 0.0;
+             *slow_frames = 0;
++            *hitch_ms = 0.0;
+         });
+     }
+ 
+@@ -1292,6 +1316,10 @@ impl RuffleHandle {
+                 &instance.window,
+                 "ruffleNoInlineCaches",
+             ));
++            ruffle_core::method_stats::set_hitch_every_frame(flag_requested(
++                &instance.window,
++                "ruffleHitchEveryFrame",
++            ));
+             ruffle_core::method_stats::set_fast_type_checks(!flag_requested(
+                 &instance.window,
+                 "ruffleNoFastTypeChecks",
+-- 
+2.51.1.windows.1
+

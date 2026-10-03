@@ -1,0 +1,271 @@
+import crc32 from "crc-32";
+import fs from "fs";
+import fse from "fs-extra";
+import path from "path";
+import { rimraf } from "rimraf";
+import { Builder, parseStringPromise } from "xml2js";
+import { create } from "xmlbuilder2";
+import { ResourcePathUtils } from "../src/utils/resource.path.utils";
+import { extractPropLibs } from "./lib/mapData";
+
+const ROOT_DIR = path.join(__dirname, "..");
+const RESOURCES_DIR = path.join(ROOT_DIR, "resources");
+const RESOURCE_BUILD_DIR = path.join(ROOT_DIR, ".resource");
+const TYPES_DIR = path.join(ROOT_DIR, "src", "generated"); // generated output (data + literal modules)
+
+interface ResourceDefinition {
+  id: string;
+  idLow: number;
+  versionLow: number;
+  sourcePath: string;
+  buildPath: string;
+  /** Set only for a single-file resource (skybox faces): the file at `sourcePath` is copied to
+   *  `buildPath/<destFileName>` instead of copying `sourcePath` wholesale as a directory. Needed because
+   *  the client always fetches the literal filename "image.<ext>" — see resolveResourceType. */
+  destFileName?: string;
+}
+
+/** A named skybox SET lives at resources/skybox/<name>/vN/{front,back,left,right,top,bottom}.<ext> — one
+ *  version folder, six human-named face files. Each face becomes its OWN resource ("skybox/<name>/<face>",
+ *  its own idLow) because the client fetches each cube face independently; see findResources below. */
+const SKYBOX_FACES = ["front", "back", "left", "right", "top", "bottom"];
+
+function generateResourceId(friendlyPath: string): number {
+  return (crc32.str(friendlyPath) & 0xffffff) >>> 0;
+}
+
+async function findSkyboxFaceResources(setId: string, versionDir: string, latestVersion: number): Promise<ResourceDefinition[]> {
+  const files = await fs.promises.readdir(versionDir);
+  const resources: ResourceDefinition[] = [];
+  for (const face of SKYBOX_FACES) {
+    const faceFile = files.find((f) => path.parse(f).name === face);
+    if (!faceFile) {
+      console.warn(`Warning: skybox set "${setId}" is missing the "${face}" face (expected "${face}.jpg" or "${face}.png" in ${versionDir}).`);
+      continue;
+    }
+    const id = `${setId}/${face}`;
+    const idLow = generateResourceId(id);
+    const buildPath = ResourcePathUtils.getResourcePath({ idLow, versionLow: latestVersion });
+    resources.push({ id, idLow, versionLow: latestVersion, sourcePath: path.join(versionDir, faceFile), buildPath, destFileName: `image${path.extname(faceFile)}` });
+  }
+  return resources;
+}
+
+async function findResources(dir: string, parentPath: string = ""): Promise<ResourceDefinition[]> {
+  const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  let resources: ResourceDefinition[] = [];
+
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const relativePath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+      const versionDirs = (await fs.promises.readdir(fullPath, { withFileTypes: true }))
+        .filter((d) => d.isDirectory() && d.name.startsWith("v"))
+        .map((d) => parseInt(d.name.substring(1), 10))
+        .filter((version) => !isNaN(version))
+        .sort((a, b) => b - a);
+
+      if (versionDirs.length > 0) {
+        const latestVersion = versionDirs[0];
+        const id = relativePath.replace(/\\/g, "/");
+        const sourcePath = path.join(fullPath, `v${latestVersion}`);
+
+        if (parentPath === "skybox") {
+          resources = resources.concat(await findSkyboxFaceResources(id, sourcePath, latestVersion));
+          continue;
+        }
+
+        let idLow: number;
+
+        const idFilePath = path.join(sourcePath, "id.json");
+
+        if (fs.existsSync(idFilePath)) {
+          const idFileContent = await fs.promises.readFile(idFilePath, "utf8");
+          const idData = JSON.parse(idFileContent);
+          if (typeof idData.idlow !== "number") {
+            throw new Error(`invalid or missing "idlow" em ${idFilePath}`);
+          }
+          idLow = idData.idlow;
+          console.log(`ID Fixo encontrado para "${id}": ${idLow}`);
+        } else {
+          idLow = generateResourceId(id);
+        }
+
+        const buildPath = ResourcePathUtils.getResourcePath({ idLow, versionLow: latestVersion });
+
+        resources.push({ id, idLow, versionLow: latestVersion, sourcePath: path.join(fullPath, `v${latestVersion}`), buildPath });
+      } else {
+        resources = resources.concat(await findResources(fullPath, relativePath));
+      }
+    }
+  }
+  return resources;
+}
+
+async function copyRootFiles() {
+  const entries = await fs.promises.readdir(RESOURCES_DIR, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isFile()) {
+      const sourceFile = path.join(RESOURCES_DIR, entry.name);
+      const destFile = path.join(RESOURCE_BUILD_DIR, entry.name);
+      await fse.copy(sourceFile, destFile);
+      console.log(`Copied root file: ${entry.name}`);
+    }
+  }
+}
+
+function generateResourceTypesFileContent(resources: ResourceDefinition[]): string {
+  let content = `// Automatically generated file. Do not edit manually.\n\n`;
+
+  // Empty resource tree: there is nothing to narrow ResourceId to. `keyof typeof ResourceData`
+  // would be `never`, and every `"..." as ResourceId` in src/ would stop compiling — widen to string.
+  if (!resources.length) {
+    content += `export const ResourceData: { [id: string]: { idLow: number; path: string; versionLow: number } } = {};\n\n`;
+    content += `export type ResourceId = string;\n`;
+    return content;
+  }
+
+  content += `export const ResourceData = {\n`;
+  resources.forEach((res) => {
+    content += `    "${res.id}": { idLow: ${res.idLow}, path: "${res.buildPath}", versionLow: ${res.versionLow} },\n`;
+  });
+  content += `} as const;\n\n`;
+
+  content += `export type ResourceId = keyof typeof ResourceData;\n`;
+
+  return content;
+}
+
+function friendlyNameToResourceId(name: string): string {
+  return `library/${name.toLowerCase().replace(/\s+/g, "_")}`;
+}
+
+/**
+ * Per map.xml: parse once to derive its prop-library dependencies (proplibs.xml in .resource +
+ * mapDependencies.ts) and to write the cleaned client XML (gameplay nodes stripped — those are
+ * extracted into per-map JSON separately by scripts/buildMapData.ts). Resource-only concern.
+ */
+async function processMaps(resources: ResourceDefinition[]): Promise<void> {
+  console.log("Processing map resources (proplibs + dependencies + cleaned XML)...");
+  const resourceMap = new Map<string, ResourceDefinition>(resources.map((r) => [r.id, r]));
+  const mapResources = resources.filter((r) => r.id.startsWith("map/") && r.id.endsWith("/xml"));
+
+  const builder = new Builder();
+
+  let depsContent = `// Automatically generated file. Do not edit manually.\n\n`;
+  depsContent += `import { ResourceId } from "./resourceTypes";\n\n`;
+  depsContent += `export const mapDependencies: { [key: number]: ResourceId[] } = {\n`;
+
+  for (const mapResource of mapResources) {
+    const mapXmlPath = path.join(mapResource.sourcePath, "map.xml");
+    if (!fs.existsSync(mapXmlPath)) continue;
+
+    try {
+      const parsed = await parseStringPromise(await fs.promises.readFile(mapXmlPath, "utf8"), { trim: true });
+
+      // Prop libraries -> proplibs.xml (.resource) + map dependencies.
+      const propLibs = extractPropLibs(parsed);
+      const root = create({ version: "1.0", encoding: "UTF-8" }).ele("proplibs");
+      const libResourceIds: string[] = [];
+      for (const libName of propLibs) {
+        const resourceId = friendlyNameToResourceId(libName);
+        const libResource = resourceMap.get(resourceId);
+        if (libResource) {
+          root.ele("library", { name: libName, "resource-id": libResource.idLow.toString(16), version: libResource.versionLow });
+          libResourceIds.push(resourceId);
+        } else {
+          console.warn(`Warning: Library "${libName}" referenced in map "${mapResource.id}" not found.`);
+        }
+      }
+      await fs.promises.writeFile(path.join(RESOURCE_BUILD_DIR, mapResource.buildPath, "proplibs.xml"), root.end({ prettyPrint: true }));
+      depsContent += `    ${mapResource.idLow}: [${libResourceIds.map((id) => `"${id}"`).join(", ")}],\n`;
+
+      // Cleaned client XML: strip the gameplay nodes (delete is a no-op if absent). buildMapData
+      // extracts these into per-map JSON.
+      delete parsed.map["spawn-points"];
+      delete parsed.map["special-geometry"];
+      delete parsed.map["ctf-flags"];
+      delete parsed.map["dom-keypoints"];
+      await fs.promises.writeFile(path.join(RESOURCE_BUILD_DIR, mapResource.buildPath, "map.xml"), builder.buildObject(parsed));
+    } catch (error) {
+      console.error(`Failed to process map ${mapResource.id}:`, error);
+    }
+  }
+
+  depsContent += `};\n`;
+  await fs.promises.writeFile(path.join(TYPES_DIR, "mapDependencies.ts"), depsContent);
+
+  console.log(`Processed ${mapResources.length} map resources.`);
+}
+
+async function validateTaraResources(resources: ResourceDefinition[]): Promise<void> {
+  console.log("Validating .tara resources...");
+  for (const resource of resources) {
+    if (resource.destFileName) continue; // single-file resource (skybox face) — sourcePath isn't a directory
+    const sourceFiles = await fs.promises.readdir(resource.sourcePath);
+    const isImageTara = sourceFiles.includes("image.tara");
+    const hasProperties = sourceFiles.includes("properties.json");
+
+    if (isImageTara && !hasProperties) {
+      throw new Error(`Resource "${resource.id}" is an image.tara resource but is missing the required "properties.json" file in its source directory: ${resource.sourcePath}`);
+    }
+  }
+}
+
+async function build() {
+  console.log("Starting resource build process...");
+
+  await rimraf(RESOURCE_BUILD_DIR);
+  await fs.promises.mkdir(RESOURCE_BUILD_DIR, { recursive: true });
+  await fs.promises.mkdir(TYPES_DIR, { recursive: true }); // src/generated is build output; ensure it exists
+
+  // Game resources are not part of the repository (see README). Without them there is nothing to
+  // build, but src/generated must exist or src/ will not compile — emit the empty modules and stop.
+  if (!fs.existsSync(RESOURCES_DIR)) {
+    console.warn(`No resources directory at ${RESOURCES_DIR} — skipping the resource build.`);
+    console.warn("The server will start and serve no game resource. See README to populate resources/.");
+    await fs.promises.writeFile(path.join(TYPES_DIR, "resourceTypes.ts"), generateResourceTypesFileContent([]));
+    await fs.promises.writeFile(
+      path.join(TYPES_DIR, "mapDependencies.ts"),
+      `// Automatically generated file. Do not edit manually.\n\nimport { ResourceId } from "./resourceTypes";\n\nexport const mapDependencies: { [key: number]: ResourceId[] } = {};\n`
+    );
+    return;
+  }
+
+  console.log("Discovering resources from 'resources' directory...");
+  const resources = await findResources(RESOURCES_DIR);
+
+  const idMap = new Map<number, string>();
+  for (const res of resources) {
+    if (idMap.has(res.idLow)) {
+      throw new Error(`Hash collision detected! Both "${res.id}" and "${idMap.get(res.idLow)}" produce the same ID (${res.idLow}). Please rename one.`);
+    }
+    idMap.set(res.idLow, res.id);
+  }
+  console.log(`Found ${resources.length} resources. No collisions detected.`);
+
+  await validateTaraResources(resources);
+
+  console.log("Generating 'resourceTypes.ts'...");
+  const typesContent = generateResourceTypesFileContent(resources);
+  await fs.promises.writeFile(path.join(TYPES_DIR, "resourceTypes.ts"), typesContent);
+
+  console.log("Copying categorized resource files to '.resource' directory...");
+  for (const res of resources) {
+    const destPath = path.join(RESOURCE_BUILD_DIR, res.buildPath);
+    // Single-file resource (skybox face): copy+rename to "image.<ext>", the literal filename the client
+    // fetches (resolveResourceType matches on it) — not a directory copy like every other resource.
+    await fse.copy(res.sourcePath, res.destFileName ? path.join(destPath, res.destFileName) : destPath);
+  }
+
+  // Single pass: proplibs.xml, mapDependencies, per-map battle JSON, eager literals + cleaned XML.
+  await processMaps(resources);
+
+  await copyRootFiles();
+  console.log("Resource build process completed successfully!");
+}
+
+build().catch((error) => {
+  console.error("Resource build failed:", error);
+  process.exit(1);
+});

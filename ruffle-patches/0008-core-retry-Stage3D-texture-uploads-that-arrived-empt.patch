@@ -1,0 +1,290 @@
+From 8367c7b26ac19f1413aefdf44fc4464b924ed2d4 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 04:50:03 +0300
+Subject: [PATCH 08/17] core: retry Stage3D texture uploads that arrived empty
+
+---
+ .../avm2/globals/flash/display/bitmap_data.rs | 10 +++
+ .../globals/flash/display3D/context_3d.rs     |  5 +-
+ .../display3D/textures/rectangle_texture.rs   | 22 +++++
+ .../flash/display3D/textures/texture.rs       | 20 +++++
+ core/src/avm2/object/context3d_object.rs      | 90 ++++++++++++++++++-
+ core/src/bitmap/bitmap_data.rs                |  9 ++
+ 6 files changed, 154 insertions(+), 2 deletions(-)
+
+diff --git a/core/src/avm2/globals/flash/display/bitmap_data.rs b/core/src/avm2/globals/flash/display/bitmap_data.rs
+index 9575d3bd..83ce0d1f 100644
+--- a/core/src/avm2/globals/flash/display/bitmap_data.rs
++++ b/core/src/avm2/globals/flash/display/bitmap_data.rs
+@@ -1100,6 +1100,16 @@ pub fn dispose<'gc>(
+     let this = this.as_object().unwrap();
+ 
+     if let Some(bitmap_data) = this.as_bitmap_data() {
++        // Картинка могла быть залита в текстуру Stage3D ещё пустой (клиент заполняет её позже,
++        // а в Ruffle события загрузки приходят с задержкой). Освобождение — последний момент,
++        // когда содержимое ещё доступно: успеваем перезалить.
++        let stage3ds: Vec<_> = activation.context.stage.stage3ds().iter().copied().collect();
++        for stage3d in stage3ds {
++            if let Some(context3d) = stage3d.context3d() {
++                context3d.retry_empty_uploads(activation.context, true);
++            }
++        }
++
+         // Don't check if we've already disposed this BitmapData - 'BitmapData.dispose()' can be called
+         // multiple times
+         bitmap_data.dispose(activation.gc());
+diff --git a/core/src/avm2/globals/flash/display3D/context_3d.rs b/core/src/avm2/globals/flash/display3D/context_3d.rs
+index 55bfe418..1bfc6ade 100644
+--- a/core/src/avm2/globals/flash/display3D/context_3d.rs
++++ b/core/src/avm2/globals/flash/display3D/context_3d.rs
+@@ -210,13 +210,16 @@ pub fn draw_triangles<'gc>(
+ }
+ 
+ pub fn present<'gc>(
+-    _activation: &mut Activation<'_, 'gc>,
++    activation: &mut Activation<'_, 'gc>,
+     this: Value<'gc>,
+     _args: &[Value<'gc>],
+ ) -> Result<Value<'gc>, Error<'gc>> {
+     let this = this.as_object().unwrap();
+ 
+     if let Some(context) = this.as_context_3d() {
++        // Заливки, приехавшие пустыми, повторяем в начале кадра: к этому моменту картинка
++        // могла догрузиться.
++        context.retry_empty_uploads(activation.context, false);
+         context.present();
+     }
+     Ok(Value::Undefined)
+diff --git a/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs b/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
+index ce7d83ab..e02ec889 100644
+--- a/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
++++ b/core/src/avm2/globals/flash/display3D/textures/rectangle_texture.rs
+@@ -31,11 +31,33 @@ pub fn upload_from_bitmap_data<'gc>(
+         let source_obj = args.get_object(activation, 0, "source")?;
+ 
+         if let Some(source) = source_obj.as_bitmap_data() {
++            // Клиент грузит картинки асинхронно и иногда заливает текстуру раньше, чем
++            // изображение приедет: в Ruffle события загрузки приходят позже, чем во Flash.
++            // Такую заливку запоминаем и повторяем, иначе текстура навсегда останется чёрной
++            // (в ProTanki так пропадали ящики припасов).
++            let empty = {
++                let data = source.sync(activation.context.renderer);
++                let data = data.borrow();
++                data.pixels_rgba()
++                    .chunks_exact(4)
++                    .step_by(16)
++                    .all(|pixel| pixel == [0, 0, 0, 0])
++            };
++
+             texture.context3d().copy_bitmapdata_to_texture(
+                 &source.sync(activation.context.renderer).borrow(),
+                 texture.handle(),
+                 0,
+             );
++
++            if empty {
++                texture.context3d().remember_empty_upload(
++                    activation.gc(),
++                    texture.handle(),
++                    source,
++                    0,
++                );
++            }
+         } else {
+             unreachable!("Argument is BitmapData-typed");
+         }
+diff --git a/core/src/avm2/globals/flash/display3D/textures/texture.rs b/core/src/avm2/globals/flash/display3D/textures/texture.rs
+index a6b6b34c..26d0cb79 100644
+--- a/core/src/avm2/globals/flash/display3D/textures/texture.rs
++++ b/core/src/avm2/globals/flash/display3D/textures/texture.rs
+@@ -125,11 +125,31 @@ pub fn upload_from_bitmap_data<'gc>(
+         if let Some(source) = source_obj.as_bitmap_data() {
+             let mip_level = args.get_u32(1);
+             if mip_level == 0 {
++                let empty = {
++                    let data = source.sync(activation.context.renderer);
++                    let data = data.borrow();
++                    // Проверяем выборочно: полностью прозрачная картинка означает, что клиент
++                    // залил текстуру раньше, чем изображение успело приехать.
++                    data.pixels_rgba()
++                        .chunks_exact(4)
++                        .step_by(16)
++                        .all(|pixel| pixel == [0, 0, 0, 0])
++                };
++
+                 texture.context3d().copy_bitmapdata_to_texture(
+                     &source.sync(activation.context.renderer).borrow(),
+                     texture.handle(),
+                     0,
+                 );
++
++                if empty {
++                    texture.context3d().remember_empty_upload(
++                        activation.gc(),
++                        texture.handle(),
++                        source,
++                        0,
++                    );
++                }
+             } else {
+                 avm2_stub_method!(
+                     activation,
+diff --git a/core/src/avm2/object/context3d_object.rs b/core/src/avm2/object/context3d_object.rs
+index a64f6b38..f79ab7f3 100644
+--- a/core/src/avm2/object/context3d_object.rs
++++ b/core/src/avm2/object/context3d_object.rs
+@@ -8,6 +8,8 @@ use crate::avm2::value::Value;
+ use crate::avm2_stub_method;
+ use crate::bitmap::bitmap_data::BitmapRawData;
+ use crate::context::{RenderContext, UpdateContext};
++use gc_arena::barrier::unlock;
++use gc_arena::lock::RefLock;
+ use gc_arena::{Collect, Gc, GcWeak};
+ use naga_agal::AgalError;
+ use ruffle_common::utils::HasPrefixField;
+@@ -48,6 +50,7 @@ impl<'gc> Context3DObject<'gc> {
+                 base: ScriptObjectData::new(class),
+                 render_context: Cell::new(Some(context3d)),
+                 stage3d,
++                pending_uploads: RefLock::new(Vec::new()),
+             },
+         ))
+     }
+@@ -56,6 +59,78 @@ impl<'gc> Context3DObject<'gc> {
+         self.0.stage3d
+     }
+ 
++    /// Запоминает заливку текстуры, приехавшую пустой.
++    ///
++    /// Клиент грузит картинки асинхронно, а текстуру заливает по своей готовности. В Ruffle
++    /// изображения доезжают позже, чем во Flash, поэтому заливка иногда получает ещё пустой
++    /// BitmapData и текстура навсегда остаётся чёрной (в ProTanki так пропадали ящики припасов).
++    /// Такие заливки повторяются, пока картинка не появится.
++    pub fn remember_empty_upload(
++        self,
++        mc: &gc_arena::Mutation<'gc>,
++        texture: Rc<dyn Texture>,
++        source: crate::bitmap::bitmap_data::BitmapData<'gc>,
++        layer: u32,
++    ) {
++        let mut pending = unlock!(Gc::write(mc, self.0), Context3DData, pending_uploads).borrow_mut();
++
++        if pending.len() < 64 {
++            pending.push(PendingUpload {
++                texture,
++                source,
++                layer,
++                attempts: 0,
++            });
++        }
++    }
++
++    /// Повторяет заливки, которые приехали пустыми, пока картинка не появится.
++    /// `force` — проверить прямо сейчас, не дожидаясь очередного цикла: так делается при
++    /// освобождении BitmapData, когда это последняя возможность забрать содержимое.
++    pub fn retry_empty_uploads(self, context: &mut UpdateContext<'gc>, force: bool) {
++        // Ждём ограниченное время: если картинки нет и через полминуты, значит её и не будет.
++        // Проверка забирает пиксели с видеокарты, поэтому делаем её не каждый кадр.
++        const MAX_ATTEMPTS: u32 = 1800;
++        const CHECK_EVERY: u32 = 15;
++
++        let pending = std::mem::take(
++            &mut *unlock!(Gc::write(context.gc(), self.0), Context3DData, pending_uploads).borrow_mut(),
++        );
++
++        let mut keep = Vec::with_capacity(pending.len());
++        for mut upload in pending {
++            upload.attempts += 1;
++            if !force && upload.attempts % CHECK_EVERY != 0 {
++                if upload.attempts < MAX_ATTEMPTS {
++                    keep.push(upload);
++                }
++                continue;
++            }
++
++            let filled = {
++                let data = upload.source.sync(context.renderer);
++                let data = data.borrow();
++                let pixels = data.pixels_rgba();
++                pixels.chunks_exact(4).step_by(16).any(|p| p != [0, 0, 0, 0])
++            };
++
++            if filled {
++                self.copy_bitmapdata_to_texture(
++                    &upload.source.sync(context.renderer).borrow(),
++                    upload.texture.clone(),
++                    upload.layer,
++                );
++                continue;
++            }
++
++            if upload.attempts < MAX_ATTEMPTS {
++                keep.push(upload);
++            }
++        }
++
++        *unlock!(Gc::write(context.gc(), self.0), Context3DData, pending_uploads).borrow_mut() = keep;
++    }
++
+     pub fn with_context_3d<R>(self, f: impl FnOnce(&mut dyn Context3D) -> R) -> R {
+         // Temporarily take ownership of the Context3D instance.
+         let cell = &self.0.render_context;
+@@ -308,7 +383,7 @@ impl<'gc> Context3DObject<'gc> {
+     /// Нужен `Context3D.drawToBitmapData`: игра рисует кадр на GPU, а затем копирует его в
+     /// BitmapData и показывает как обычный Bitmap (так устроено превью танка в гараже).
+     pub fn back_buffer_handle(self) -> ruffle_render::bitmap::BitmapHandle {
+-        self.with_context_3d(|context3d| context3d.bitmap_handle())
++        self.with_context_3d(|context3d| context3d.draw_source_handle())
+     }
+ 
+     pub fn render(self, context: &mut RenderContext<'_, 'gc>) {
+@@ -522,6 +597,19 @@ pub struct Context3DData<'gc> {
+     render_context: Cell<Option<Box<dyn Context3D>>>,
+ 
+     stage3d: Stage3DObject<'gc>,
++
++    /// Заливки текстур, приехавшие пустыми, — повторяются, пока картинка не появится.
++    pending_uploads: RefLock<Vec<PendingUpload<'gc>>>,
++}
++
++#[derive(Collect)]
++#[collect(no_drop)]
++struct PendingUpload<'gc> {
++    #[collect(require_static)]
++    texture: Rc<dyn Texture>,
++    source: crate::bitmap::bitmap_data::BitmapData<'gc>,
++    layer: u32,
++    attempts: u32,
+ }
+ 
+ impl<'gc> TObject<'gc> for Context3DObject<'gc> {
+diff --git a/core/src/bitmap/bitmap_data.rs b/core/src/bitmap/bitmap_data.rs
+index 29eb34fd..88fee2e7 100644
+--- a/core/src/bitmap/bitmap_data.rs
++++ b/core/src/bitmap/bitmap_data.rs
+@@ -360,6 +360,11 @@ impl<'gc> BitmapData<'gc> {
+     pub fn ptr_eq(&self, other: BitmapData<'gc>) -> bool {
+         self.0.ptr_eq(other.0)
+     }
++
++    /// Адрес данных — им удобно различать объекты в диагностике.
++    pub fn id(&self) -> usize {
++        self.0.id()
++    }
+ }
+ 
+ #[derive(Collect)]
+@@ -709,6 +714,10 @@ mod wrapper {
+         pub fn ptr_eq(&self, other: BitmapRawDataWrapper<'gc>) -> bool {
+             Gc::ptr_eq(self.0, other.0)
+         }
++
++        pub fn id(&self) -> usize {
++            Gc::as_ptr(self.0) as *const () as usize
++        }
+     }
+ }
+ 
+-- 
+2.51.1.windows.1
+

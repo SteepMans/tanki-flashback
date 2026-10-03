@@ -1,0 +1,53 @@
+From 948f48de6c2083629e1cf048924a754f1ff3ebcc Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 04:50:03 +0300
+Subject: [PATCH 10/17] naga-agal: write each destination component from its
+ own source component
+
+---
+ render/naga-agal/src/builder.rs | 27 +++++++++------------------
+ 1 file changed, 9 insertions(+), 18 deletions(-)
+
+diff --git a/render/naga-agal/src/builder.rs b/render/naga-agal/src/builder.rs
+index 8ecd2513..b92a644e 100644
+--- a/render/naga-agal/src/builder.rs
++++ b/render/naga-agal/src/builder.rs
+@@ -1102,26 +1102,17 @@ impl<'a> NagaBuilder<'a> {
+                 value: expr,
+             });
+         } else {
+-            // A scalar write occurs when we have exactly one component in the dest write mask.
+-            let scalar_write = [Mask::X, Mask::Y, Mask::Z, Mask::W]
+-                .into_iter()
+-                .filter(|mask| dest.write_mask.contains(*mask))
+-                .count()
+-                == 1;
+-
+             for (i, mask) in [(0, Mask::X), (1, Mask::Y), (2, Mask::Z), (3, Mask::W)] {
+                 if dest.write_mask.contains(mask) {
+-                    let source_component = if scalar_write || source_is_scalar {
+-                        if source_is_scalar {
+-                            expr
+-                        } else {
+-                            // Grab the first component of the source expression - all of them should be
+-                            // the same when doing a scalar write.
+-                            self.evaluate_expr(Expression::AccessIndex {
+-                                base: expr,
+-                                index: 0,
+-                            })
+-                        }
++                    // AGAL writes each masked component from the *matching* component of the
++                    // source, which has already been swizzled into place by the source load. A
++                    // single-component mask is no exception: taking component 0 instead only
++                    // happens to work when the source swizzle replicates one value (`.yyyy` and
++                    // friends), and silently produces the wrong value otherwise — an unswizzled
++                    // source fed `x` into every masked component, which collapsed transformed
++                    // positions (`m34` into `op.xyz`) onto a line and left the scene invisible.
++                    let source_component = if source_is_scalar {
++                        expr
+                     } else {
+                         self.evaluate_expr(Expression::AccessIndex {
+                             base: expr,
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,106 @@
+From 1a6f88fe3e76cf89cadcd97eb002da3d991d7b82 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 09:49:59 +0300
+Subject: [PATCH 13/17] bitmap: composite scaled BitmapData.draw only over the
+ covered area
+
+---
+ core/src/bitmap/operations.rs | 61 ++++++++++++++++++++++++-----------
+ 1 file changed, 43 insertions(+), 18 deletions(-)
+
+diff --git a/core/src/bitmap/operations.rs b/core/src/bitmap/operations.rs
+index cac11637..4397fc5d 100644
+--- a/core/src/bitmap/operations.rs
++++ b/core/src/bitmap/operations.rs
+@@ -1318,18 +1318,31 @@ fn scale_on_cpu<'gc>(
+     let dest_width = target.width();
+     let dest_height = target.height();
+ 
+-    let mut pixels = Vec::with_capacity((dest_width * dest_height) as usize);
++    // Рисовать нужно только там, куда легло изображение: остальные пиксели приёмника трогать
++    // нельзя. Раньше здесь переписывалась вся картинка, и содержимое, наложенное предыдущими
++    // вызовами, обнулялось — так пропадали плитки в текстурных атласах (ящики припасов в игре
++    // становились чёрными).
++    let x_min = offset_x.floor().max(0.0) as u32;
++    let y_min = offset_y.floor().max(0.0) as u32;
++    let x_max = ((offset_x + src_width * scale_x).ceil().max(0.0) as u32).min(dest_width);
++    let y_max = ((offset_y + src_height * scale_y).ceil().max(0.0) as u32).min(dest_height);
++
++    if x_min >= x_max || y_min >= y_max {
++        return;
++    }
++
++    let mut pixels = Vec::with_capacity(((x_max - x_min) * (y_max - y_min)) as usize);
+ 
+-    for y in 0..dest_height {
+-        for x in 0..dest_width {
+-            // Source rectangle this destination pixel covers.
+-            let x0 = ((x as f64 + 0.0 - offset_x) / scale_x).max(0.0);
++    for y in y_min..y_max {
++        for x in x_min..x_max {
++            // Прямоугольник источника, который накрывает этот пиксель приёмника.
++            let x0 = ((x as f64 - offset_x) / scale_x).max(0.0);
+             let x1 = ((x as f64 + 1.0 - offset_x) / scale_x).min(src_width);
+-            let y0 = ((y as f64 + 0.0 - offset_y) / scale_y).max(0.0);
++            let y0 = ((y as f64 - offset_y) / scale_y).max(0.0);
+             let y1 = ((y as f64 + 1.0 - offset_y) / scale_y).min(src_height);
+ 
+             if x1 <= x0 || y1 <= y0 {
+-                pixels.push(Color::rgba(0, 0, 0, 0));
++                pixels.push(None);
+                 continue;
+             }
+ 
+@@ -1363,26 +1376,38 @@ fn scale_on_cpu<'gc>(
+                 src.get_pixel32_raw(sx, sy).to_un_multiplied_alpha()
+             };
+ 
+-            pixels.push(if target.transparency() {
+-                color.to_premultiplied_alpha(true)
+-            } else {
+-                Color::rgba(color.red(), color.green(), color.blue(), 255)
+-            });
++            pixels.push(Some(color.to_premultiplied_alpha(true)));
+         }
+     }
+ 
+     drop(src);
+ 
+-    let (target, _) = target.overwrite_cpu_pixels_from_gpu(context.gc());
++    let opaque = !target.transparency();
++    let target = target.sync(context.renderer);
+     let mut write = target.borrow_mut(context.gc());
+-    for (i, color) in pixels.into_iter().enumerate() {
+-        let x = (i as u32) % dest_width;
+-        let y = (i as u32) / dest_width;
+-        write.set_pixel32_raw(x, y, color);
++
++    let mut index = 0;
++    for y in y_min..y_max {
++        for x in x_min..x_max {
++            let color = pixels[index];
++            index += 1;
++
++            let Some(color) = color else {
++                continue;
++            };
++
++            // Обычное наложение поверх того, что уже нарисовано, как это делает сам Flash.
++            let mut color = write.get_pixel32_raw(x, y).blend_over(&color);
++            if opaque {
++                color = color.with_alpha(255);
++            }
++            write.set_pixel32_raw(x, y, color);
++        }
+     }
++
+     write.set_cpu_dirty(
+         context.gc(),
+-        PixelRegion::for_whole_size(dest_width, dest_height),
++        PixelRegion::encompassing_pixels((x_min, y_min), (x_max - 1, y_max - 1)),
+     );
+ }
+ 
+-- 
+2.51.1.windows.1
+

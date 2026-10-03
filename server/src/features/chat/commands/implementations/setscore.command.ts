@@ -1,0 +1,35 @@
+import { SetCtfScorePacket } from "@/features/battle/battle.packets";
+import { CommandContext, ICommand } from "@/features/chat/commands/command.types";
+import { ChatModeratorLevel } from "@/shared/models/enums/chat-moderator-level.enum";
+
+/** Sets the team scores of the current battle (team modes; RED=0, BLUE=1 on the wire). */
+export default class SetScoreCommand implements ICommand {
+    name = "setscore";
+    description = "Задаёт счёт команд в текущей битве (командные режимы). Использование: /setscore <красные> <синие>.";
+    permissionLevel: ChatModeratorLevel = ChatModeratorLevel.MODERATOR;
+    example = "/setscore 5 3";
+
+    async execute(context: CommandContext, args: string[]): Promise<void> {
+        const battle = context.executor.currentBattle;
+        if (!context.executor.user || !battle) {
+            context.reply("Нужно быть в битве.");
+            return;
+        }
+        if (!battle.isTeamMode()) {
+            context.reply("Эта битва не в командном режиме.");
+            return;
+        }
+        const red = parseInt(args[0], 10);
+        const blue = parseInt(args[1], 10);
+        if (isNaN(red) || isNaN(blue) || red < 0 || blue < 0) {
+            context.reply("Использование: /setscore <красные> <синие> (числа не меньше 0).");
+            return;
+        }
+
+        battle.scoreRed = red;
+        battle.scoreBlue = blue;
+        battle.broadcast(new SetCtfScorePacket({ team: 0, score: red }));
+        battle.broadcast(new SetCtfScorePacket({ team: 1, score: blue }));
+        context.reply(`Счёт изменён: красные ${red} — ${blue} синие.`);
+    }
+}

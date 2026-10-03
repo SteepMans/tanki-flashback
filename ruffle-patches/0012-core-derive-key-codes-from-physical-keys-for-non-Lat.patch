@@ -1,0 +1,35 @@
+From 6aeac70dcabf817fa45b7350ff4b12c946dc3498 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 09:49:59 +0300
+Subject: [PATCH 12/17] core: derive key codes from physical keys for non-Latin
+ layouts
+
+---
+ core/src/input.rs | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/core/src/input.rs b/core/src/input.rs
+index 922d13ea..b0f6f843 100644
+--- a/core/src/input.rs
++++ b/core/src/input.rs
+@@ -239,6 +239,17 @@ impl InputManager {
+         match self.key_code_mapping_type {
+             KeyCodeMappingType::Physical => map_to_key_code_physical(descriptor.physical_key),
+             KeyCodeMappingType::Logical => {
++                // Раскладки с нелатинскими буквами: Flash отдаёт содержимому код клавиши
++                // (виртуальный код системы), поэтому управление на WASD работает и с русской
++                // раскладкой. Отображение символа дало бы код самой буквы — например 1094 для
++                // «ц» вместо 87 для W, — и содержимое такой клавиши просто не знает.
++                if let LogicalKey::Character(char) = descriptor.logical_key
++                    && !char.is_ascii()
++                    && let Some(key_code) = map_to_key_code_physical(descriptor.physical_key)
++                {
++                    return Some(key_code);
++                }
++
+                 map_to_key_code_logical(descriptor.logical_key, descriptor.key_location)
+             }
+         }
+-- 
+2.51.1.windows.1
+

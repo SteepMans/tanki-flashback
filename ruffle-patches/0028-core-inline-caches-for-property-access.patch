@@ -1,0 +1,723 @@
+From 06c2f67ce0853eb84f5919b428d6850bcfe71014 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 16:14:37 +0300
+Subject: [PATCH] core: cache resolved properties at the call site
+
+---
+ core/src/avm2.rs                      |   1 +
+ core/src/avm2/activation.rs           |  77 ++++++++++++++---
+ core/src/avm2/inline_cache.rs         | 118 ++++++++++++++++++++++++++
+ core/src/avm2/method_stats.rs         |  11 +++
+ core/src/avm2/op.rs                   |  13 +++
+ core/src/avm2/optimizer/type_aware.rs |   6 +-
+ core/src/avm2/value.rs                |  43 +++++++++-
+ core/src/avm2/verify.rs               |  58 ++++++++++++-
+ core/src/avm2/vtable.rs               |  30 ++++++-
+ web/src/lib.rs                        |  19 +++++
+ 10 files changed, 357 insertions(+), 19 deletions(-)
+ create mode 100644 core/src/avm2/inline_cache.rs
+
+diff --git a/core/src/avm2.rs b/core/src/avm2.rs
+index 27edf07e..f47adb73 100644
+--- a/core/src/avm2.rs
++++ b/core/src/avm2.rs
+@@ -60,6 +60,7 @@ mod filters;
+ mod flv;
+ mod function;
+ pub mod globals;
++mod inline_cache;
+ mod metadata;
+ mod method;
+ pub mod method_stats;
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index cc4af9ca..1129fa7b 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -18,6 +18,7 @@ use crate::avm2::object::{
+     ArrayObject, ByteArrayObject, ClassObject, FunctionObject, NamespaceObject, ScriptObject,
+     XmlListObject,
+ };
++use crate::avm2::inline_cache::PropertyCache;
+ use crate::avm2::op::{LookupSwitch, Op};
+ use crate::avm2::scope::{Scope, ScopeChain, search_scope_stack};
+ use crate::avm2::script::Script;
+@@ -722,6 +723,14 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+ 
+         let verified_info = method.get_verified_info();
+         let opcodes = verified_info.parsed_code.as_slice();
++        // Инлайн-кэши обращений к свойствам. Выключаются со страницы (`?noic=1`), чтобы сравнивать
++        // «до/после» на одной сборке: пустой срез — и `caches.get` у каждой инструкции даёт None,
++        // то есть старый поиск имени.
++        let caches: &[PropertyCache] = if crate::avm2::method_stats::inline_caches_enabled() {
++            &verified_info.caches
++        } else {
++            &[]
++        };
+ 
+         self.timeout_check()?;
+ 
+@@ -800,7 +809,8 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+                 Op::CallProperty {
+                     multiname,
+                     num_args,
+-                } => self.op_call_property(*multiname, *num_args),
++                    cache,
++                } => self.op_call_property(*multiname, *num_args, caches.get(*cache as usize)),
+                 Op::CallPropLex {
+                     multiname,
+                     num_args,
+@@ -808,16 +818,21 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+                 Op::CallPropVoid {
+                     multiname,
+                     num_args,
+-                } => self.op_call_prop_void(*multiname, *num_args),
++                    cache,
++                } => self.op_call_prop_void(*multiname, *num_args, caches.get(*cache as usize)),
+                 Op::CallStatic { method, num_args } => self.op_call_static(*method, *num_args),
+                 Op::CallSuper {
+                     multiname,
+                     num_args,
+                 } => self.op_call_super(*multiname, *num_args),
+-                Op::GetPropertyStatic { multiname } => self.op_get_property_static(*multiname),
++                Op::GetPropertyStatic { multiname, cache } => {
++                    self.op_get_property_static(*multiname, caches.get(*cache as usize))
++                }
+                 Op::GetPropertyFast { multiname } => self.op_get_property_fast(*multiname),
+                 Op::GetPropertySlow { multiname } => self.op_get_property_slow(*multiname),
+-                Op::SetPropertyStatic { multiname } => self.op_set_property_static(*multiname),
++                Op::SetPropertyStatic { multiname, cache } => {
++                    self.op_set_property_static(*multiname, caches.get(*cache as usize))
++                }
+                 Op::SetPropertyFast { multiname } => self.op_set_property_fast(*multiname),
+                 Op::SetPropertySlow { multiname } => self.op_set_property_slow(*multiname),
+                 Op::InitProperty { multiname } => self.op_init_property(*multiname),
+@@ -1316,12 +1331,28 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         &mut self,
+         multiname: Gc<'gc, Multiname<'gc>>,
+         arg_count: u32,
++        cache: Option<&PropertyCache>,
+     ) -> Result<(), Error<'gc>> {
+         let args = self.get_args(arg_count);
+-        let multiname = multiname.fill_with_runtime_params(self)?;
++
++        // Ячейка есть только у мест с постоянным именем свойства. Там же не нужен и разбор
++        // имени со стека: `fill_with_runtime_params` для такого имени лишь копирует его целиком.
++        let Some(cache) = cache else {
++            let multiname = multiname.fill_with_runtime_params(self)?;
++            let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
++
++            let value = receiver.call_property(&multiname, args, self)?;
++
++            self.push_stack(value);
++
++            return Ok(());
++        };
++
+         let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
++        let vtable = receiver.vtable(self);
++        let property = cache.resolve(vtable, &multiname);
+ 
+-        let value = receiver.call_property(&multiname, args, self)?;
++        let value = receiver.call_property_resolved(property, &multiname, args, self)?;
+ 
+         self.push_stack(value);
+ 
+@@ -1348,12 +1379,24 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         &mut self,
+         multiname: Gc<'gc, Multiname<'gc>>,
+         arg_count: u32,
++        cache: Option<&PropertyCache>,
+     ) -> Result<(), Error<'gc>> {
+         let args = self.get_args(arg_count);
+-        let multiname = multiname.fill_with_runtime_params(self)?;
++
++        let Some(cache) = cache else {
++            let multiname = multiname.fill_with_runtime_params(self)?;
++            let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
++
++            receiver.call_property(&multiname, args, self)?;
++
++            return Ok(());
++        };
++
+         let receiver = self.pop_stack().null_check(self, Some(&multiname))?;
++        let vtable = receiver.vtable(self);
++        let property = cache.resolve(vtable, &multiname);
+ 
+-        receiver.call_property(&multiname, args, self)?;
++        receiver.call_property_resolved(property, &multiname, args, self)?;
+ 
+         Ok(())
+     }
+@@ -1439,11 +1482,18 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+     fn op_get_property_static(
+         &mut self,
+         multiname: Gc<'gc, Multiname<'gc>>,
++        cache: Option<&PropertyCache>,
+     ) -> Result<(), Error<'gc>> {
+         // default path for static names
+         let object = self.pop_stack().null_check(self, Some(&multiname))?;
+ 
+-        let value = object.get_property(&multiname, self)?;
++        let vtable = object.vtable(self);
++        let property = match cache {
++            Some(cache) => cache.resolve(vtable, &multiname),
++            None => vtable.get_trait(&multiname),
++        };
++
++        let value = object.get_property_resolved(vtable, property, &multiname, self)?;
+         self.push_stack(value);
+ 
+         Ok(())
+@@ -1510,6 +1560,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+     fn op_set_property_static(
+         &mut self,
+         multiname: Gc<'gc, Multiname<'gc>>,
++        cache: Option<&PropertyCache>,
+     ) -> Result<(), Error<'gc>> {
+         // default path for static names
+ 
+@@ -1517,7 +1568,13 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+ 
+         let object = self.pop_stack().null_check(self, Some(&multiname))?;
+ 
+-        object.set_property(&multiname, value, self)?;
++        let vtable = object.vtable(self);
++        let property = match cache {
++            Some(cache) => cache.resolve(vtable, &multiname),
++            None => vtable.get_trait(&multiname),
++        };
++
++        object.set_property_resolved(property, &multiname, value, self)?;
+ 
+         Ok(())
+     }
+diff --git a/core/src/avm2/inline_cache.rs b/core/src/avm2/inline_cache.rs
+new file mode 100644
+index 00000000..e42ad66f
+--- /dev/null
++++ b/core/src/avm2/inline_cache.rs
+@@ -0,0 +1,118 @@
++//! Инлайн-кэши мест обращения к свойствам.
++//!
++//! `callproperty`/`getproperty`/`setproperty` ищут имя в таблице методов класса: считается хэш
++//! имени свойства (по всем его символам, кэша хэша у строк движка нет), потом идёт поиск в
++//! хэш-таблице и перебор пространств имён. И так на КАЖДОМ выполнении инструкции, хотя в горячем
++//! коде по одному и тому же месту почти всегда приходит объект того же класса.
++//!
++//! Оптимизатор типов уже заменяет такие обращения на прямой номер слота или метода там, где тип
++//! известен статически (`optimizer::type_aware`). Остаётся то, что он в принципе не может решить:
++//! вызовы через интерфейс (у каждого наследника свой номер метода), поля значений типа `*` и
++//! `Object`. Физика клиента написана именно так, поэтому в бою этих инструкций много.
++//!
++//! Здесь на каждое такое место кода заводится одна ячейка «последняя таблица методов -> что в ней
++//! нашлось». Проверка на входе — сравнение номера таблицы (см. `VTable::id`), и при совпадении
++//! поиск имени не делается вовсе. Таблица методов после создания не меняется, так что запомненный
++//! ответ не может протухнуть, а смена класса объекта видна по номеру. Отрицательный ответ («такого
++//! свойства в классе нет, ищи среди динамических») кэшируется тоже — он стоит того же поиска.
++//!
++//! Ячейки живут в `VerifiedMethodInfo::caches`, номер ячейки прошит в саму инструкцию. Отдельным
++//! массивом, а не полем инструкции, потому что инструкция обязана оставаться в 16 байтах.
++
++use crate::avm2::property::Property;
++use crate::avm2::vtable::VTable;
++use std::cell::Cell;
++
++/// Что запомнено в ячейке. Разложенный `Option<Property>`: хранить его целиком было бы 32 байта
++/// на место кода, а мест этих десятки тысяч.
++mod kind {
++    pub const NONE: u8 = 0;
++    pub const SLOT: u8 = 1;
++    pub const CONST_SLOT: u8 = 2;
++    pub const METHOD: u8 = 3;
++    pub const VIRTUAL: u8 = 4;
++}
++
++/// Признак «нет такого номера» для половинок `Virtual`.
++const NO_ID: u32 = u32::MAX;
++
++/// Номер ячейки у инструкции, которой кэш не положен. Заведомо за границей массива ячеек:
++/// столько мест обращения в одном методе не бывает, а если бы и было — лишние остались бы без
++/// кэша, и только.
++pub const NO_CACHE: u16 = u16::MAX;
++
++/// Одно место обращения к свойству. 16 байт: номер таблицы, вид найденного свойства и до двух
++/// номеров (слот/метод, для свойств с методами доступа — читающий и пишущий).
++#[derive(Default)]
++pub struct PropertyCache {
++    /// Номер таблицы методов, для которой запомнен ответ; 0 — ячейка пуста.
++    vtable_id: Cell<u32>,
++    kind: Cell<u8>,
++    first: Cell<u32>,
++    second: Cell<u32>,
++}
++
++impl PropertyCache {
++    /// Свойство по имени в этой таблице методов. При попадании поиск имени не выполняется.
++    #[inline(always)]
++    pub fn resolve<'gc>(
++        &self,
++        vtable: VTable<'gc>,
++        multiname: &crate::avm2::Multiname<'gc>,
++    ) -> Option<Property> {
++        let id = vtable.id();
++        if self.vtable_id.get() == id {
++            return self.stored();
++        }
++
++        let property = vtable.get_trait(multiname);
++        self.store(id, property);
++        property
++    }
++
++    #[inline(always)]
++    fn stored(&self) -> Option<Property> {
++        match self.kind.get() {
++            kind::SLOT => Some(Property::Slot {
++                slot_id: self.first.get() as usize,
++            }),
++            kind::CONST_SLOT => Some(Property::ConstSlot {
++                slot_id: self.first.get() as usize,
++            }),
++            kind::METHOD => Some(Property::Method {
++                disp_id: self.first.get() as usize,
++            }),
++            kind::VIRTUAL => Some(Property::Virtual {
++                get: (self.first.get() != NO_ID).then(|| self.first.get() as usize),
++                set: (self.second.get() != NO_ID).then(|| self.second.get() as usize),
++            }),
++            _ => None,
++        }
++    }
++
++    fn store(&self, vtable_id: u32, property: Option<Property>) {
++        // Номера слотов и методов в живом коде и до тысячи не доходят, но если чужой SWF всё же
++        // выйдет за границу, место кода просто останется без кэша и будет считаться как раньше.
++        let short = |id: usize| u32::try_from(id).ok().filter(|id| *id != NO_ID);
++        let Some((kind, first, second)) = (match property {
++            None => Some((kind::NONE, 0, 0)),
++            Some(Property::Slot { slot_id }) => short(slot_id).map(|id| (kind::SLOT, id, 0)),
++            Some(Property::ConstSlot { slot_id }) => {
++                short(slot_id).map(|id| (kind::CONST_SLOT, id, 0))
++            }
++            Some(Property::Method { disp_id }) => short(disp_id).map(|id| (kind::METHOD, id, 0)),
++            Some(Property::Virtual { get, set }) => {
++                let get = get.map_or(Some(NO_ID), short);
++                let set = set.map_or(Some(NO_ID), short);
++                get.zip(set).map(|(get, set)| (kind::VIRTUAL, get, set))
++            }
++        }) else {
++            return;
++        };
++
++        self.kind.set(kind);
++        self.first.set(first);
++        self.second.set(second);
++        self.vtable_id.set(vtable_id);
++    }
++}
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index ced36104..250c7bef 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -24,6 +24,9 @@ static FUSION_ENABLED: AtomicBool = AtomicBool::new(true);
+ /// Нативные замены горячих методов движка. Отключаются со страницы
+ /// `window.ruffleNoNativePaths = true`.
+ static NATIVE_PATHS_ENABLED: AtomicBool = AtomicBool::new(true);
++/// Инлайн-кэши обращений к свойствам (`avm2::inline_cache`). Отключаются со страницы
++/// `window.ruffleNoInlineCaches = true` — по той же причине, что и склейка инструкций.
++static INLINE_CACHES_ENABLED: AtomicBool = AtomicBool::new(true);
+ /// Режим сверки: нативный ответ считается, но метод всё равно выполняется байткодом, и результаты
+ /// сравниваются. Включается со страницы `window.ruffleValidateNative = true`. Нужен, чтобы
+ /// доказать совпадение на живой сцене, а не надеяться на аккуратность.
+@@ -66,6 +69,14 @@ pub fn fusion_enabled() -> bool {
+     FUSION_ENABLED.load(Ordering::Relaxed)
+ }
+ 
++pub fn set_inline_caches_enabled(value: bool) {
++    INLINE_CACHES_ENABLED.store(value, Ordering::Relaxed);
++}
++
++pub fn inline_caches_enabled() -> bool {
++    INLINE_CACHES_ENABLED.load(Ordering::Relaxed)
++}
++
+ pub fn set_native_paths_enabled(value: bool) {
+     NATIVE_PATHS_ENABLED.store(value, Ordering::Relaxed);
+ }
+diff --git a/core/src/avm2/op.rs b/core/src/avm2/op.rs
+index 7669ff43..43577cd3 100644
+--- a/core/src/avm2/op.rs
++++ b/core/src/avm2/op.rs
+@@ -50,6 +50,10 @@ pub enum Op<'gc> {
+         multiname: Gc<'gc, Multiname<'gc>>,
+ 
+         num_args: u32,
++
++        /// Номер ячейки инлайн-кэша в `VerifiedMethodInfo::caches`; `NO_CACHE` — без кэша
++        /// (имя свойства известно только в момент выполнения).
++        cache: u16,
+     },
+     CallPropLex {
+         multiname: Gc<'gc, Multiname<'gc>>,
+@@ -60,6 +64,9 @@ pub enum Op<'gc> {
+         multiname: Gc<'gc, Multiname<'gc>>,
+ 
+         num_args: u32,
++
++        /// См. `Op::CallProperty::cache`.
++        cache: u16,
+     },
+     CallStatic {
+         method: Method<'gc>,
+@@ -205,6 +212,9 @@ pub enum Op<'gc> {
+     //    the verifier emits GetPropertySlow.
+     GetPropertyStatic {
+         multiname: Gc<'gc, Multiname<'gc>>,
++
++        /// См. `Op::CallProperty::cache`.
++        cache: u16,
+     },
+     GetPropertyFast {
+         multiname: Gc<'gc, Multiname<'gc>>,
+@@ -345,6 +355,9 @@ pub enum Op<'gc> {
+     // See the comments on the GetProperty op
+     SetPropertyStatic {
+         multiname: Gc<'gc, Multiname<'gc>>,
++
++        /// См. `Op::CallProperty::cache`.
++        cache: u16,
+     },
+     SetPropertyFast {
+         multiname: Gc<'gc, Multiname<'gc>>,
+diff --git a/core/src/avm2/optimizer/type_aware.rs b/core/src/avm2/optimizer/type_aware.rs
+index ad3ca39e..3068d147 100644
+--- a/core/src/avm2/optimizer/type_aware.rs
++++ b/core/src/avm2/optimizer/type_aware.rs
+@@ -1529,7 +1529,7 @@ fn abstract_interpret_ops<'gc>(
+                     optimize_op_to!(Op::SetSlotCoerceI { index: slot_id });
+                 }
+             }
+-            Op::GetPropertyStatic { multiname } => {
++            Op::GetPropertyStatic { multiname, .. } => {
+                 // Verifier only emits this op when the multiname is static
+                 assert!(!multiname.has_lazy_component());
+ 
+@@ -1665,7 +1665,7 @@ fn abstract_interpret_ops<'gc>(
+                 }
+                 // `stack_pop_multiname` handled lazy
+             }
+-            Op::SetPropertyStatic { multiname } => {
++            Op::SetPropertyStatic { multiname, .. } => {
+                 // Verifier only emits this op when the multiname is static
+                 assert!(!multiname.has_lazy_component());
+ 
+@@ -1848,6 +1848,7 @@ fn abstract_interpret_ops<'gc>(
+             Op::CallProperty {
+                 multiname,
+                 num_args,
++                ..
+             }
+             | Op::CallPropLex {
+                 multiname,
+@@ -1891,6 +1892,7 @@ fn abstract_interpret_ops<'gc>(
+             Op::CallPropVoid {
+                 multiname,
+                 num_args,
++                ..
+             } => {
+                 // Arguments
+                 let args = stack.popn(activation, num_args)?;
+diff --git a/core/src/avm2/value.rs b/core/src/avm2/value.rs
+index 03c1e979..235a698a 100644
+--- a/core/src/avm2/value.rs
++++ b/core/src/avm2/value.rs
+@@ -967,8 +967,21 @@ impl<'gc> Value<'gc> {
+         activation: &mut Activation<'_, 'gc>,
+     ) -> Result<Value<'gc>, Error<'gc>> {
+         let vtable = self.vtable(activation);
++        let property = vtable.get_trait(multiname);
+ 
+-        match vtable.get_trait(multiname) {
++        self.get_property_resolved(vtable, property, multiname, activation)
++    }
++
++    /// То же самое, но свойство в таблице методов уже найдено: либо поиском, либо инлайн-кэшем
++    /// места вызова (см. `avm2::inline_cache`).
++    pub fn get_property_resolved(
++        &self,
++        vtable: VTable<'gc>,
++        property: Option<Property>,
++        multiname: &Multiname<'gc>,
++        activation: &mut Activation<'_, 'gc>,
++    ) -> Result<Value<'gc>, Error<'gc>> {
++        match property {
+             Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) => {
+                 // Only objects can have slots
+                 let object = self.as_object().unwrap();
+@@ -1079,8 +1092,20 @@ impl<'gc> Value<'gc> {
+         activation: &mut Activation<'_, 'gc>,
+     ) -> Result<(), Error<'gc>> {
+         let vtable = self.vtable(activation);
++        let property = vtable.get_trait(multiname);
+ 
+-        match vtable.get_trait(multiname) {
++        self.set_property_resolved(property, multiname, value, activation)
++    }
++
++    /// См. `get_property_resolved`.
++    pub fn set_property_resolved(
++        &self,
++        property: Option<Property>,
++        multiname: &Multiname<'gc>,
++        value: Value<'gc>,
++        activation: &mut Activation<'_, 'gc>,
++    ) -> Result<(), Error<'gc>> {
++        match property {
+             Some(Property::Slot { slot_id }) => {
+                 // Only objects can have slots
+                 let object = self.as_object().unwrap();
+@@ -1221,8 +1246,20 @@ impl<'gc> Value<'gc> {
+         activation: &mut Activation<'_, 'gc>,
+     ) -> Result<Value<'gc>, Error<'gc>> {
+         let vtable = self.vtable(activation);
++        let property = vtable.get_trait(multiname);
+ 
+-        match vtable.get_trait(multiname) {
++        self.call_property_resolved(property, multiname, arguments, activation)
++    }
++
++    /// См. `get_property_resolved`.
++    pub fn call_property_resolved(
++        &self,
++        property: Option<Property>,
++        multiname: &Multiname<'gc>,
++        arguments: FunctionArgs<'_, 'gc>,
++        activation: &mut Activation<'_, 'gc>,
++    ) -> Result<Value<'gc>, Error<'gc>> {
++        match property {
+             Some(Property::Slot { slot_id } | Property::ConstSlot { slot_id }) => {
+                 // Only objects can have slots
+                 let object = self.as_object().unwrap();
+diff --git a/core/src/avm2/verify.rs b/core/src/avm2/verify.rs
+index 338acad4..6d8bfc82 100644
+--- a/core/src/avm2/verify.rs
++++ b/core/src/avm2/verify.rs
+@@ -5,6 +5,7 @@ use crate::avm2::error::{
+     make_error_1051, make_error_1054, make_error_1072, make_error_1078, make_error_1107,
+     make_error_1113, make_error_1124,
+ };
++use crate::avm2::inline_cache::{NO_CACHE, PropertyCache};
+ use crate::avm2::method::Method;
+ use crate::avm2::op::{LookupSwitch, Op};
+ use crate::avm2::script::TranslationUnit;
+@@ -32,6 +33,11 @@ pub struct VerifiedMethodInfo<'gc> {
+     /// одна проверка поля.
+     #[collect(require_static)]
+     pub native_method: Option<crate::avm2::fast_paths::NativeMethod>,
++
++    /// По ячейке на каждое место обращения к свойству по имени (см. `avm2::inline_cache`).
++    /// Номер ячейки прошит в саму инструкцию.
++    #[collect(require_static)]
++    pub caches: Box<[PropertyCache]>,
+ }
+ 
+ #[derive(Collect)]
+@@ -545,13 +551,48 @@ pub fn verify_method<'gc>(
+         None
+     };
+ 
++    // Раздача ячеек инлайн-кэша — после всех проходов оптимизатора: он успевает заменить часть
++    // обращений на прямой номер слота или метода, и кэш таким местам уже не нужен.
++    let caches = assign_property_caches(&mut verified_code);
++
+     Ok(VerifiedMethodInfo {
+         parsed_code: verified_code,
+         exceptions: new_exceptions,
+         native_method,
++        caches,
+     })
+ }
+ 
++/// Нумерует места обращения к свойствам по имени и заводит под них ячейки кэша. Имена, которые
++/// становятся известны только в момент выполнения, кэшировать нечем: у такого места нет
++/// постоянного имени, и ячейка отвечала бы про чужое свойство.
++fn assign_property_caches(code: &mut [Op<'_>]) -> Box<[PropertyCache]> {
++    let mut count = 0usize;
++
++    for op in code.iter_mut() {
++        let (multiname, slot) = match op {
++            Op::CallProperty {
++                multiname, cache, ..
++            }
++            | Op::CallPropVoid {
++                multiname, cache, ..
++            }
++            | Op::GetPropertyStatic { multiname, cache }
++            | Op::SetPropertyStatic { multiname, cache } => (*multiname, cache),
++            _ => continue,
++        };
++
++        if multiname.has_lazy_component() || count >= NO_CACHE as usize {
++            continue;
++        }
++
++        *slot = count as u16;
++        count += 1;
++    }
++
++    (0..count).map(|_| PropertyCache::default()).collect()
++}
++
+ fn create_activation_class<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+     method: Method<'gc>,
+@@ -773,6 +814,7 @@ fn translate_op<'gc>(
+             Op::CallProperty {
+                 multiname,
+                 num_args,
++                cache: NO_CACHE,
+             }
+         }
+         AbcOp::CallPropLex { index, num_args } => {
+@@ -791,6 +833,7 @@ fn translate_op<'gc>(
+             Op::CallPropVoid {
+                 multiname,
+                 num_args,
++                cache: NO_CACHE,
+             }
+         }
+         AbcOp::CallStatic { index, num_args } => {
+@@ -831,7 +874,10 @@ fn translate_op<'gc>(
+                 translation_unit.pool_maybe_uninitialized_multiname(activation, index)?;
+ 
+             if !multiname.has_lazy_component() {
+-                Op::GetPropertyStatic { multiname }
++                Op::GetPropertyStatic {
++                    multiname,
++                    cache: NO_CACHE,
++                }
+             } else if multiname.has_lazy_name() && !multiname.has_lazy_ns() {
+                 // The fast-path path usually doesn't activate when the public
+                 // namespace isn't included in the multiname's namespace set.
+@@ -851,7 +897,10 @@ fn translate_op<'gc>(
+                 translation_unit.pool_maybe_uninitialized_multiname(activation, index)?;
+ 
+             if !multiname.has_lazy_component() {
+-                Op::SetPropertyStatic { multiname }
++                Op::SetPropertyStatic {
++                    multiname,
++                    cache: NO_CACHE,
++                }
+             } else if multiname.has_lazy_name() && !multiname.has_lazy_ns() {
+                 // The fast-path path usually doesn't activate when the public
+                 // namespace isn't included in the multiname's namespace set.
+@@ -942,7 +991,10 @@ fn translate_op<'gc>(
+             // GetLex is split into two ops; multiname is guaranteed static
+             return Ok((
+                 Op::FindPropStrict { multiname },
+-                Some(Op::GetPropertyStatic { multiname }),
++                Some(Op::GetPropertyStatic {
++                    multiname,
++                    cache: NO_CACHE,
++                }),
+             ));
+         }
+         AbcOp::GetDescendants { index } => {
+diff --git a/core/src/avm2/vtable.rs b/core/src/avm2/vtable.rs
+index ea299b01..42f0c5d9 100644
+--- a/core/src/avm2/vtable.rs
++++ b/core/src/avm2/vtable.rs
+@@ -23,6 +23,13 @@ pub struct VTable<'gc>(Gc<'gc, VTableData<'gc>>);
+ #[derive(Collect, Default)]
+ #[collect(no_drop)]
+ struct VTableData<'gc> {
++    /// Сквозной номер таблицы, по нему инлайн-кэши мест обращения к свойствам узнают «тот же
++    /// класс, что и в прошлый раз» (см. `avm2::inline_cache`). Именно номер, а не адрес:
++    /// адрес освобождённой таблицы сборщик может отдать под новую, и кэш молча выдал бы чужой
++    /// слот. Номера не переиспользуются, поэтому такой ошибки быть не может. 0 не выдаётся
++    /// никогда — это признак пустого кэша.
++    id: u32,
++
+     scope: Option<ScopeChain<'gc>>,
+ 
+     protected_namespace: Option<Namespace<'gc>>,
+@@ -70,9 +77,29 @@ impl<'gc> ClassBoundMethod<'gc> {
+     }
+ }
+ 
++/// Выдаёт следующий номер таблицы методов. Начинается с единицы: ноль зарезервирован под
++/// «кэш пуст».
++fn next_vtable_id() -> u32 {
++    use std::sync::atomic::{AtomicU32, Ordering};
++    static NEXT: AtomicU32 = AtomicU32::new(1);
++    NEXT.fetch_add(1, Ordering::Relaxed)
++}
++
+ impl<'gc> VTable<'gc> {
+     pub fn empty(mc: &Mutation<'gc>) -> Self {
+-        VTable(Gc::new(mc, VTableData::default()))
++        VTable(Gc::new(
++            mc,
++            VTableData {
++                id: next_vtable_id(),
++                ..Default::default()
++            },
++        ))
++    }
++
++    /// Номер этой таблицы методов; см. поле `VTableData::id`.
++    #[inline(always)]
++    pub fn id(self) -> u32 {
++        self.0.id
+     }
+ 
+     /// Builds a new vtable by calculating the flattened list of instance traits
+@@ -523,6 +550,7 @@ impl<'gc> VTable<'gc> {
+         }
+ 
+         Ok(VTableData {
++            id: next_vtable_id(),
+             scope,
+             protected_namespace: defining_class_def.protected_namespace(),
+             resolved_traits,
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 728fe8c6..2e7b7ca6 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1220,6 +1220,21 @@ impl RuffleHandle {
+                     );
+                 }
+ 
++                // Гистограмма по видам инструкций (window.ruffleTraceOps). По ней видно, на что
++                // вообще уходит кадр, — без неё выбор следующей оптимизации был бы гаданием.
++                // Сам счёт заметно замедляет игру, поэтому включается отдельно и на замерах
++                // скорости выключен.
++                if ruffle_core::method_stats::ops_enabled() {
++                    let list = js_sys::Array::new();
++                    for (name, count) in ruffle_core::method_stats::take_ops() {
++                        let row = js_sys::Array::new();
++                        row.push(&JsValue::from_str(name));
++                        row.push(&JsValue::from_f64(count as f64 / elapsed as f64));
++                        list.push(&row);
++                    }
++                    let _ = js_sys::Reflect::set(&stats, &JsValue::from_str("opKinds"), &list);
++                }
++
+                 for (name, value) in [
+                     ("ticks", *ticks as f64 / elapsed as f64),
+                     ("renders", *renders as f64 / elapsed as f64),
+@@ -1273,6 +1288,10 @@ impl RuffleHandle {
+                 &instance.window,
+                 "ruffleNoNativePaths",
+             ));
++            ruffle_core::method_stats::set_inline_caches_enabled(!flag_requested(
++                &instance.window,
++                "ruffleNoInlineCaches",
++            ));
+             ruffle_core::method_stats::set_validate_native_paths(flag_requested(
+                 &instance.window,
+                 "ruffleValidateNative",
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,601 @@
+From 9fa02398d06187fe2fa7b70260df8753dad7e2cc Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 11:19:36 +0300
+Subject: [PATCH 3/3] core: translate Sprite3D.calculateLight, validation-only
+ until proven on live
+
+---
+ core/src/avm2/fast_paths.rs | 529 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 527 insertions(+), 2 deletions(-)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 80e35868..f8781437 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -88,6 +88,8 @@ pub enum NativeMethod {
+     SortByAverageZ,
+     /// Рамка вокруг текстуры покраски с растяжкой крайних пикселей.
+     PadTexture,
++    /// Освещение спрайта точечными, прожекторными и трубчатыми источниками.
++    CalculateLight,
+ }
+ 
+ impl NativeMethod {
+@@ -119,6 +121,7 @@ impl NativeMethod {
+             // Утилита текстур покраски в library.swf: класс обфусцирован, имя метода — из
+             // отладочной записи метода.
+             ("521423108862310899123423632234", "padTextureDuplicated") => Some(Self::PadTexture),
++            ("Sprite3D", "calculateLight") => Some(Self::CalculateLight),
+             _ => None,
+         }
+     }
+@@ -133,13 +136,16 @@ impl NativeMethod {
+                 | Self::SetTextureAt
+                 | Self::SetVertexBufferAt
+                 | Self::BspCollectFaces
++                | Self::CalculateLight
+         )
+     }
+ 
+     /// Метод исполняется нативно только в режиме сверки: перевод готов, но по умолчанию не
+     /// включается, пока живой бой не покажет ноль расхождений с байткодом.
+     pub fn validate_only(self) -> bool {
+-        matches!(self, Self::CalculateOobb)
++        // Освещение спрайта на стендовой карте не исполняется, поэтому стендом не сверено:
++        // включение по умолчанию — после нуля расхождений на живом бою.
++        matches!(self, Self::CalculateOobb | Self::CalculateLight)
+     }
+ 
+     /// Возможна ли сверка «выполнить оба прохода и сравнить». Рамка текстуры уничтожает вход
+@@ -3880,6 +3886,488 @@ fn pad_texture<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>>
+     Some(out_value)
+ }
+ 
++/// Слоты одного вида источника света; у каждого вида свой класс и свои номера.
++#[derive(Clone, Copy)]
++struct LightKindSlots {
++    /// cmd, cmh, cml — положение в координатах камеры; cmc, cmg, cmk — ось (для прожектора и
++    /// трубки; у точечного не используются и равны нулям).
++    cm_position: [usize; 3],
++    cm_axis: [usize; 3],
++    attenuation_begin: usize,
++    attenuation_end: usize,
++    intensity: usize,
++    color: usize,
++    /// falloff и hotspot прожектора; falloff и length трубки. У точечного не используются.
++    falloff: usize,
++    hotspot_or_length: usize,
++    vtable: u32,
++}
++
++/// Номера слотов освещения спрайта.
++#[derive(Clone, Copy)]
++struct LightSlots {
++    /// Камера: размеры видового окна, фокус, вид и его флаг, источники и их числа.
++    view_size: [usize; 2],
++    focal_length: usize,
++    view: usize,
++    view_constrained: usize,
++    directional_light: usize,
++    directional_strength: usize,
++    shadow_map: usize,
++    shadow_strength: usize,
++    deferred_strength: usize,
++    omnies: usize,
++    omnies_count: usize,
++    spots: usize,
++    spots_count: usize,
++    tubes: usize,
++    tubes_count: usize,
++    /// Спрайт: набор констант света, флаг и положение (md, mh, ml).
++    light_const: usize,
++    lighted: usize,
++    m_position: [usize; 3],
++    camera_vtable: u32,
++    /// Виды источников разбираются лениво — по первому живому экземпляру каждого.
++    omni: Option<LightKindSlots>,
++    spot: Option<LightKindSlots>,
++    tube: Option<LightKindSlots>,
++}
++
++thread_local! {
++    static LIGHT_SLOTS: RefCell<Option<LightSlots>> = const { RefCell::new(None) };
++    static LIGHT_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn light_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++    camera: Object<'gc>,
++) -> Option<LightSlots> {
++    if let Some(slots) = LIGHT_SLOTS.with(|cache| *cache.borrow()) {
++        return Some(slots);
++    }
++    if LIGHT_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Result<LightSlots, bool> {
++        let engine = |activation: &mut Activation<'_, 'gc>, object, name| {
++            slot_of(activation, object, name, true).ok_or(true)
++        };
++        let public = |activation: &mut Activation<'_, 'gc>, object, name| {
++            slot_of(activation, object, name, false).ok_or(true)
++        };
++        let view_slot = public(activation, camera, "view")?;
++        let view = camera
++            .get_slot(view_slot)
++            .as_object()
++            .ok_or(("вид ещё не назначен", false).1)?;
++        Ok(LightSlots {
++            view_size: [
++                engine(activation, camera, "viewSizeX")?,
++                engine(activation, camera, "viewSizeY")?,
++            ],
++            focal_length: engine(activation, camera, "focalLength")?,
++            view: view_slot,
++            view_constrained: engine(activation, view, "constrained")?,
++            directional_light: public(activation, camera, "directionalLight")?,
++            directional_strength: public(activation, camera, "directionalLightStrength")?,
++            shadow_map: public(activation, camera, "shadowMap")?,
++            shadow_strength: public(activation, camera, "shadowMapStrength")?,
++            deferred_strength: public(activation, camera, "deferredLightingStrength")?,
++            omnies: engine(activation, camera, "omnies")?,
++            omnies_count: engine(activation, camera, "omniesCount")?,
++            spots: engine(activation, camera, "spots")?,
++            spots_count: engine(activation, camera, "spotsCount")?,
++            tubes: engine(activation, camera, "tubes")?,
++            tubes_count: engine(activation, camera, "tubesCount")?,
++            light_const: engine(activation, this, "lightConst")?,
++            lighted: engine(activation, this, "lighted")?,
++            m_position: [
++                engine(activation, this, "md")?,
++                engine(activation, this, "mh")?,
++                engine(activation, this, "ml")?,
++            ],
++            camera_vtable: camera.vtable().id(),
++            omni: None,
++            spot: None,
++            tube: None,
++        })
++    };
++    match resolve(activation) {
++        Ok(slots) => {
++            LIGHT_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            Some(slots)
++        }
++        Err(hopeless) => {
++            if hopeless {
++                LIGHT_HOPELESS.with(|flag| flag.set(true));
++            }
++            None
++        }
++    }
++}
++
++/// Слоты вида источника по живому экземпляру. У точечного нет оси и углов — для него берутся
++/// нули соответствующих имён (falloff у OmniLight отсутствует, поэтому и не разбирается).
++fn light_kind_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    sample: Object<'gc>,
++    axis_and_angles: bool,
++    length_instead_of_hotspot: bool,
++) -> Option<LightKindSlots> {
++    let engine = |activation: &mut Activation<'_, 'gc>, object, name| {
++        slot_of(activation, object, name, true)
++    };
++    let public = |activation: &mut Activation<'_, 'gc>, object, name| {
++        slot_of(activation, object, name, false)
++    };
++    let cm_axis = if axis_and_angles {
++        [
++            engine(activation, sample, "cmc")?,
++            engine(activation, sample, "cmg")?,
++            engine(activation, sample, "cmk")?,
++        ]
++    } else {
++        [0usize; 3]
++    };
++    let falloff = if axis_and_angles {
++        public(activation, sample, "falloff")?
++    } else {
++        0
++    };
++    let hotspot_or_length = if axis_and_angles {
++        if length_instead_of_hotspot {
++            public(activation, sample, "length")?
++        } else {
++            public(activation, sample, "hotspot")?
++        }
++    } else {
++        0
++    };
++    Some(LightKindSlots {
++        cm_position: [
++            engine(activation, sample, "cmd")?,
++            engine(activation, sample, "cmh")?,
++            engine(activation, sample, "cml")?,
++        ],
++        cm_axis,
++        attenuation_begin: public(activation, sample, "attenuationBegin")?,
++        attenuation_end: public(activation, sample, "attenuationEnd")?,
++        intensity: public(activation, sample, "intensity")?,
++        color: public(activation, sample, "color")?,
++        falloff,
++        hotspot_or_length,
++        vtable: sample.vtable().id(),
++    })
++}
++
++/// Список источников: числа и элементы с проверкой класса. `None` — байткод на этом входе
++/// бросил бы ошибку или класс неизвестен, уступаем интерпретатору.
++fn light_list<'gc>(
++    camera: Object<'gc>,
++    list_slot: usize,
++    count_slot: usize,
++    kind: &Option<LightKindSlots>,
++) -> Option<Vec<Object<'gc>>> {
++    let count = match camera.get_slot(count_slot) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    if count < 0 {
++        return None;
++    }
++    let count = count as usize;
++    let mut lights = Vec::with_capacity(count);
++    if count == 0 {
++        return Some(lights);
++    }
++    let vector = camera.get_slot(list_slot).as_object()?;
++    let storage = vector.as_vector_storage()?;
++    if count > storage.length() {
++        return None;
++    }
++    let kind = kind.as_ref()?;
++    for at in 0..count {
++        let light = storage.get_optional(at)?.as_object()?;
++        if light.vtable().id() != kind.vtable {
++            return None;
++        }
++        lights.push(light);
++    }
++    Some(lights)
++}
++
++/// Прибавка канала цвета: порядок операций повторяет байткод.
++fn light_channel_add<'gc>(
++    light_const: Object<'gc>,
++    at: usize,
++    strength: f64,
++    channel: i32,
++    mc: &Mutation<'gc>,
++) {
++    if let Some(mut storage) = light_const.as_vector_storage_mut(mc) {
++        let current = storage
++            .get_optional(at)
++            .and_then(|value| value.try_as_f64())
++            .unwrap_or(f64::NAN);
++        storage.set_in_range(
++            at,
++            Value::Number(current + strength * f64::from(channel) / 255.0),
++        );
++    }
++}
++
++/// `Sprite3D.calculateLight` — освещение спрайта: рассеянная составляющая по флагам камеры и
++/// вклады точечных, прожекторных и трубчатых источников в три константы цвета. Полностью
++/// замкнутая арифметика; на сценах со светом это до семи процентов кадра.
++fn calculate_light<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let camera = activation.local_register(1).as_object()?;
++    let mut slots = light_slots(activation, this, camera)?;
++    if camera.vtable().id() != slots.camera_vtable {
++        return None;
++    }
++
++    // Ленивое дознание слотов видов света по первым живым экземплярам.
++    let sample_of = |camera: Object<'gc>, list_slot: usize| -> Option<Object<'gc>> {
++        camera
++            .get_slot(list_slot)
++            .as_object()
++            .and_then(|vector| vector.as_vector_storage().ok_or(()).ok()?.get_optional(0))
++            .and_then(|value| value.as_object())
++    };
++    let count_of = |camera: Object<'gc>, count_slot: usize| -> i32 {
++        match camera.get_slot(count_slot) {
++            Value::Integer(value) => value,
++            _ => -1,
++        }
++    };
++    if slots.omni.is_none() && count_of(camera, slots.omnies_count) > 0 {
++        let sample = sample_of(camera, slots.omnies)?;
++        slots.omni = Some(light_kind_slots(activation, sample, false, false)?);
++    }
++    if slots.spot.is_none() && count_of(camera, slots.spots_count) > 0 {
++        let sample = sample_of(camera, slots.spots)?;
++        slots.spot = Some(light_kind_slots(activation, sample, true, false)?);
++    }
++    if slots.tube.is_none() && count_of(camera, slots.tubes_count) > 0 {
++        let sample = sample_of(camera, slots.tubes)?;
++        slots.tube = Some(light_kind_slots(activation, sample, true, true)?);
++    }
++    LIGHT_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++
++    // Прескан до первой записи: наборы источников, вид, константы.
++    let omnies = light_list(camera, slots.omnies, slots.omnies_count, &slots.omni)
++        .or_else(|| (count_of(camera, slots.omnies_count) == 0).then(Vec::new))?;
++    let spots = light_list(camera, slots.spots, slots.spots_count, &slots.spot)
++        .or_else(|| (count_of(camera, slots.spots_count) == 0).then(Vec::new))?;
++    let tubes = light_list(camera, slots.tubes, slots.tubes_count, &slots.tube)
++        .or_else(|| (count_of(camera, slots.tubes_count) == 0).then(Vec::new))?;
++    let view = camera.get_slot(slots.view).as_object()?;
++    let constrained = match view.get_slot(slots.view_constrained) {
++        Value::Bool(value) => value,
++        _ => return None,
++    };
++    let light_const = this.get_slot(slots.light_const).as_object()?;
++    if light_const.as_vector_storage()?.length() < 3 {
++        return None;
++    }
++
++    let num = |object: Object<'gc>, slot: usize| {
++        object.get_slot(slot).try_as_f64().unwrap_or(f64::NAN)
++    };
++    let kx = num(camera, slots.view_size[0]) / num(camera, slots.focal_length); // l29
++    let ky = num(camera, slots.view_size[1]) / num(camera, slots.focal_length); // l28
++
++    // Рассеянная составляющая: гаснет, когда есть направленный свет или карта теней.
++    let directional_on = !matches!(
++        camera.get_slot(slots.directional_light),
++        Value::Null | Value::Undefined
++    ) && num(camera, slots.directional_strength) > 0.0;
++    let shadow_on = !matches!(
++        camera.get_slot(slots.shadow_map),
++        Value::Null | Value::Undefined
++    ) && num(camera, slots.shadow_strength) > 0.0;
++    let ambient_off = !constrained && (directional_on || shadow_on);
++
++    let mc = activation.gc();
++    {
++        let mut storage = light_const.as_vector_storage_mut(mc)?;
++        let base = if ambient_off { 0.0 } else { 1.0 };
++        for at in 0..3 {
++            storage.set_in_range(at, Value::Number(base));
++        }
++    }
++
++    let sx = num(this, slots.m_position[0]) * kx; // l17
++    let sy = num(this, slots.m_position[1]) * ky; // l20
++    let sz = num(this, slots.m_position[2]); // l15
++    let len = (sx * sx + sy * sy + sz * sz).sqrt(); // l13
++    let nx = -sx / len; // l4
++    let ny = -sy / len; // l21
++    let nz = -sz / len; // l12
++
++    let dls = num(camera, slots.deferred_strength);
++    let mut lighted = false;
++
++    let clamp01_sq = |value: f64| {
++        let mut out = value;
++        if out > 1.0 {
++            out = 1.0;
++        }
++        if out < 0.0 {
++            out = 0.0;
++        }
++        out * out
++    };
++    let color_of = |light: Object<'gc>, slot: usize| match light.get_slot(slot) {
++        Value::Integer(value) => value,
++        _ => 0,
++    };
++    let apply = |light_const: Object<'gc>, strength: f64, color: i32, mc: &Mutation<'gc>| {
++        light_channel_add(light_const, 0, strength, (color >> 16) & 255, mc);
++        light_channel_add(light_const, 1, strength, (color >> 8) & 255, mc);
++        light_channel_add(light_const, 2, strength, color & 255, mc);
++    };
++
++    if let Some(kind) = &slots.omni {
++        for light in omnies.iter() {
++            let lx = num(*light, kind.cm_position[0]) * kx; // l30
++            let ly = num(*light, kind.cm_position[1]) * ky; // l11
++            let lz = num(*light, kind.cm_position[2]); // l26
++            let reach = num(*light, kind.attenuation_end); // l24
++            if lx - reach < sx
++                && lx + reach > sx
++                && ly - reach < sy
++                && ly + reach > sy
++                && lz - reach < sz
++                && lz + reach > sz
++            {
++                let dx = lx - sx;
++                let dy = ly - sy;
++                let dz = lz - sz;
++                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
++                if dist > 0.0 && dist < reach {
++                    let dx = dx / dist;
++                    let dy = dy / dist;
++                    let dz = dz / dist;
++                    let atten = clamp01_sq(
++                        (reach - dist)
++                            / (num(*light, kind.attenuation_end)
++                                - num(*light, kind.attenuation_begin)),
++                    );
++                    let mut dot = dx * nx + dy * ny + dz * nz;
++                    dot *= 0.5;
++                    dot += 0.5;
++                    let strength = atten * dot * num(*light, kind.intensity) * 2.0 * dls;
++                    apply(light_const, strength, color_of(*light, kind.color), mc);
++                    lighted = true;
++                }
++            }
++        }
++    }
++
++    if let Some(kind) = &slots.spot {
++        for light in spots.iter() {
++            let lx = num(*light, kind.cm_position[0]) * kx;
++            let ly = num(*light, kind.cm_position[1]) * ky;
++            let lz = num(*light, kind.cm_position[2]);
++            let reach = num(*light, kind.attenuation_end);
++            if lx - reach < sx
++                && lx + reach > sx
++                && ly - reach < sy
++                && ly + reach > sy
++                && lz - reach < sz
++                && lz + reach > sz
++            {
++                let dx = lx - sx;
++                let dy = ly - sy;
++                let dz = lz - sz;
++                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
++                if dist > 0.0 && dist < reach {
++                    let dx = dx / dist;
++                    let dy = dy / dist;
++                    let dz = dz / dist;
++                    // Ось прожектора: порядок множителей повторяет байткод, включая то, что
++                    // второй член умножается на ky.
++                    let axis = (-dx) * num(*light, kind.cm_axis[0]) * kx
++                        - dy * num(*light, kind.cm_axis[1]) * ky
++                        - dz * num(*light, kind.cm_axis[2]);
++                    let cos_falloff = (num(*light, kind.falloff) * 0.5).cos();
++                    if axis > cos_falloff {
++                        let mut dot = dx * nx + dy * ny + dz * nz;
++                        dot *= 0.5;
++                        dot += 0.5;
++                        let atten = clamp01_sq(
++                            (reach - dist)
++                                / (num(*light, kind.attenuation_end)
++                                    - num(*light, kind.attenuation_begin)),
++                        );
++                        let hotspot = clamp01_sq(
++                            (axis - cos_falloff)
++                                / ((num(*light, kind.hotspot_or_length) * 0.5).cos()
++                                    - cos_falloff),
++                        );
++                        let strength =
++                            atten * hotspot * dot * num(*light, kind.intensity) * 2.0 * dls;
++                        apply(light_const, strength, color_of(*light, kind.color), mc);
++                        lighted = true;
++                    }
++                }
++            }
++        }
++    }
++
++    if let Some(kind) = &slots.tube {
++        for light in tubes.iter() {
++            let half = num(*light, kind.hotspot_or_length) * 0.5; // l18
++            let reach_along = half + num(*light, kind.falloff); // l7
++            // Ось трубки: обе первые компоненты байткод умножает на kx.
++            let ax = num(*light, kind.cm_axis[0]) * kx; // l10
++            let ay = num(*light, kind.cm_axis[1]) * kx; // l5
++            let az = num(*light, kind.cm_axis[2]); // l9
++            let lx = num(*light, kind.cm_position[0]) * kx + ax * half; // l30
++            let ly = num(*light, kind.cm_position[1]) * ky + ay * half; // l11
++            let lz = num(*light, kind.cm_position[2]) + az * half; // l26
++            let mut t = ax * (sx - lx) + ay * (sy - ly) + az * (sz - lz); // l27
++            if t > -reach_along && t < reach_along {
++                let dx = lx + (ax * t - sx);
++                let dy = ly + (ay * t - sy);
++                let dz = lz + (az * t - sz);
++                let dist = (dx * dx + dy * dy + dz * dz).sqrt();
++                let reach = num(*light, kind.attenuation_end);
++                if dist > 0.0 && dist < reach {
++                    let dx = dx / dist;
++                    let dy = dy / dist;
++                    let dz = dz / dist;
++                    let mut dot = dx * nx + dy * ny + dz * nz;
++                    dot *= 0.5;
++                    dot += 0.5;
++                    let atten = clamp01_sq(
++                        (reach - dist)
++                            / (num(*light, kind.attenuation_end)
++                                - num(*light, kind.attenuation_begin)),
++                    );
++                    if t < 0.0 {
++                        t = -t;
++                    }
++                    let edge = clamp01_sq((reach_along - t) / (reach_along - half));
++                    let strength =
++                        atten * edge * dot * num(*light, kind.intensity) * 2.0 * dls;
++                    apply(light_const, strength, color_of(*light, kind.color), mc);
++                    lighted = true;
++                }
++            }
++        }
++    }
++
++    if lighted {
++        this.set_slot_no_coerce(slots.lighted, Value::Bool(true), mc);
++    }
++    Some(Value::Undefined)
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -4558,6 +5046,41 @@ pub fn snapshot<'gc>(
+         });
+     }
+ 
++    // Освещение спрайта: пишутся три константы света и флаг. Флаг откатывается ссылкой и
++    // сверяется числом на сравнительном месте.
++    if native == NativeMethod::CalculateLight {
++        let this = activation.local_register(0).as_object()?;
++        let camera = activation.local_register(1).as_object()?;
++        let slots = light_slots(activation, this, camera)?;
++        let light_const = this.get_slot(slots.light_const).as_object()?;
++        let mut fields = Vec::with_capacity(4);
++        {
++            let storage = light_const.as_vector_storage()?;
++            for at in 0..3 {
++                fields.push((
++                    Place::Element(light_const, at),
++                    storage
++                        .get_optional(at)?
++                        .try_as_f64()
++                        .unwrap_or(f64::NAN),
++                ));
++            }
++        }
++        fields.push((
++            Place::LinkAddress,
++            match this.get_slot(slots.lighted) {
++                Value::Bool(true) => 1.0,
++                _ => 0.0,
++            },
++        ));
++        let links = vec![(this, slots.lighted, this.get_slot(slots.lighted))];
++        return Some(Snapshot {
++            fields,
++            links,
++            vectors: Vec::new(),
++        });
++    }
++
+     // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
+     // делается один раз за сессию и на чужом объекте запомнил бы неудачу навсегда.
+     if !matches!(
+@@ -4588,7 +5111,8 @@ pub fn snapshot<'gc>(
+         | NativeMethod::WrapperCreate
+         | NativeMethod::ConflictClip
+         | NativeMethod::SortByAverageZ
+-        | NativeMethod::PadTexture => return None,
++        | NativeMethod::PadTexture
++        | NativeMethod::CalculateLight => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -4669,6 +5193,7 @@ pub fn run<'gc>(
+         NativeMethod::ConflictClip => conflict_clip(activation),
+         NativeMethod::SortByAverageZ => sort_faces_entry(activation),
+         NativeMethod::PadTexture => pad_texture(activation),
++        NativeMethod::CalculateLight => calculate_light(activation),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+-- 
+2.51.1.windows.1
+

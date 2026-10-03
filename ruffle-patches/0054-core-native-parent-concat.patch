@@ -1,0 +1,344 @@
+From d39da7ce5f6efd465ead90ee5407c6c511c2ac80 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 11:59:04 +0300
+Subject: [PATCH 3/3] core: native parent concat for alpha, blend and color
+ transform
+
+---
+ core/src/avm2/fast_paths.rs | 278 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 277 insertions(+), 1 deletion(-)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index b0dd78c7..55eb4670 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -94,6 +94,8 @@ pub enum NativeMethod {
+     SpriteBillboard,
+     /// Обход KD-дерева при вставке динамики с выходом в интерпретатор на collectPlanes.
+     KdCollectPlanes,
++    /// Свёртка прозрачности, режима смешивания и цветовой трансформации с родителем.
++    ObjectConcat,
+ }
+ 
+ impl NativeMethod {
+@@ -128,6 +130,7 @@ impl NativeMethod {
+             ("Sprite3D", "calculateLight") => Some(Self::CalculateLight),
+             ("Sprite3D", "c7108d08") => Some(Self::SpriteBillboard),
+             ("KDContainer", "d33b25fe") => Some(Self::KdCollectPlanes),
++            ("Object3D", "concat") => Some(Self::ObjectConcat),
+             _ => None,
+         }
+     }
+@@ -144,6 +147,7 @@ impl NativeMethod {
+                 | Self::BspCollectFaces
+                 | Self::CalculateLight
+                 | Self::KdCollectPlanes
++                | Self::ObjectConcat
+         )
+     }
+ 
+@@ -5160,6 +5164,229 @@ fn kd_collect_planes<'gc>(
+     }
+ }
+ 
++/// `Object3D.concat` — свёртка прозрачности, режима смешивания и цветовой трансформации с
++/// родительскими. Цветовая трансформация при двух источниках собирается в новый ColorTransform
++/// и доводится его собственным `concat` (интерпретатором — он крошечный).
++fn object_concat<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++) -> Result<Option<Value<'gc>>, crate::avm2::Error<'gc>> {
++    let Some(this) = activation.local_register(0).as_object() else {
++        return Ok(None);
++    };
++    let Some(parent) = activation.local_register(1).as_object() else {
++        return Ok(None);
++    };
++    let Some(slots) = concat_slots(activation, this) else {
++        return Ok(None);
++    };
++
++    // Прескан: числовые и ссылочные поля, длина colorConst.
++    let parent_alpha = parent.get_slot(slots.concatenated_alpha).try_as_f64();
++    let own_alpha = this.get_slot(slots.alpha).try_as_f64();
++    let (Some(_), Some(_)) = (parent_alpha, own_alpha) else {
++        return Ok(None);
++    };
++    let Some(color_const) = this.get_slot(slots.color_const).as_object() else {
++        return Ok(None);
++    };
++    {
++        let Some(storage) = color_const.as_vector_storage() else {
++            return Ok(None);
++        };
++        if storage.length() < 7 {
++            return Ok(None);
++        }
++    }
++    let parent_transform = parent.get_slot(slots.concatenated_color_transform);
++    let own_transform = this.get_slot(slots.color_transform);
++    // Слоты ColorTransform — по живому экземпляру.
++    if slots.transform_fields.is_none() {
++        let sample = parent_transform.as_object().or(own_transform.as_object());
++        if let Some(sample) = sample {
++            let mut updated = slots;
++            let names = [
++                "redMultiplier", "greenMultiplier", "blueMultiplier",
++                "redOffset", "greenOffset", "blueOffset",
++            ];
++            let mut fields = [0usize; 6];
++            for at in 0..6 {
++                let Some(slot) = slot_of(activation, sample, names[at], false) else {
++                    return Ok(None);
++                };
++                fields[at] = slot;
++            }
++            updated.transform_fields = Some(fields);
++            CONCAT_SLOTS.with(|cache| *cache.borrow_mut() = Some(updated));
++            return object_concat_with(activation, this, parent, &updated);
++        }
++    }
++    object_concat_with(activation, this, parent, &slots)
++}
++
++fn object_concat_with<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++    parent: Object<'gc>,
++    slots: &ConcatSlots,
++) -> Result<Option<Value<'gc>>, crate::avm2::Error<'gc>> {
++    let parent_alpha = parent
++        .get_slot(slots.concatenated_alpha)
++        .try_as_f64()
++        .unwrap_or(f64::NAN);
++    let own_alpha = this.get_slot(slots.alpha).try_as_f64().unwrap_or(f64::NAN);
++    let parent_transform = parent.get_slot(slots.concatenated_color_transform);
++    let own_transform = this.get_slot(slots.color_transform);
++    if (parent_transform.as_object().is_some() || own_transform.as_object().is_some())
++        && slots.transform_fields.is_none()
++    {
++        return Ok(None);
++    }
++
++    let mc = activation.gc();
++    let concatenated_alpha = parent_alpha * own_alpha;
++    set(this, slots.concatenated_alpha, concatenated_alpha, mc);
++
++    // Режим смешивания: родительский, если тот не 'normal', иначе собственный.
++    let parent_blend = parent.get_slot(slots.concatenated_blend_mode);
++    let parent_is_normal = matches!(
++        parent_blend,
++        Value::String(name) if &*name.to_utf8_lossy() == "normal"
++    );
++    let blend = if parent_is_normal {
++        this.get_slot(slots.blend_mode)
++    } else {
++        parent_blend
++    };
++    this.set_slot_no_coerce(slots.concatenated_blend_mode, blend, mc);
++
++    // Цветовая трансформация.
++    let combined: Value<'gc>;
++    match (parent_transform.as_object(), own_transform.as_object()) {
++        (Some(parent_ct), Some(own_ct)) => {
++            let fields = slots.transform_fields.expect("проверено выше");
++            let fresh_value = activation
++                .avm2()
++                .classes()
++                .colortransform
++                .construct(activation, &[])?;
++            let Some(fresh) = fresh_value.as_object() else {
++                return Ok(None);
++            };
++            let mc = activation.gc();
++            this.set_slot_no_coerce(slots.concatenated_color_transform, fresh_value, mc);
++            for at in 0..6 {
++                fresh.set_slot_no_coerce(fields[at], parent_ct.get_slot(fields[at]), mc);
++            }
++            let concat_name = Multiname::new(
++                activation.avm2().namespaces.public_vm_internal(),
++                AvmString::new_utf8(activation.gc(), "concat"),
++            );
++            Value::Object(fresh).call_property(
++                &concat_name,
++                crate::avm2::function::FunctionArgs::from_slice(&[Value::Object(own_ct)]),
++                activation,
++            )?;
++            combined = fresh_value;
++        }
++        (Some(_), None) => {
++            let mc = activation.gc();
++            this.set_slot_no_coerce(slots.concatenated_color_transform, parent_transform, mc);
++            combined = parent_transform;
++        }
++        (None, _) => {
++            let mc = activation.gc();
++            this.set_slot_no_coerce(slots.concatenated_color_transform, own_transform, mc);
++            combined = own_transform;
++        }
++    }
++
++    let mc = activation.gc();
++    let Some(color_const) = this.get_slot(slots.color_const).as_object() else {
++        return Ok(None);
++    };
++    let Some(mut storage) = color_const.as_vector_storage_mut(mc) else {
++        return Ok(None);
++    };
++    if let Some(transform) = combined.as_object() {
++        let fields = slots.transform_fields.expect("проверено выше");
++        let read = |at: usize| {
++            transform
++                .get_slot(fields[at])
++                .try_as_f64()
++                .unwrap_or(f64::NAN)
++        };
++        storage.set_in_range(0, Value::Number(read(0)));
++        storage.set_in_range(1, Value::Number(read(1)));
++        storage.set_in_range(2, Value::Number(read(2)));
++        storage.set_in_range(3, Value::Number(concatenated_alpha));
++        storage.set_in_range(4, Value::Number(read(3) / 255.0));
++        storage.set_in_range(5, Value::Number(read(4) / 255.0));
++        storage.set_in_range(6, Value::Number(read(5) / 255.0));
++    } else {
++        storage.set_in_range(3, Value::Number(concatenated_alpha));
++    }
++    Ok(Some(Value::Undefined))
++}
++
++/// Номера слотов свёртки с родителем.
++#[derive(Clone, Copy)]
++struct ConcatSlots {
++    alpha: usize,
++    blend_mode: usize,
++    color_transform: usize,
++    concatenated_alpha: usize,
++    concatenated_blend_mode: usize,
++    concatenated_color_transform: usize,
++    color_const: usize,
++    /// red/green/blueMultiplier, red/green/blueOffset на ColorTransform; None — трансформаций
++    /// ещё не встречалось.
++    transform_fields: Option<[usize; 6]>,
++}
++
++thread_local! {
++    static CONCAT_SLOTS: RefCell<Option<ConcatSlots>> = const { RefCell::new(None) };
++    static CONCAT_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn concat_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++) -> Option<ConcatSlots> {
++    if let Some(slots) = CONCAT_SLOTS.with(|cache| *cache.borrow()) {
++        return Some(slots);
++    }
++    if CONCAT_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Option<ConcatSlots> {
++        Some(ConcatSlots {
++            alpha: slot_of(activation, this, "alpha", false)?,
++            blend_mode: slot_of(activation, this, "blendMode", false)?,
++            color_transform: slot_of(activation, this, "colorTransform", false)?,
++            concatenated_alpha: slot_of(activation, this, "concatenatedAlpha", true)?,
++            concatenated_blend_mode: slot_of(activation, this, "concatenatedBlendMode", true)?,
++            concatenated_color_transform: slot_of(
++                activation,
++                this,
++                "concatenatedColorTransform",
++                true,
++            )?,
++            color_const: slot_of(activation, this, "colorConst", true)?,
++            transform_fields: None,
++        })
++    };
++    match resolve(activation) {
++        Some(slots) => {
++            CONCAT_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            Some(slots)
++        }
++        None => {
++            CONCAT_HOPELESS.with(|flag| flag.set(true));
++            None
++        }
++    }
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -5950,6 +6177,53 @@ pub fn snapshot<'gc>(
+         });
+     }
+ 
++    // Свёртка с родителем: пишутся семь констант цвета, прозрачность, режим смешивания и
++    // ссылка на трансформацию. Ссылки откатываются, числа сверяются.
++    if native == NativeMethod::ObjectConcat {
++        let this = activation.local_register(0).as_object()?;
++        let slots = concat_slots(activation, this)?;
++        let color_const = this.get_slot(slots.color_const).as_object()?;
++        let mut fields = Vec::with_capacity(8);
++        {
++            let storage = color_const.as_vector_storage()?;
++            if storage.length() < 7 {
++                return None;
++            }
++            for at in 0..7 {
++                fields.push((
++                    Place::Element(color_const, at),
++                    storage
++                        .get_optional(at)?
++                        .try_as_f64()
++                        .unwrap_or(f64::NAN),
++                ));
++            }
++        }
++        fields.push((
++            Place::Slot(this, slots.concatenated_alpha),
++            this.get_slot(slots.concatenated_alpha)
++                .try_as_f64()
++                .unwrap_or(f64::NAN),
++        ));
++        let links = vec![
++            (
++                this,
++                slots.concatenated_blend_mode,
++                this.get_slot(slots.concatenated_blend_mode),
++            ),
++            (
++                this,
++                slots.concatenated_color_transform,
++                this.get_slot(slots.concatenated_color_transform),
++            ),
++        ];
++        return Some(Snapshot {
++            fields,
++            links,
++            vectors: Vec::new(),
++        });
++    }
++
+     // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
+     // делается один раз за сессию и на чужом объекте запомнил бы неудачу навсегда.
+     if !matches!(
+@@ -5983,7 +6257,8 @@ pub fn snapshot<'gc>(
+         | NativeMethod::PadTexture
+         | NativeMethod::CalculateLight
+         | NativeMethod::SpriteBillboard
+-        | NativeMethod::KdCollectPlanes => return None,
++        | NativeMethod::KdCollectPlanes
++        | NativeMethod::ObjectConcat => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -6041,6 +6316,7 @@ pub fn run<'gc>(
+ ) -> Result<Option<Value<'gc>>, crate::avm2::Error<'gc>> {
+     match native {
+         NativeMethod::KdCollectPlanes => return kd_collect_planes(activation),
++        NativeMethod::ObjectConcat => return object_concat(activation),
+         NativeMethod::BoxBoxOverlapOnAxis => {
+             Ok(get_overlap_on_axis(activation, 0, 3).ok().map(Value::Number))
+         }
+-- 
+2.51.1.windows.1
+

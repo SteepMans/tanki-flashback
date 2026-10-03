@@ -1,0 +1,103 @@
+import { itemBlueprints, PREMIUM_PAINT_IDS } from "@/features/garage/garage.data";
+import { UserDocument } from "@/shared/models/user.model";
+import { isPremiumActive } from "@/shared/models/passes";
+import logger from "@/utils/logger";
+
+export class ItemUtils {
+    /**
+     * Reconciliação LAZY do estado derivado do premium: se a pintura equipada é premium-gated
+     * (PREMIUM_PAINT_IDS) e o premium NÃO está mais ativo, volta para a "green". Persiste apenas quando
+     * muda (evento raro — 1x por expiração), então o banco vai ficando honesto pra leitores externos
+     * (site de perfil, preview de rank) sempre que o nosso servidor toca o usuário. Ponto único: chamar
+     * onde o premium/equipamento é lido (login/lobby, garagem, perfil, spawn de batalha). Retorna o user.
+     */
+    public static async reconcilePremiumEquipment(user: UserDocument): Promise<UserDocument> {
+        if (PREMIUM_PAINT_IDS.has(user.equippedPaint) && !isPremiumActive(user)) {
+            user.equippedPaint = "green";
+            await user.save();
+            logger.info(`Premium expired: ${user.username}'s premium paint reverted to green.`);
+        }
+        return user;
+    }
+
+    public static getItemModification(user: UserDocument, itemType: "hull" | "turret") {
+        const baseId = itemType === "hull" ? user.equippedHull : user.equippedTurret;
+        const inventory = itemType === "hull" ? user.hulls : user.turrets;
+        const blueprintList = itemType === "hull" ? itemBlueprints.hulls : itemBlueprints.turrets;
+
+        const modId = inventory.get(baseId) ?? 0;
+        const blueprint = blueprintList.find((bp) => bp.id === baseId);
+        if (!blueprint) {
+            throw new Error(`Blueprint not found for ${itemType}: ${baseId}`);
+        }
+
+        const modification = blueprint.modifications.find((m) => m.modificationID === modId);
+        if (!modification) {
+            throw new Error(`Modification M${modId} not found for ${itemType}: ${baseId}`);
+        }
+
+        return modification;
+    }
+
+    public static getPropertyValue(modification: any, propertyName: string, subPropName?: string): number | null {
+        const prop = modification.properts.find((p: any) => p.property === propertyName);
+        if (!prop) return null;
+
+        let valueSource = prop;
+        if (subPropName && prop.subproperties) {
+            const subProp = prop.subproperties.find((sp: any) => sp.property === subPropName);
+            if (!subProp) return null;
+            valueSource = subProp;
+        }
+
+        return valueSource.value ? parseFloat(valueSource.value) : null;
+    }
+
+    /** The % damage reduction the user's EQUIPPED paint gives against a weapon's resistance property
+     *  (e.g. "RAILGUN_RESISTANCE"). 0 if the paint has no such protection. Values are the garage properts.
+     *  A paint's universal `ALL_RESISTANCE` (e.g. the premium paint's 15%) is ADDED to the weapon-specific
+     *  value, so it protects against every weapon. */
+    public static getPaintResistancePercent(user: UserDocument, resistanceProperty: string): number {
+        const paint = itemBlueprints.paints.find((p) => p.id === user.equippedPaint);
+        if (!paint) return 0;
+        const props = paint.properts as any[];
+        const read = (name: string) => {
+            const p = props.find((pr) => pr.property === name);
+            return p && p.value != null ? parseFloat(p.value) : 0;
+        };
+        const specific = resistanceProperty && resistanceProperty !== "ALL_RESISTANCE" ? read(resistanceProperty) : 0;
+        return specific + read("ALL_RESISTANCE");
+    }
+
+    public static getHullArmor(user: UserDocument): number {
+        const hullMod = this.getItemModification(user, "hull");
+        const armor = this.getPropertyValue(hullMod, "HULL_ARMOR");
+        return armor ?? 100;
+    }
+
+    private static getPhysicsValue(props: any[], propertyName: string, subPropName?: string): number {
+        const prop = props.find((p) => p.property === propertyName);
+        if (!prop) return 0;
+
+        if (subPropName && prop.subproperties) {
+            const subProp = prop.subproperties.find((sp: any) => sp.property === subPropName);
+            return subProp ? parseFloat(subProp.value) : 0;
+        }
+
+        return prop.value ? parseFloat(prop.value) : 0;
+    }
+
+    public static getTankSpecifications(user: UserDocument) {
+        const hullMod = this.getItemModification(user, "hull");
+        const turretMod = this.getItemModification(user, "turret");
+
+        const toRadians = (degrees: number) => (degrees * Math.PI) / 180;
+
+        return {
+            speed: this.getPhysicsValue(hullMod.properts, "HULL_SPEED"),
+            maxTurnSpeed: toRadians(this.getPhysicsValue(hullMod.properts, "HULL_TURN_SPEED")),
+            acceleration: this.getPhysicsValue(hullMod.properts, "HULL_POWER", "HULL_ACCELERATION"),
+            turretTurnSpeed: toRadians(this.getPhysicsValue(turretMod.properts, "TURRET_TURN_SPEED")),
+        };
+    }
+}

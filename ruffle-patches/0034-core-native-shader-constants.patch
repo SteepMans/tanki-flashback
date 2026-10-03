@@ -1,0 +1,474 @@
+From 4f49661e50418c91394a2f455b1797bdb89dd590 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 22:21:14 +0300
+Subject: [PATCH] core: load shader constants without crossing into the
+ interpreter
+
+---
+ core/src/avm2/activation.rs                   |   9 +-
+ core/src/avm2/fast_paths.rs                   | 277 +++++++++++++++++-
+ .../globals/flash/display3D/context_3d.rs     |   9 +-
+ core/src/avm2/vector.rs                       |  10 +
+ 4 files changed, 292 insertions(+), 13 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index b3c1ea78..936a802b 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -13,6 +13,7 @@ use crate::avm2::error::{
+ };
+ use crate::avm2::function::FunctionArgs;
+ use crate::avm2::method::{Method, NativeMethodImpl, ResolvedParamConfig};
++use smallvec::SmallVec;
+ use crate::avm2::object::TObject;
+ use crate::avm2::object::{
+     ArrayObject, ByteArrayObject, ClassObject, FunctionObject, NamespaceObject, ScriptObject,
+@@ -210,13 +211,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+     ///
+     /// The returned list of parameters will be coerced to the stated types in
+     /// the signature, with missing parameters filled in with defaults.
++    /// Список аргументов собирается в буфер на стеке: у нативных методов их единицы, а куча в
++    /// wasm недешёвая, и на горячем пути вроде загрузки констант шейдера (десятки тысяч вызовов в
++    /// секунду) выделение под каждый вызов заметно. Восьми хватает всем нативным методам движка;
++    /// если параметров больше, `SmallVec` сам уйдёт в кучу.
+     pub fn resolve_parameters(
+         &mut self,
+         method: Method<'gc>,
+         user_arguments: FunctionArgs<'_, 'gc>,
+         signature: &[ResolvedParamConfig<'gc>],
+-    ) -> Result<Vec<Value<'gc>>, Error<'gc>> {
+-        let mut arguments_list = Vec::new();
++    ) -> Result<SmallVec<[Value<'gc>; 8]>, Error<'gc>> {
++        let mut arguments_list = SmallVec::new();
+         for (arg, param_config) in user_arguments.iter().zip(signature.iter()) {
+             let coerced_arg = if let Some(param_class) = param_config.param_type {
+                 arg.coerce_to_type(self, param_class)?
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 72143d3b..94ef5f08 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -33,6 +33,8 @@ use crate::avm2::object::{ClassObject, Object, TObject};
+ use crate::avm2::property::Property;
+ use crate::avm2::value::Value;
+ use crate::string::AvmString;
++use ruffle_render::backend::ProgramType;
++use smallvec::SmallVec;
+ 
+ /// Пространство имён, в котором движок держит свои внутренние поля.
+ const ENGINE_NS: &str = "http://alternativaplatform.com/en/alternativa3d";
+@@ -56,6 +58,8 @@ pub enum NativeMethod {
+     BoxRectOverlapOnAxis,
+     /// Столкновение эллипсоида игрока с треугольниками карты.
+     EllipsoidCollide,
++    /// Загрузка констант шейдера через теневой набор движка.
++    SetProgramConstants,
+ }
+ 
+ impl NativeMethod {
+@@ -68,6 +72,7 @@ impl NativeMethod {
+             ("BoxBoxCollider", "getOverlapOnAxis") => Some(Self::BoxBoxOverlapOnAxis),
+             ("BoxRectCollider", "getOverlapOnAxis") => Some(Self::BoxRectOverlapOnAxis),
+             ("EllipsoidCollider", "ecfa5c3") => Some(Self::EllipsoidCollide),
++            ("Device", "setProgramConstantsFromVector") => Some(Self::SetProgramConstants),
+             _ => None,
+         }
+     }
+@@ -1081,20 +1086,255 @@ fn ellipsoid_collide<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<
+     Some(Value::Bool(l7 < 1.0))
+ }
+ 
++/// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
++mod device_fields {
++    /// `RenderState` с теневыми наборами констант.
++    pub const RENDER_STATE: &str = "e1e28469";
++    /// `Stage3D`, у которого спрашивают текущий `Context3D`.
++    pub const STAGE3D: &str = "e1044b0a";
++}
++
++/// Номера слотов, нужных для загрузки констант шейдера.
++#[derive(Clone, Copy)]
++struct DeviceSlots {
++    render_state: usize,
++    stage3d: usize,
++    vertex_constants: usize,
++    fragment_constants: usize,
++}
++
++thread_local! {
++    static DEVICE_SLOTS: RefCell<Option<(u32, DeviceSlots)>> = const { RefCell::new(None) };
++    static DEVICE_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn device_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++) -> Option<DeviceSlots> {
++    let key = this.vtable().id();
++    if let Some((known, slots)) = DEVICE_SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if DEVICE_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    match resolve_device_slots(activation, this) {
++        Ok(slots) => {
++            DEVICE_SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++            Some(slots)
++        }
++        Err(hopeless) => {
++            if hopeless {
++                DEVICE_HOPELESS.with(|flag| flag.set(true));
++            }
++            None
++        }
++    }
++}
++
++fn resolve_device_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++) -> Result<DeviceSlots, bool> {
++    use device_fields::*;
++
++    let render_state = slot_by_local_name(this, RENDER_STATE).ok_or(true)?;
++    let stage3d = slot_by_local_name(this, STAGE3D).ok_or(true)?;
++    // Имена теневых наборов открытые, но искать их надо на живом `RenderState`.
++    let state = this.get_slot(render_state).as_object().ok_or(false)?;
++
++    Ok(DeviceSlots {
++        render_state,
++        stage3d,
++        vertex_constants: slot_of(activation, state, "vertexConstants", false).ok_or(true)?,
++        fragment_constants: slot_of(activation, state, "fragmentConstants", false).ok_or(true)?,
++    })
++}
++
++/// Разобранный вызов загрузки констант: всё, что нужно и счёту, и снимку для сверки.
++struct ConstantsCall<'gc> {
++    this: Object<'gc>,
++    data: Object<'gc>,
++    shadow: Object<'gc>,
++    program_type: ProgramType,
++    first_register: i32,
++    num_registers: i32,
++    check: bool,
++    /// Отрезок теневого набора, который вызов трогает.
++    base: usize,
++    count: usize,
++    slots: DeviceSlots,
++}
++
++/// Разбирает аргументы вызова и заранее проверяет всё, из-за чего байткод мог бы бросить ошибку.
++/// `None` — случай не покрыт: пусть считает интерпретатор, ничего ещё не тронуто.
++fn constants_call<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<ConstantsCall<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let program_type = match activation.local_register(1) {
++        Value::String(name) => name,
++        _ => return None,
++    };
++    let first_register = match activation.local_register(2) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let data = activation.local_register(3).as_object()?;
++    let num_registers = match activation.local_register(4) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let check = match activation.local_register(5) {
++        Value::Bool(value) => value,
++        _ => return None,
++    };
++
++    // Отрицательное число регистров, кроме -1, ниже пришлось бы приводить к беззнаковому, и оно
++    // превратилось бы в огромную длину. Такой вызов отдаём байткоду.
++    if num_registers < -1 {
++        return None;
++    }
++
++    let slots = device_slots(activation, this)?;
++    let state = this.get_slot(slots.render_state).as_object()?;
++    let program_type = if &*program_type == b"vertex" {
++        ProgramType::Vertex
++    } else {
++        ProgramType::Fragment
++    };
++    let shadow = state
++        .get_slot(match program_type {
++            ProgramType::Vertex => slots.vertex_constants,
++            ProgramType::Fragment => slots.fragment_constants,
++        })
++        .as_object()?;
++    // Читать и писать один и тот же вектор одновременно нельзя: это двойное заимствование.
++    if Object::ptr_eq(data, shadow) {
++        return None;
++    }
++
++    let data_length = data.as_vector_storage()?.length();
++    let shadow_length = shadow.as_vector_storage()?.length();
++
++    let base = first_register.wrapping_shl(2);
++    let count = if num_registers < 0 {
++        data_length as i32
++    } else {
++        num_registers.wrapping_shl(2)
++    };
++    if base < 0 || count < 0 {
++        return None;
++    }
++    let (base, count) = (base as usize, count as usize);
++    // Выход за границы любого из векторов байткод превращает в RangeError. Такой вызов должен
++    // бросать ошибку сам, поэтому уступаем ему до того, как что-либо записали.
++    if count > data_length || base.saturating_add(count) > shadow_length {
++        return None;
++    }
++
++    Some(ConstantsCall {
++        this,
++        data,
++        shadow,
++        program_type,
++        first_register,
++        num_registers,
++        check,
++        base,
++        count,
++        slots,
++    })
++}
++
++/// `Device.setProgramConstantsFromVector` — движок держит теневую копию констант шейдера и грузит
++/// их в Stage3D, только если что-то поменялось. Сравнение идёт поэлементно, в байткоде это около
++/// двадцати инструкций на каждое число, а вызовов в бою двадцать восемь тысяч в секунду — на
++/// машине владельца метод занимал от 8 до 14 процентов кадра.
++///
++/// Здесь тот же цикл выполняется нативно, и загрузка констант, если она нужна, зовётся напрямую —
++/// минуя разбор аргументов нативного метода AVM2 и создание кадра вызова.
++fn set_program_constants<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let call = constants_call(activation)?;
++    let mc = activation.gc();
++
++    // Ветка без сверки просто переписывает теневой набор и грузит константы всегда.
++    let mut changed = !call.check;
++    {
++        let data = call.data.as_vector_storage()?;
++        let mut shadow = call.shadow.as_vector_storage_mut(mc)?;
++        for at in 0..call.count {
++            let value = data.get_optional(at)?.try_as_f64()?;
++            if call.check {
++                // `ifeq` в байткоде — обычное равенство чисел: NaN не равен себе, а минус ноль
++                // равен нулю, и на обоих отличиях держится решение «грузить или нет».
++                let old = shadow.get_optional(call.base + at)?.try_as_f64()?;
++                if old == value {
++                    continue;
++                }
++                changed = true;
++            }
++            shadow.set_in_range(call.base + at, Value::Number(value));
++        }
++    }
++
++    if changed
++        && let Some(stage3d) = call.this.get_slot(call.slots.stage3d).as_object()
++        && let Some(stage3d) = stage3d.as_stage_3d()
++        && let Some(context) = stage3d.context3d()
++    {
++        let data = call.data.as_vector_storage()?;
++        // Ровно тот же отбор, что и в `Context3D.setProgramConstantsFromVector`.
++        let to_take = if call.num_registers != -1 {
++            let required = call.num_registers as usize * 4;
++            if data.length() < required {
++                return None;
++            }
++            required
++        } else {
++            data.length()
++        };
++        let raw_data = data
++            .iter()
++            .map(|value| (value.as_f64() as f32).to_le_bytes())
++            .take(to_take)
++            .collect::<SmallVec<[[u8; 4]; 64]>>();
++        context.set_program_constants(call.program_type, call.first_register as u32, &raw_data);
++    }
++
++    Some(Value::Undefined)
++}
++
+ /// Снимок полей, которые метод перезаписывает. Нужен режиму сверки: метод ничего не возвращает,
+ /// поэтому сравнить нативный счёт с байткодом можно только по записанному — а чтобы байткод считал
+ /// с того же входа, снимок сначала откатывают.
+ pub struct Snapshot<'gc> {
+-    /// Объект, номер слота и значение. Полей может быть с разных объектов: столкновение
+-    /// эллипсоида пишет в два вектора сразу.
+-    fields: Vec<(Object<'gc>, usize, f64)>,
++    /// Куда смотреть и что там было. Полей может быть с разных объектов: столкновение эллипсоида
++    /// пишет в два вектора сразу, а загрузка констант — в элементы вектора, а не в слоты.
++    fields: Vec<(Place<'gc>, f64)>,
++}
++
++/// Место, куда пишет заменяемый метод: поле объекта или элемент вектора.
++#[derive(Clone, Copy)]
++enum Place<'gc> {
++    Slot(Object<'gc>, usize),
++    Element(Object<'gc>, usize),
+ }
+ 
+ impl<'gc> Snapshot<'gc> {
+     /// Вернуть поля в состояние до нативного счёта.
+     pub fn restore(&self, mc: &Mutation<'gc>) {
+-        for (object, slot, value) in self.fields.iter() {
+-            set(*object, *slot, *value, mc);
++        for (place, value) in self.fields.iter() {
++            match place {
++                Place::Slot(object, slot) => set(*object, *slot, *value, mc),
++                Place::Element(object, at) => {
++                    if let Some(mut storage) = object.as_vector_storage_mut(mc) {
++                        storage.set_in_range(*at, Value::Number(*value));
++                    }
++                }
++            }
+         }
+     }
+ 
+@@ -1102,7 +1342,7 @@ impl<'gc> Snapshot<'gc> {
+     /// значению, но два NaN считаются одинаковыми — в матрице вырожденного объекта они законны.
+     pub fn mismatch(&self, other: &Self) -> Option<(usize, f64, f64)> {
+         for (at, (mine, theirs)) in self.fields.iter().zip(other.fields.iter()).enumerate() {
+-            let (mine, theirs) = (mine.2, theirs.2);
++            let (mine, theirs) = (mine.1, theirs.1);
+             if mine != theirs && !(mine.is_nan() && theirs.is_nan()) {
+                 return Some((at, mine, theirs));
+             }
+@@ -1136,6 +1376,20 @@ pub fn snapshot<'gc>(
+     native: NativeMethod,
+     method: Method<'gc>,
+ ) -> Option<Snapshot<'gc>> {
++    // Загрузка констант не возвращает ничего, и весь её видимый итог — отрезок теневого набора.
++    if native == NativeMethod::SetProgramConstants {
++        let call = constants_call(activation)?;
++        let shadow = call.shadow.as_vector_storage()?;
++        let mut fields = Vec::with_capacity(call.count);
++        for at in 0..call.count {
++            fields.push((
++                Place::Element(call.shadow, call.base + at),
++                shadow.get_optional(call.base + at)?.try_as_f64()?,
++            ));
++        }
++        return Some(Snapshot { fields });
++    }
++
+     // Столкновение эллипсоида пишет в два вектора, и по ним только и видно, совпал ли счёт:
+     // возвращаемое «да/нет» слишком грубое, чтобы поймать расхождение в последнем бите.
+     if native == NativeMethod::EllipsoidCollide {
+@@ -1145,7 +1399,10 @@ pub fn snapshot<'gc>(
+         for (slot, count) in [(slots.contact_point, 3), (slots.contact_plane, 4)] {
+             let vector = this.get_slot(slot).as_object()?;
+             for at in 0..count {
+-                fields.push((vector, slots.vector[at], vector.get_slot(slots.vector[at]).try_as_f64()?));
++                fields.push((
++                    Place::Slot(vector, slots.vector[at]),
++                    vector.get_slot(slots.vector[at]).try_as_f64()?,
++                ));
+             }
+         }
+         return Some(Snapshot { fields });
+@@ -1166,7 +1423,8 @@ pub fn snapshot<'gc>(
+         NativeMethod::CullingInCamera
+         | NativeMethod::BoxBoxOverlapOnAxis
+         | NativeMethod::BoxRectOverlapOnAxis
+-        | NativeMethod::EllipsoidCollide => return None,
++        | NativeMethod::EllipsoidCollide
++        | NativeMethod::SetProgramConstants => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -1199,7 +1457,7 @@ pub fn snapshot<'gc>(
+ 
+     let mut fields = Vec::with_capacity(12);
+     for slot in slots.iter() {
+-        fields.push((object, *slot, object.get_slot(*slot).try_as_f64()?));
++        fields.push((Place::Slot(object, *slot), object.get_slot(*slot).try_as_f64()?));
+     }
+     Some(Snapshot { fields })
+ }
+@@ -1226,6 +1484,7 @@ pub fn run<'gc>(
+         }
+         NativeMethod::CullingInCamera => culling_in_camera(activation, declaring_class(method)?),
+         NativeMethod::EllipsoidCollide => ellipsoid_collide(activation),
++        NativeMethod::SetProgramConstants => set_program_constants(activation),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+diff --git a/core/src/avm2/globals/flash/display3D/context_3d.rs b/core/src/avm2/globals/flash/display3D/context_3d.rs
+index 1bfc6ade..7fdcd539 100644
+--- a/core/src/avm2/globals/flash/display3D/context_3d.rs
++++ b/core/src/avm2/globals/flash/display3D/context_3d.rs
+@@ -13,6 +13,7 @@ use crate::avm2_stub_method;
+ use ruffle_macros::istr;
+ use ruffle_render::backend::BufferUsage;
+ use ruffle_render::backend::{Context3DProfile, Context3DTextureFilter};
++use smallvec::SmallVec;
+ use swf::{Rectangle, Twips};
+ 
+ pub fn create_index_buffer<'gc>(
+@@ -300,6 +301,7 @@ pub fn set_program_constants_from_matrix<'gc>(
+             Value::from(matrix).call_method(matrix3d_methods::TRANSPOSE, &[], activation)?;
+         }
+ 
++        // В матрице ровно шестнадцать чисел, поэтому куча тут не нужна вовсе.
+         let matrix_raw_data = matrix
+             .as_matrix3d_object()
+             .unwrap()
+@@ -307,7 +309,7 @@ pub fn set_program_constants_from_matrix<'gc>(
+             .raw_data
+             .iter()
+             .map(|&val| val.to_le_bytes())
+-            .collect::<Vec<[u8; 4]>>();
++            .collect::<SmallVec<[[u8; 4]; 16]>>();
+ 
+         context.set_program_constants(program_type, first_register, &matrix_raw_data);
+     }
+@@ -346,11 +348,14 @@ pub fn set_program_constants_from_vector<'gc>(
+             vector.length()
+         };
+ 
++        // Буфер на стеке: константы шейдера грузятся десятки тысяч раз в секунду, и выделение в
++        // куче под каждый вызов стоит дороже самой перекладки. Шестидесяти четырёх чисел (16
++        // регистров) хватает подавляющему большинству вызовов, дальше `SmallVec` уйдёт в кучу.
+         let raw_data = vector
+             .iter()
+             .map(|val| (val.as_f64() as f32).to_le_bytes())
+             .take(to_take)
+-            .collect::<Vec<[u8; 4]>>();
++            .collect::<SmallVec<[[u8; 4]; 64]>>();
+ 
+         context.set_program_constants(program_type, first_register, &raw_data);
+     }
+diff --git a/core/src/avm2/vector.rs b/core/src/avm2/vector.rs
+index 5293618d..d207a2f7 100644
+--- a/core/src/avm2/vector.rs
++++ b/core/src/avm2/vector.rs
+@@ -133,6 +133,16 @@ impl<'gc> VectorStorage<'gc> {
+         pos < self.storage.len()
+     }
+ 
++    /// Запись по номеру, уже приведённому к типу вектора и уже проверенному на границы. Нужна
++    /// горячим путям, где весь диапазон проверяется одним сравнением до цикла: платить в каждом
++    /// шаге за приведение типа, за проверку «фиксированной длины» и за возможную ошибку не за что.
++    /// Выход за границы просто ничего не делает — вызывающий обязан проверить диапазон сам.
++    pub fn set_in_range(&mut self, pos: usize, value: Value<'gc>) {
++        if let Some(slot) = self.storage.get_mut(pos) {
++            *slot = value;
++        }
++    }
++
+     /// Change an arbitrary i32 into a positive parameter index.
+     ///
+     /// This converts negative indices into positive indices indexed from the
+-- 
+2.51.1.windows.1
+

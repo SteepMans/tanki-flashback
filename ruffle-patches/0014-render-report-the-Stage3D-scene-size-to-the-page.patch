@@ -1,0 +1,32 @@
+From 47a095021aca64f4d9c2b14016962769e15e6025 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 09:49:59 +0300
+Subject: [PATCH 14/17] render: report the Stage3D scene size to the page
+
+---
+ render/wgpu/src/context3d/mod.rs | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/render/wgpu/src/context3d/mod.rs b/render/wgpu/src/context3d/mod.rs
+index 9abd0bcc..f1cea3b0 100644
+--- a/render/wgpu/src/context3d/mod.rs
++++ b/render/wgpu/src/context3d/mod.rs
+@@ -373,6 +373,15 @@ impl WgpuContext3D {
+                 self.stats.command_time.as_secs_f64() * 1000.0 / self.stats.frames as f64,
+             ),
+             ("commands", self.stats.commands as f64 / self.stats.frames as f64),
++            // Размер сцены отличает бой (во весь экран) от превью танка в гараже.
++            (
++                "sceneWidth",
++                self.back_buffer_size.map_or(0.0, |size| size.width as f64),
++            ),
++            (
++                "sceneHeight",
++                self.back_buffer_size.map_or(0.0, |size| size.height as f64),
++            ),
+             ("pipelines", self.current_pipeline.created_pipelines.get() as f64),
+             (
+                 "bindGroups",
+-- 
+2.51.1.windows.1
+

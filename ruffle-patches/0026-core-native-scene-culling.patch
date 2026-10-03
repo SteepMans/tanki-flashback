@@ -1,0 +1,452 @@
+From 3600a75248e7a3c063431d695d4dfb55629591b7 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 13:19:59 +0300
+Subject: [PATCH] core: compute scene culling natively with a bytecode
+ cross-check
+
+---
+ core/src/avm2.rs              |   1 +
+ core/src/avm2/activation.rs   |  26 ++++
+ core/src/avm2/fast_paths.rs   | 278 ++++++++++++++++++++++++++++++++++
+ core/src/avm2/method_stats.rs |  22 +++
+ core/src/avm2/verify.rs       |  20 +++
+ web/src/lib.rs                |   8 +
+ 6 files changed, 355 insertions(+)
+ create mode 100644 core/src/avm2/fast_paths.rs
+
+diff --git a/core/src/avm2.rs b/core/src/avm2.rs
+index ac918c73..27edf07e 100644
+--- a/core/src/avm2.rs
++++ b/core/src/avm2.rs
+@@ -55,6 +55,7 @@ mod e4x;
+ pub mod error;
+ pub mod error_messages;
+ mod events;
++pub mod fast_paths;
+ mod filters;
+ mod flv;
+ mod function;
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index ace63608..a0537422 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -646,6 +646,32 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+     /// методе (вложенные вызовы копят в своих счётчиках). По этим числам видно, какой код игры
+     /// съедает кадр — в профиле браузера весь ActionScript выглядит одной функцией run_actions.
+     pub fn run_actions(&mut self, method: Method<'gc>) -> Result<Value<'gc>, Error<'gc>> {
++        // Отсечение сцены — четверть всей работы клиента за кадр. Если метод узнан, считаем его
++        // нативно; на любом непокрытом случае функция вернёт None и отработает интерпретатор.
++        if method.get_verified_info().native_culling
++            && crate::avm2::method_stats::native_culling_enabled()
++        {
++            let native = crate::avm2::fast_paths::culling_in_camera(self);
++            if let Some(result) = native {
++                // Режим сверки: считаем и нативно, и байткодом, и сравниваем ответы.
++                if crate::avm2::method_stats::validate_culling() {
++                    let mut ops = 0u64;
++                    let interpreted = self.run_actions_inner(method, &mut ops);
++                    if let Ok(interpreted) = &interpreted
++                        && interpreted.as_i32() != result.as_i32()
++                    {
++                        tracing::warn!(
++                            "culling mismatch: нативно {}, байткодом {}",
++                            result.as_i32(),
++                            interpreted.as_i32()
++                        );
++                    }
++                    return interpreted;
++                }
++                return Ok(result);
++            }
++        }
++
+         let mut executed_ops = 0u64;
+         let result = self.run_actions_inner(method, &mut executed_ops);
+         if crate::avm2::method_stats::enabled() {
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+new file mode 100644
+index 00000000..a148a434
+--- /dev/null
++++ b/core/src/avm2/fast_paths.rs
+@@ -0,0 +1,278 @@
++//! Нативные замены самых горячих методов игры.
++//!
++//! Счётчик горячих методов показал, что кадр танкового клиента на четверть состоит из одного
++//! метода движка Alternativa3D — `Object3D.cullingInCamera`: отсечение объекта по пирамиде
++//! видимости. Он вызывается для каждого объекта сцены каждый кадр (порядка тысячи раз), а внутри
++//! это 616 инструкций без единого вызова наружу: заливка восьми углов габаритного ящика, перевод
++//! их в координаты камеры и шесть проверок плоскостей.
++//!
++//! Здесь тот же алгоритм выполняется нативно. Метод опознаётся по имени класса и метода, а любой
++//! случай, который не покрыт (есть окклюдеры, поля оказались не слотами, значения не числовые),
++//! возвращает `None` — и тогда работает обычный интерпретатор. То есть замена не может «почти
++//! правильно» посчитать: она либо считает ровно то же, либо уступает место байткоду.
++//!
++//! Отключается со страницы: `window.ruffleNoNativeCulling = true` — так можно сравнить «до/после»
++//! на одной сборке.
++
++use std::cell::RefCell;
++
++use gc_arena::Mutation;
++
++use crate::avm2::activation::Activation;
++use crate::avm2::multiname::Multiname;
++use crate::avm2::object::{Object, TObject};
++use crate::avm2::property::Property;
++use crate::avm2::value::Value;
++use crate::string::AvmString;
++
++/// Пространство имён, в котором движок держит свои внутренние поля.
++const ENGINE_NS: &str = "http://alternativaplatform.com/en/alternativa3d";
++
++/// Имя метода, который заменяем.
++pub const CULLING_METHOD: &str = "cullingInCamera";
++/// Имя класса, которому он принадлежит.
++pub const CULLING_CLASS: &str = "Object3D";
++
++/// Номера слотов, по которым лежат нужные поля. Ищутся один раз: имена одинаковы для всех
++/// объектов класса, а поиск имени в таблице класса дороже самой арифметики.
++#[derive(Clone, Copy)]
++struct CullingSlots {
++    /// boundMinX, boundMinY, boundMinZ, boundMaxX, boundMaxY, boundMaxZ
++    bound: [usize; 6],
++    /// ma..ml — матрица перевода в координаты камеры
++    matrix: [usize; 12],
++    /// Статическое поле класса со списком вершин габаритного ящика.
++    bound_vertex_list: usize,
++    /// occludedAll, numOccluders на камере
++    occluded_all: usize,
++    num_occluders: usize,
++    /// nearClipping, farClipping на камере
++    near: usize,
++    far: usize,
++    /// x, y, z вершины
++    vertex: [usize; 3],
++    /// cameraX, cameraY, cameraZ вершины
++    vertex_camera: [usize; 3],
++    /// next вершины
++    vertex_next: usize,
++}
++
++thread_local! {
++    /// Разбор слотов делается один раз за сессию: классы движка не меняются на ходу.
++    static SLOTS: RefCell<Option<Option<CullingSlots>>> = const { RefCell::new(None) };
++}
++
++/// Номер слота свойства по имени. `None` — свойства нет или это не слот (например, геттер): тогда
++/// нативный путь отключается целиком, и всё считает интерпретатор.
++fn slot_of<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    object: Object<'gc>,
++    name: &'static str,
++    engine_namespace: bool,
++) -> Option<usize> {
++    let name = AvmString::new_utf8(activation.gc(), name);
++    let namespace = if engine_namespace {
++        crate::avm2::namespace::Namespace::package(
++            AvmString::new_utf8(activation.gc(), ENGINE_NS),
++            crate::avm2::api_version::ApiVersion::AllVersions,
++            activation.strings(),
++        )
++    } else {
++        activation.avm2().namespaces.public_all()
++    };
++
++    match object.vtable().get_trait(&Multiname::new(namespace, name)) {
++        Some(Property::Slot { slot_id }) | Some(Property::ConstSlot { slot_id }) => Some(slot_id),
++        _ => None,
++    }
++}
++
++fn resolve_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    object: Object<'gc>,
++    camera: Object<'gc>,
++) -> Option<CullingSlots> {
++    // Список вершин лежит статическим полем класса, поэтому нужен объект самого класса.
++    let class_object = object.instance_class().class_object()?;
++    let vertex_list = class_object.get_slot(slot_of(
++        activation,
++        class_object.into(),
++        "boundVertexList",
++        true,
++    )?);
++    let vertex = vertex_list.as_object()?;
++
++    let bound_names = [
++        "boundMinX", "boundMinY", "boundMinZ", "boundMaxX", "boundMaxY", "boundMaxZ",
++    ];
++    let mut bound = [0usize; 6];
++    for (at, name) in bound_names.iter().enumerate() {
++        bound[at] = slot_of(activation, object, name, false)?;
++    }
++
++    let matrix_names = [
++        "ma", "mb", "mc", "md", "me", "mf", "mg", "mh", "mi", "mj", "mk", "ml",
++    ];
++    let mut matrix = [0usize; 12];
++    for (at, name) in matrix_names.iter().enumerate() {
++        matrix[at] = slot_of(activation, object, name, true)?;
++    }
++
++    Some(CullingSlots {
++        bound,
++        matrix,
++        bound_vertex_list: slot_of(activation, class_object.into(), "boundVertexList", true)?,
++        occluded_all: slot_of(activation, camera, "occludedAll", true)?,
++        num_occluders: slot_of(activation, camera, "numOccluders", true)?,
++        near: slot_of(activation, camera, "nearClipping", false)?,
++        far: slot_of(activation, camera, "farClipping", false)?,
++        vertex: [
++            slot_of(activation, vertex, "x", false)?,
++            slot_of(activation, vertex, "y", false)?,
++            slot_of(activation, vertex, "z", false)?,
++        ],
++        vertex_camera: [
++            slot_of(activation, vertex, "cameraX", true)?,
++            slot_of(activation, vertex, "cameraY", true)?,
++            slot_of(activation, vertex, "cameraZ", true)?,
++        ],
++        vertex_next: slot_of(activation, vertex, "next", true)?,
++    })
++}
++
++/// Один угол габаритного ящика: какие из шести граничных значений брать.
++const CORNERS: [[usize; 3]; 8] = [
++    [0, 1, 2], // min, min, min
++    [3, 1, 2], // max, min, min
++    [0, 4, 2], // min, max, min
++    [3, 4, 2], // max, max, min
++    [0, 1, 5], // min, min, max
++    [3, 1, 5], // max, min, max
++    [0, 4, 5], // min, max, max
++    [3, 4, 5], // max, max, max
++];
++
++/// Проверка одной плоскости по всем вершинам: снаружи ли объект целиком, внутри ли целиком.
++/// `inside` повторяет сравнение из байткода буквально, включая поведение на NaN: там стоят
++/// `ifngt`/`ifnlt`, то есть «не больше» и «не меньше», и любое сравнение с NaN уводит в ветку
++/// «позади плоскости».
++fn plane_test(vertices: &[(f64, f64, f64)], inside: impl Fn(f64, f64, f64) -> bool) -> (bool, bool) {
++    let mut in_front = false;
++    let mut behind = false;
++    for &(x, y, z) in vertices {
++        if inside(x, y, z) {
++            in_front = true;
++        } else {
++            behind = true;
++        }
++        if in_front && behind {
++            break;
++        }
++    }
++    (in_front, behind)
++}
++
++/// Нативная замена `Object3D.cullingInCamera`. `None` — случай не покрыт, считать должен
++/// интерпретатор.
++pub fn culling_in_camera<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let object = activation.local_register(0).as_object()?;
++    let camera = activation.local_register(1).as_object()?;
++    let mut culling = match activation.local_register(2) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++
++    let slots = SLOTS.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        if cache.is_none() {
++            *cache = Some(resolve_slots(activation, object, camera));
++        }
++        *cache.as_ref().expect("только что заполнено")
++    })?;
++
++    // Камера уже сказала, что всё перекрыто.
++    if matches!(camera.get_slot(slots.occluded_all), Value::Bool(true)) {
++        return Some(Value::Integer(-1));
++    }
++
++    // Окклюдеры нативно не считаем — редкий случай, пусть работает байткод.
++    if camera.get_slot(slots.num_occluders).as_i32() > 0 {
++        return None;
++    }
++
++    if culling <= 0 {
++        return Some(Value::Integer(culling));
++    }
++
++    // Габариты и матрица перевода в координаты камеры.
++    let mut bound = [0.0f64; 6];
++    for (at, slot) in slots.bound.iter().enumerate() {
++        bound[at] = object.get_slot(*slot).try_as_f64()?;
++    }
++    let mut matrix = [0.0f64; 12];
++    for (at, slot) in slots.matrix.iter().enumerate() {
++        matrix[at] = object.get_slot(*slot).try_as_f64()?;
++    }
++
++    let class_object = object.instance_class().class_object()?;
++    let mut vertex = class_object
++        .get_slot(slots.bound_vertex_list)
++        .as_object()?;
++
++    // Заливаем восемь углов и сразу переводим их в координаты камеры — ровно как в байткоде,
++    // включая запись обратно в общий список вершин: движок читает его дальше.
++    let mc: &Mutation<'gc> = activation.gc();
++    let mut camera_space = Vec::with_capacity(8);
++    for corner in CORNERS.iter() {
++        let (x, y, z) = (bound[corner[0]], bound[corner[1]], bound[corner[2]]);
++        vertex.set_slot_no_coerce(slots.vertex[0], Value::Number(x), mc);
++        vertex.set_slot_no_coerce(slots.vertex[1], Value::Number(y), mc);
++        vertex.set_slot_no_coerce(slots.vertex[2], Value::Number(z), mc);
++
++        let cx = matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3];
++        let cy = matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7];
++        let cz = matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11];
++        vertex.set_slot_no_coerce(slots.vertex_camera[0], Value::Number(cx), mc);
++        vertex.set_slot_no_coerce(slots.vertex_camera[1], Value::Number(cy), mc);
++        vertex.set_slot_no_coerce(slots.vertex_camera[2], Value::Number(cz), mc);
++        camera_space.push((cx, cy, cz));
++
++        match vertex.get_slot(slots.vertex_next).as_object() {
++            Some(next) => vertex = next,
++            None => break,
++        }
++    }
++
++    // Список вершин оказался короче восьми — значит это не тот габаритный ящик, что мы ждём.
++    if camera_space.len() != CORNERS.len() {
++        return None;
++    }
++
++    let near = camera.get_slot(slots.near).try_as_f64()?;
++    let far = camera.get_slot(slots.far).try_as_f64()?;
++
++    // Шесть плоскостей: ближняя, дальняя и четыре боковых. Маски совпадают с байткодом.
++    let planes: [(i32, Box<dyn Fn(f64, f64, f64) -> bool>); 6] = [
++        (1, Box::new(move |_x, _y, z| z > near)),
++        (2, Box::new(move |_x, _y, z| z < far)),
++        (4, Box::new(|x, _y, z| -x < z)),
++        (8, Box::new(|x, _y, z| x < z)),
++        (16, Box::new(|_x, y, z| -y < z)),
++        (32, Box::new(|_x, y, z| y < z)),
++    ];
++
++    for (bit, inside) in planes.iter() {
++        if culling & bit == 0 {
++            continue;
++        }
++        let (in_front, behind) = plane_test(&camera_space, inside);
++        if !in_front {
++            return Some(Value::Integer(-1));
++        }
++        if !behind {
++            culling &= !bit;
++        }
++    }
++
++    Some(Value::Integer(culling))
++}
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 713df28d..00f81a99 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -21,6 +21,12 @@ static OPS_ENABLED: AtomicBool = AtomicBool::new(false);
+ /// Склейка инструкций (peephole). Отключается со страницы `window.ruffleNoFusion = true`, чтобы
+ /// можно было сравнить «до/после» на ОДНОЙ сборке — иначе разброс между сборками съедает разницу.
+ static FUSION_ENABLED: AtomicBool = AtomicBool::new(true);
++/// Нативная замена отсечения сцены. Отключается со страницы `window.ruffleNoNativeCulling = true`.
++static NATIVE_CULLING_ENABLED: AtomicBool = AtomicBool::new(true);
++/// Режим сверки: нативный ответ считается, но метод всё равно выполняется байткодом, и результаты
++/// сравниваются. Включается со страницы `window.ruffleValidateCulling = true`. Нужен, чтобы
++/// доказать совпадение на живой сцене, а не надеяться на аккуратность.
++static VALIDATE_CULLING: AtomicBool = AtomicBool::new(false);
+ 
+ thread_local! {
+     /// Всего выполнено инструкций и вызовов за период. По ним считается пропускная способность
+@@ -59,6 +65,22 @@ pub fn fusion_enabled() -> bool {
+     FUSION_ENABLED.load(Ordering::Relaxed)
+ }
+ 
++pub fn set_native_culling_enabled(value: bool) {
++    NATIVE_CULLING_ENABLED.store(value, Ordering::Relaxed);
++}
++
++pub fn native_culling_enabled() -> bool {
++    NATIVE_CULLING_ENABLED.load(Ordering::Relaxed)
++}
++
++pub fn set_validate_culling(value: bool) {
++    VALIDATE_CULLING.store(value, Ordering::Relaxed);
++}
++
++pub fn validate_culling() -> bool {
++    VALIDATE_CULLING.load(Ordering::Relaxed)
++}
++
+ pub fn set_ops_enabled(value: bool) {
+     OPS_ENABLED.store(value, Ordering::Relaxed);
+ }
+diff --git a/core/src/avm2/verify.rs b/core/src/avm2/verify.rs
+index 008ae1dc..ede993db 100644
+--- a/core/src/avm2/verify.rs
++++ b/core/src/avm2/verify.rs
+@@ -26,6 +26,10 @@ pub struct VerifiedMethodInfo<'gc> {
+     pub parsed_code: Vec<Op<'gc>>,
+ 
+     pub exceptions: Vec<Exception<'gc>>,
++
++    /// Метод узнан как отсечение сцены и может считаться нативно (см. `avm2::fast_paths`).
++    /// Проверяется один раз здесь, чтобы в горячем цикле осталась одна проверка флага.
++    pub native_culling: bool,
+ }
+ 
+ #[derive(Collect)]
+@@ -519,9 +523,25 @@ pub fn verify_method<'gc>(
+         jump_targets,
+     )?;
+ 
++    let native_culling = method
++        .method_name()
++        .map(|name| name == crate::avm2::fast_paths::CULLING_METHOD)
++        .unwrap_or(false)
++        && method
++            .bound_class()
++            .map(|class| {
++                class
++                    .name()
++                    .local_name()
++                    .to_utf8_lossy()
++                    .eq(crate::avm2::fast_paths::CULLING_CLASS)
++            })
++            .unwrap_or(false);
++
+     Ok(VerifiedMethodInfo {
+         parsed_code: verified_code,
+         exceptions: new_exceptions,
++        native_culling,
+     })
+ }
+ 
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 56ccbd51..f8093475 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1269,6 +1269,14 @@ impl RuffleHandle {
+             ruffle_core::method_stats::set_enabled(trace_methods_requested(&instance.window));
+             ruffle_core::method_stats::set_ops_enabled(flag_requested(&instance.window, "ruffleTraceOps"));
+             ruffle_core::method_stats::set_fusion_enabled(!flag_requested(&instance.window, "ruffleNoFusion"));
++            ruffle_core::method_stats::set_native_culling_enabled(!flag_requested(
++                &instance.window,
++                "ruffleNoNativeCulling",
++            ));
++            ruffle_core::method_stats::set_validate_culling(flag_requested(
++                &instance.window,
++                "ruffleValidateCulling",
++            ));
+             let device_pixel_ratio =
+                 instance.window.device_pixel_ratio() * render_scale(&instance.window); // Changes via user zooming.
+             if instance.canvas_width != canvas_width
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,1212 @@
+From 2a17cd39f6e3dd89ddc84d26ec26ce1be1e6a279 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 11:19:10 +0300
+Subject: [PATCH 1/3] core: native conflict geometry clipping and average-z
+ face sort
+
+---
+ core/src/avm2/fast_paths.rs | 1153 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 1152 insertions(+), 1 deletion(-)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index f884a194..acb910d9 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -82,6 +82,10 @@ pub enum NativeMethod {
+     BspCollectFaces,
+     /// Выдача звена из пула свободных.
+     WrapperCreate,
++    /// Резка конфликтной прозрачной геометрии деревом разделителей.
++    ConflictClip,
++    /// Сортировка списка граней по среднему Z вершин.
++    SortByAverageZ,
+ }
+ 
+ impl NativeMethod {
+@@ -108,6 +112,8 @@ impl NativeMethod {
+             // У create и createStatic общий быстрый путь: оба выдают голову списка свободных,
+             // различаются они только веткой с пустым пулом, а её считает интерпретатор.
+             ("Wrapper", "create") | ("Wrapper", "createStatic") => Some(Self::WrapperCreate),
++            ("ConflictContainer", "e48c6fdc") => Some(Self::ConflictClip),
++            ("Camera3D", "sortByAverageZ") => Some(Self::SortByAverageZ),
+             _ => None,
+         }
+     }
+@@ -2722,6 +2728,1045 @@ fn wrapper_create<'gc>(
+     Some(Value::Object(head))
+ }
+ 
++/// Номера слотов для резки конфликтной прозрачной геометрии (`ConflictContainer.e48c6fdc`)
++/// и сортировки по среднему Z (`Camera3D.sortByAverageZ`).
++#[derive(Clone, Copy)]
++struct ConflictSlots {
++    /// Грань: звено, цепочки, геометрия, плоскость, средняя глубина.
++    face_wrapper: usize,
++    face_process_next: usize,
++    face_process_negative: usize,
++    face_process_positive: usize,
++    face_next: usize,
++    face_geometry: usize,
++    face_normal: [usize; 3],
++    face_offset: usize,
++    face_distance: usize,
++    /// material — открытое имя.
++    face_material: usize,
++    /// Звено.
++    wrapper_vertex: usize,
++    wrapper_next: usize,
++    /// Вершина: камерные координаты, запомненное расстояние до плоскости, пул и текстурные
++    /// координаты с локальными полями для интерполяции.
++    vertex_camera: [usize; 3],
++    vertex_offset: usize,
++    vertex_next: usize,
++    vertex_transform_id: usize,
++    vertex_draw_id: usize,
++    vertex_uv: [usize; 2],
++    vertex_local: [usize; 3],
++    vertex_normal: [usize; 3],
++    /// useVerticesNormals на базовом классе материала; None — материалов ещё не встречалось.
++    material_use_normals: Option<usize>,
++    /// sorting на VG; None — геометрий ещё не встречалось.
++    vg_sorting: Option<usize>,
++    /// Хвосты учётных цепочек кадра на камере.
++    camera_last_face: usize,
++    camera_last_vertex: usize,
++    /// Статические списки свободных на классах Face/Wrapper/Vertex.
++    face_collector: usize,
++    wrapper_collector: usize,
++    vertex_collector: usize,
++    /// Таблицы методов, на которых всё разобрано.
++    face_vtable: u32,
++    wrapper_vtable: u32,
++    vertex_vtable: u32,
++    camera_vtable: u32,
++}
++
++thread_local! {
++    static CONFLICT_SLOTS: RefCell<Option<ConflictSlots>> = const { RefCell::new(None) };
++    static CONFLICT_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++/// Разбор слотов по живым объектам: грань со звеном и вершиной плюс камера.
++fn conflict_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    face: Object<'gc>,
++    camera: Object<'gc>,
++) -> Option<ConflictSlots> {
++    if let Some(slots) = CONFLICT_SLOTS.with(|cache| *cache.borrow()) {
++        return Some(slots);
++    }
++    if CONFLICT_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Result<ConflictSlots, bool> {
++        let engine = |activation: &mut Activation<'_, 'gc>, object, name| {
++            slot_of(activation, object, name, true).ok_or(true)
++        };
++        let public = |activation: &mut Activation<'_, 'gc>, object, name| {
++            slot_of(activation, object, name, false).ok_or(true)
++        };
++
++        let face_wrapper = engine(activation, face, "wrapper")?;
++        let wrapper = face
++            .get_slot(face_wrapper)
++            .as_object()
++            .ok_or(("звено ещё не заполнено", false).1)?;
++        let wrapper_vertex = engine(activation, wrapper, "vertex")?;
++        let vertex = wrapper
++            .get_slot(wrapper_vertex)
++            .as_object()
++            .ok_or(("вершина ещё не заполнена", false).1)?;
++
++        let face_class: Object<'gc> = face
++            .instance_class()
++            .class_object()
++            .ok_or(("класс грани недоступен", false).1)?
++            .into();
++        let wrapper_class: Object<'gc> = wrapper
++            .instance_class()
++            .class_object()
++            .ok_or(("класс звена недоступен", false).1)?
++            .into();
++        let vertex_class: Object<'gc> = vertex
++            .instance_class()
++            .class_object()
++            .ok_or(("класс вершины недоступен", false).1)?
++            .into();
++
++        Ok(ConflictSlots {
++            face_wrapper,
++            face_process_next: engine(activation, face, "processNext")?,
++            face_process_negative: engine(activation, face, "processNegative")?,
++            face_process_positive: engine(activation, face, "processPositive")?,
++            face_next: engine(activation, face, "next")?,
++            face_geometry: engine(activation, face, "geometry")?,
++            face_normal: [
++                engine(activation, face, "normalX")?,
++                engine(activation, face, "normalY")?,
++                engine(activation, face, "normalZ")?,
++            ],
++            face_offset: engine(activation, face, "offset")?,
++            face_distance: engine(activation, face, "distance")?,
++            face_material: public(activation, face, "material")?,
++            wrapper_vertex,
++            wrapper_next: engine(activation, wrapper, "next")?,
++            vertex_camera: [
++                engine(activation, vertex, "cameraX")?,
++                engine(activation, vertex, "cameraY")?,
++                engine(activation, vertex, "cameraZ")?,
++            ],
++            vertex_offset: engine(activation, vertex, "offset")?,
++            vertex_next: engine(activation, vertex, "next")?,
++            vertex_transform_id: engine(activation, vertex, "transformId")?,
++            vertex_draw_id: engine(activation, vertex, "drawId")?,
++            vertex_uv: [
++                public(activation, vertex, "u")?,
++                public(activation, vertex, "v")?,
++            ],
++            vertex_local: [
++                public(activation, vertex, "x")?,
++                public(activation, vertex, "y")?,
++                public(activation, vertex, "z")?,
++            ],
++            vertex_normal: [
++                public(activation, vertex, "normalX")?,
++                public(activation, vertex, "normalY")?,
++                public(activation, vertex, "normalZ")?,
++            ],
++            material_use_normals: None,
++            vg_sorting: None,
++            camera_last_face: engine(activation, camera, "lastFace")?,
++            camera_last_vertex: engine(activation, camera, "lastVertex")?,
++            face_collector: engine(activation, face_class, "collector")?,
++            wrapper_collector: engine(activation, wrapper_class, "collector")?,
++            vertex_collector: engine(activation, vertex_class, "collector")?,
++            face_vtable: face.vtable().id(),
++            wrapper_vtable: wrapper.vtable().id(),
++            vertex_vtable: vertex.vtable().id(),
++            camera_vtable: camera.vtable().id(),
++        })
++    };
++    match resolve(activation) {
++        Ok(slots) => {
++            CONFLICT_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            Some(slots)
++        }
++        Err(hopeless) => {
++            if hopeless {
++                CONFLICT_HOPELESS.with(|flag| flag.set(true));
++            }
++            None
++        }
++    }
++}
++
++/// Всё, что нужно резке, собранное и проверенное до первой записи.
++struct ConflictCtx<'gc> {
++    slots: ConflictSlots,
++    camera: Object<'gc>,
++    face_class: Object<'gc>,
++    wrapper_class: Object<'gc>,
++    vertex_class: Object<'gc>,
++    /// Порог отделения «на плоскости» (аргумент threshold).
++    threshold: f64,
++    /// Сортировать ли подсписки без поддеревьев (аргумент l5).
++    sort_flag: bool,
++}
++
++/// Обход цепочки граней по processNext. `None` — чужой класс или цепь длиннее предела.
++fn conflict_chain<'gc>(
++    head: Option<Object<'gc>>,
++    slots: &ConflictSlots,
++) -> Option<Vec<Object<'gc>>> {
++    let mut out = Vec::new();
++    let mut node = head;
++    while let Some(face) = node {
++        if face.vtable().id() != slots.face_vtable || out.len() >= 4096 {
++            return None;
++        }
++        out.push(face);
++        node = face.get_slot(slots.face_process_next).as_object();
++    }
++    Some(out)
++}
++
++/// Итог прескана: грани и вершины, которые вызов может задеть.
++struct ConflictScan<'gc> {
++    /// Все узлы дерева разделителей (сам splitter, его цепочки и поддеревья).
++    splitter_faces: Vec<Object<'gc>>,
++    /// Все грани раскраиваемого списка (включая их будущие подсписки).
++    list_faces: Vec<Object<'gc>>,
++    /// Вершины граней списка.
++    vertices: Vec<Object<'gc>>,
++}
++
++/// Прескан: валидация классов и структуры до единственной записи. Заодно лениво дорезолвливает
++/// слоты материала и геометрии — они видны только на живых объектах.
++fn conflict_prescan<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    slots: &mut ConflictSlots,
++    splitter: Option<Object<'gc>>,
++    list: Option<Object<'gc>>,
++) -> Option<ConflictScan<'gc>> {
++    let mut scan = ConflictScan {
++        splitter_faces: Vec::new(),
++        list_faces: Vec::new(),
++        vertices: Vec::new(),
++    };
++
++    // Дерево разделителей: цепочки processNext и поддеревья processNegative/processPositive.
++    let mut stack: Vec<Object<'gc>> = Vec::new();
++    if let Some(splitter) = splitter {
++        stack.push(splitter);
++    }
++    while let Some(node) = stack.pop() {
++        let mut chain = Some(node);
++        while let Some(face) = chain {
++            if face.vtable().id() != slots.face_vtable || scan.splitter_faces.len() >= 4096 {
++                return None;
++            }
++            scan.splitter_faces.push(face);
++            for child_slot in [slots.face_process_negative, slots.face_process_positive] {
++                if let Some(child) = face.get_slot(child_slot).as_object() {
++                    if stack.len() >= 4096 {
++                        return None;
++                    }
++                    stack.push(child);
++                }
++            }
++            chain = face.get_slot(slots.face_process_next).as_object();
++        }
++    }
++
++    // Грани списка: у каждой минимум три звена (байткод читает третью вершину без проверки).
++    let list_faces = conflict_chain(list, slots)?;
++    for face in list_faces.iter() {
++        let mut count = 0usize;
++        let mut link = face.get_slot(slots.face_wrapper).as_object();
++        while let Some(wrapper) = link {
++            if wrapper.vtable().id() != slots.wrapper_vtable || scan.vertices.len() >= 65536 {
++                return None;
++            }
++            let vertex = wrapper.get_slot(slots.wrapper_vertex).as_object()?;
++            if vertex.vtable().id() != slots.vertex_vtable {
++                return None;
++            }
++            scan.vertices.push(vertex);
++            count += 1;
++            link = wrapper.get_slot(slots.wrapper_next).as_object();
++        }
++        if count < 3 {
++            return None;
++        }
++        // Ленивые слоты: материал и геометрия видны только здесь.
++        if slots.material_use_normals.is_none()
++            && let Some(material) = face.get_slot(slots.face_material).as_object()
++        {
++            slots.material_use_normals =
++                Some(slot_of(activation, material, "useVerticesNormals", true)?);
++        }
++        if slots.vg_sorting.is_none()
++            && let Some(geometry) = face.get_slot(slots.face_geometry).as_object()
++        {
++            slots.vg_sorting = Some(slot_of(activation, geometry, "sorting", true)?);
++        }
++    }
++    if slots.vg_sorting.is_none()
++        && let Some(splitter) = splitter
++        && let Some(geometry) = splitter.get_slot(slots.face_geometry).as_object()
++    {
++        slots.vg_sorting = Some(slot_of(activation, geometry, "sorting", true)?);
++    }
++    scan.list_faces = list_faces;
++    Some(scan)
++}
++
++/// Взять объект из списка свободных класса или, если пул пуст, построить новый конструктором.
++fn conflict_take<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_as_object: Object<'gc>,
++    collector_slot: usize,
++    next_slot: usize,
++    expected_vtable: u32,
++) -> Option<Object<'gc>> {
++    let mc = activation.gc();
++    if let Some(head) = class_as_object.get_slot(collector_slot).as_object()
++        && head.vtable().id() == expected_vtable
++    {
++        let next = head.get_slot(next_slot);
++        class_as_object.set_slot_no_coerce(collector_slot, next, mc);
++        head.set_slot_no_coerce(next_slot, Value::Null, mc);
++        return Some(head);
++    }
++    // Пул пуст: как и байткод, зовём настоящий конструктор (он у этих классов пустой).
++    let class_object = class_as_object.as_class_object()?;
++    class_object.construct(activation, &[]).ok()?.as_object()
++}
++
++/// Числовое поле; незаполненное читается как NaN — так его видит и байткод.
++fn conflict_num<'gc>(object: Object<'gc>, slot: usize) -> f64 {
++    object.get_slot(slot).try_as_f64().unwrap_or(f64::NAN)
++}
++
++/// Новая вершина резки: интерполяция камерных и текстурных координат, при необходимости —
++/// локальных координат и нормали. Порядок операций повторяет байткод дословно.
++#[allow(clippy::too_many_arguments)]
++fn conflict_new_vertex<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    ctx: &ConflictCtx<'gc>,
++    prev: Object<'gc>,
++    current: Object<'gc>,
++    t: f64,
++    interpolate_normals: bool,
++) -> Option<Object<'gc>> {
++    let slots = &ctx.slots;
++    let vertex = conflict_take(
++        activation,
++        ctx.vertex_class,
++        slots.vertex_collector,
++        slots.vertex_next,
++        slots.vertex_vtable,
++    )?;
++    let mc = activation.gc();
++    // Свежая вершина из пула: как в Vertex.create.
++    vertex.set_slot_no_coerce(slots.vertex_transform_id, Value::Integer(0), mc);
++    vertex.set_slot_no_coerce(slots.vertex_draw_id, Value::Integer(0), mc);
++    // Учёт кадра: camera.lastVertex.next = vertex; camera.lastVertex = vertex.
++    if let Some(last) = ctx.camera.get_slot(slots.camera_last_vertex).as_object() {
++        last.set_slot_no_coerce(slots.vertex_next, Value::Object(vertex), mc);
++    }
++    ctx.camera
++        .set_slot_no_coerce(slots.camera_last_vertex, Value::Object(vertex), mc);
++
++    let lerp = |slot: usize| {
++        let a = conflict_num(prev, slot);
++        let b = conflict_num(current, slot);
++        a + (b - a) * t
++    };
++    for slot in [
++        slots.vertex_camera[0],
++        slots.vertex_camera[1],
++        slots.vertex_camera[2],
++        slots.vertex_uv[0],
++        slots.vertex_uv[1],
++    ] {
++        set(vertex, slot, lerp(slot), mc);
++    }
++    if interpolate_normals {
++        for slot in [
++            slots.vertex_local[0],
++            slots.vertex_local[1],
++            slots.vertex_local[2],
++            slots.vertex_normal[0],
++            slots.vertex_normal[1],
++            slots.vertex_normal[2],
++        ] {
++            set(vertex, slot, lerp(slot), mc);
++        }
++    }
++    Some(vertex)
++}
++
++/// Приписать к полигону новое звено с данной вершиной. `tail` — прежний хвост (None — полигон
++/// ещё пуст, звено становится его первым, через face.wrapper).
++fn conflict_add_wrapper<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    ctx: &ConflictCtx<'gc>,
++    polygon: Object<'gc>,
++    tail: Option<Object<'gc>>,
++    vertex: Object<'gc>,
++) -> Option<Object<'gc>> {
++    let slots = &ctx.slots;
++    let wrapper = conflict_take(
++        activation,
++        ctx.wrapper_class,
++        slots.wrapper_collector,
++        slots.wrapper_next,
++        slots.wrapper_vtable,
++    )?;
++    let mc = activation.gc();
++    wrapper.set_slot_no_coerce(slots.wrapper_vertex, Value::Object(vertex), mc);
++    match tail {
++        Some(tail) => tail.set_slot_no_coerce(slots.wrapper_next, Value::Object(wrapper), mc),
++        None => polygon.set_slot_no_coerce(slots.face_wrapper, Value::Object(wrapper), mc),
++    }
++    Some(wrapper)
++}
++
++/// Новый полигон резки: клон материала и геометрии исходной грани, учёт в цепочке кадра.
++fn conflict_new_face<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    ctx: &ConflictCtx<'gc>,
++    source: Object<'gc>,
++) -> Option<Object<'gc>> {
++    let slots = &ctx.slots;
++    let face = conflict_take(
++        activation,
++        ctx.face_class,
++        slots.face_collector,
++        slots.face_next,
++        slots.face_vtable,
++    )?;
++    let mc = activation.gc();
++    face.set_slot_no_coerce(slots.face_material, source.get_slot(slots.face_material), mc);
++    face.set_slot_no_coerce(slots.face_geometry, source.get_slot(slots.face_geometry), mc);
++    if let Some(last) = ctx.camera.get_slot(slots.camera_last_face).as_object() {
++        last.set_slot_no_coerce(slots.face_next, Value::Object(face), mc);
++    }
++    ctx.camera
++        .set_slot_no_coerce(slots.camera_last_face, Value::Object(face), mc);
++    Some(face)
++}
++
++/// `Camera3D.sortByAverageZ` — сортировка слиянием связного списка граней по средней глубине
++/// вершин; глубина листьев пересчитывается на месте. Дословный перенос байткода.
++fn sort_by_average_z<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    slots: &ConflictSlots,
++    head: Object<'gc>,
++) -> Option<Object<'gc>> {
++    let mc = activation.gc();
++    let next_of = |face: Object<'gc>| face.get_slot(slots.face_process_next).as_object();
++
++    // Быстрый и медленный указатели делят список пополам.
++    let mut middle = head;
++    let mut probe = next_of(head);
++    while let Some(fast) = probe
++        && next_of(fast).is_some()
++    {
++        middle = next_of(middle)?;
++        probe = next_of(next_of(fast)?);
++    }
++    let mut right = next_of(middle);
++    middle.set_slot_no_coerce(slots.face_process_next, Value::Null, mc);
++    let mut left = Some(head);
++
++    // Каждая половина либо сортируется глубже, либо (одиночная грань) получает глубину.
++    let refresh = |face: Object<'gc>, mc: &Mutation<'gc>| {
++        let mut count = 0i32;
++        let mut sum = 0.0f64;
++        let mut link = face.get_slot(slots.face_wrapper).as_object();
++        while let Some(wrapper) = link {
++            count += 1;
++            if let Some(vertex) = wrapper.get_slot(slots.wrapper_vertex).as_object() {
++                sum += conflict_num(vertex, slots.vertex_camera[2]);
++            } else {
++                sum += f64::NAN;
++            }
++            link = wrapper.get_slot(slots.wrapper_next).as_object();
++        }
++        set(face, slots.face_distance, sum / f64::from(count), mc);
++    };
++    let left_head = left?;
++    if next_of(left_head).is_some() {
++        left = Some(sort_by_average_z(activation, slots, left_head)?);
++    } else {
++        refresh(left_head, mc);
++    }
++    let right_head = right?;
++    if next_of(right_head).is_some() {
++        right = Some(sort_by_average_z(activation, slots, right_head)?);
++    } else {
++        refresh(right_head, mc);
++    }
++
++    // Слияние на месте: пока берём из той же половины, ссылки уже стоят.
++    let distance = |face: Object<'gc>| conflict_num(face, slots.face_distance);
++    let (mut left, mut right) = (left?, right?);
++    let mut from_left = distance(left) > distance(right);
++    let result;
++    let mut tail;
++    if from_left {
++        result = left;
++        tail = left;
++        match next_of(left) {
++            Some(next) => left = next,
++            None => {
++                tail.set_slot_no_coerce(slots.face_process_next, Value::Object(right), mc);
++                return Some(result);
++            }
++        }
++    } else {
++        result = right;
++        tail = right;
++        match next_of(right) {
++            Some(next) => right = next,
++            None => {
++                tail.set_slot_no_coerce(slots.face_process_next, Value::Object(left), mc);
++                return Some(result);
++            }
++        }
++    }
++    loop {
++        if from_left {
++            if distance(left) > distance(right) {
++                tail = left;
++                match next_of(left) {
++                    Some(next) => left = next,
++                    None => {
++                        tail.set_slot_no_coerce(
++                            slots.face_process_next,
++                            Value::Object(right),
++                            mc,
++                        );
++                        return Some(result);
++                    }
++                }
++            } else {
++                tail.set_slot_no_coerce(slots.face_process_next, Value::Object(right), mc);
++                tail = right;
++                match next_of(right) {
++                    Some(next) => right = next,
++                    None => {
++                        tail.set_slot_no_coerce(slots.face_process_next, Value::Object(left), mc);
++                        return Some(result);
++                    }
++                }
++                from_left = false;
++            }
++        } else if distance(right) > distance(left) {
++            tail = right;
++            match next_of(right) {
++                Some(next) => right = next,
++                None => {
++                    tail.set_slot_no_coerce(slots.face_process_next, Value::Object(left), mc);
++                    return Some(result);
++                }
++            }
++        } else {
++            tail.set_slot_no_coerce(slots.face_process_next, Value::Object(left), mc);
++            tail = left;
++            match next_of(left) {
++                Some(next) => left = next,
++                None => {
++                    tail.set_slot_no_coerce(slots.face_process_next, Value::Object(right), mc);
++                    return Some(result);
++                }
++            }
++            from_left = true;
++        }
++    }
++}
++
++/// Раскрой списка граней деревом разделителей: дословный перенос `e48c6fdc`. Возвращает голову
++/// собранной задом наперёд выходной цепочки (аргумент-аккумулятор `result`).
++fn conflict_clip_node<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    ctx: &ConflictCtx<'gc>,
++    splitter_in: Option<Object<'gc>>,   // l1
++    list: Option<Object<'gc>>,          // l2
++    result_in: Value<'gc>,              // l6
++    depth: u32,
++) -> Option<Value<'gc>> {
++    if depth > 2048 {
++        return None;
++    }
++    let slots = &ctx.slots;
++    let mc = activation.gc();
++    let link = |object: Object<'gc>, slot: usize| object.get_slot(slot).as_object();
++
++    let mut splitter = splitter_in; // l1
++    let mut list = list; // l2
++    let mut result = result_in; // l6
++
++    // Плоскость и поддеревья.
++    let mut geometry_value = Value::Null; // l52
++    let mut near = None; // l28 — ближнее поддерево (обрабатывается вторым)
++    let mut far = None; // l40 — дальнее (обрабатывается первым)
++    let (mut nx, mut ny, mut nz, mut offset); // l7, l10, l11, l21
++    let mut chain_tail = None; // l44 — хвост цепочки «на плоскости»
++
++    if let Some(plane) = splitter {
++        geometry_value = plane.get_slot(slots.face_geometry);
++        // Ветвление повторяет `ifnlt` байткода: при offset < 0 плоскость берётся как есть,
++        // иначе (включая NaN) нормаль и смещение переворачиваются, а поддеревья меняются
++        // местами — так ближняя сторона всегда оказывается ближней к камере.
++        if conflict_num(plane, slots.face_offset) < 0.0 {
++            near = link(plane, slots.face_process_negative);
++            far = link(plane, slots.face_process_positive);
++            nx = conflict_num(plane, slots.face_normal[0]);
++            ny = conflict_num(plane, slots.face_normal[1]);
++            nz = conflict_num(plane, slots.face_normal[2]);
++            offset = conflict_num(plane, slots.face_offset);
++        } else {
++            near = link(plane, slots.face_process_positive);
++            far = link(plane, slots.face_process_negative);
++            nx = -conflict_num(plane, slots.face_normal[0]);
++            ny = -conflict_num(plane, slots.face_normal[1]);
++            nz = -conflict_num(plane, slots.face_normal[2]);
++            offset = -conflict_num(plane, slots.face_offset);
++        }
++        plane.set_slot_no_coerce(slots.face_process_negative, Value::Null, mc);
++        plane.set_slot_no_coerce(slots.face_process_positive, Value::Null, mc);
++        if link(plane, slots.face_wrapper).is_some() {
++            // Разделитель — живая цепочка граней: пометить геометрию у хвостов.
++            let mut walker = plane;
++            while let Some(next) = link(walker, slots.face_process_next) {
++                walker = next;
++                walker.set_slot_no_coerce(slots.face_geometry, geometry_value, mc);
++            }
++            chain_tail = Some(walker);
++        } else {
++            plane.set_slot_no_coerce(slots.face_geometry, Value::Null, mc);
++            splitter = None;
++        }
++    } else {
++        // Разделителя нет: плоскость строится по первой грани списка.
++        let plane = list?;
++        list = link(plane, slots.face_process_next);
++        splitter = Some(plane);
++        chain_tail = Some(plane);
++
++        let mut wrapper = link(plane, slots.face_wrapper)?; // l48
++        let a = link(wrapper, slots.wrapper_vertex)?; // l37
++        wrapper = link(wrapper, slots.wrapper_next)?;
++        let b = link(wrapper, slots.wrapper_vertex)?; // l38
++        let ax = conflict_num(a, slots.vertex_camera[0]); // l32
++        let ay = conflict_num(a, slots.vertex_camera[1]); // l8
++        let az = conflict_num(a, slots.vertex_camera[2]); // l17
++        let abx = conflict_num(b, slots.vertex_camera[0]) - ax; // l22
++        let aby = conflict_num(b, slots.vertex_camera[1]) - ay; // l54
++        let abz = conflict_num(b, slots.vertex_camera[2]) - az; // l34
++        nx = 0.0;
++        ny = 0.0;
++        nz = 1.0;
++        offset = az;
++        let mut best = 0.0f64; // l41
++        let mut walker = link(wrapper, slots.wrapper_next);
++        while let Some(current) = walker {
++            let c = link(current, slots.wrapper_vertex)?; // l47
++            let acx = conflict_num(c, slots.vertex_camera[0]) - ax; // l51
++            let acy = conflict_num(c, slots.vertex_camera[1]) - ay; // l20
++            let acz = conflict_num(c, slots.vertex_camera[2]) - az; // l9
++            let cx = acz * aby - acy * abz; // l35
++            let cy = acx * abz - acz * abx; // l13
++            let cz = acy * abx - acx * aby; // l14
++            let len2 = cx * cx + cy * cy + cz * cz; // l27
++            if len2 > ctx.threshold {
++                let k = 1.0 / len2.sqrt();
++                nx = cx * k;
++                ny = cy * k;
++                nz = cz * k;
++                offset = ax * nx + ay * ny + az * nz;
++                break;
++            } else if len2 > best {
++                let k = 1.0 / len2.sqrt();
++                nx = cx * k;
++                ny = cy * k;
++                nz = cz * k;
++                offset = ax * nx + ay * ny + az * nz;
++                best = len2;
++            }
++            walker = link(current, slots.wrapper_next);
++        }
++    }
++
++    let behind_limit = offset - ctx.threshold; // l19
++    let front_limit = offset + ctx.threshold; // l36
++
++    // Списки по сторонам плоскости.
++    let mut front_head: Option<Object<'gc>> = None; // l12
++    let mut front_tail: Option<Object<'gc>> = None; // l26
++    let mut behind_head: Option<Object<'gc>> = None; // l23
++    let mut behind_tail: Option<Object<'gc>> = None; // l49
++
++    let mut current = list; // l45
++    while let Some(face) = current {
++        let after = link(face, slots.face_process_next); // l25
++
++        let mut wrapper = link(face, slots.face_wrapper)?; // l48
++        let v1 = link(wrapper, slots.wrapper_vertex)?; // l37
++        wrapper = link(wrapper, slots.wrapper_next)?;
++        let v2 = link(wrapper, slots.wrapper_vertex)?; // l38
++        wrapper = link(wrapper, slots.wrapper_next)?;
++        let v3 = link(wrapper, slots.wrapper_vertex)?; // l39
++        let mut rest = link(wrapper, slots.wrapper_next); // l48
++
++        let dot = |vertex: Object<'gc>| {
++            conflict_num(vertex, slots.vertex_camera[0]) * nx
++                + conflict_num(vertex, slots.vertex_camera[1]) * ny
++                + conflict_num(vertex, slots.vertex_camera[2]) * nz
++        };
++        let d1 = dot(v1); // l24
++        let d2 = dot(v2); // l16
++        let d3 = dot(v3); // l30
++        let mut is_behind = d1 < behind_limit || d2 < behind_limit || d3 < behind_limit; // l42
++        let mut is_front = d1 > front_limit || d2 > front_limit || d3 > front_limit; // l29
++        while let Some(extra) = rest {
++            let vertex = link(extra, slots.wrapper_vertex)?; // l47
++            let d = dot(vertex); // l50
++            if d < behind_limit {
++                is_behind = true;
++            } else if d > front_limit {
++                is_front = true;
++            }
++            set(vertex, slots.vertex_offset, d, mc);
++            rest = link(extra, slots.wrapper_next);
++        }
++
++        if !is_behind {
++            if !is_front {
++                // В пределах порога: в цепочку разделителя.
++                match chain_tail {
++                    Some(tail) if splitter.is_some() => {
++                        tail.set_slot_no_coerce(
++                            slots.face_process_next,
++                            Value::Object(face),
++                            mc,
++                        );
++                    }
++                    _ => splitter = Some(face),
++                }
++                chain_tail = Some(face);
++            } else {
++                match front_tail {
++                    Some(tail) => tail.set_slot_no_coerce(
++                        slots.face_process_next,
++                        Value::Object(face),
++                        mc,
++                    ),
++                    None => front_head = Some(face),
++                }
++                front_tail = Some(face);
++            }
++        } else if !is_front {
++            match behind_tail {
++                Some(tail) => {
++                    tail.set_slot_no_coerce(slots.face_process_next, Value::Object(face), mc)
++                }
++                None => behind_head = Some(face),
++            }
++            behind_tail = Some(face);
++        } else {
++            // Пересекает слой: резка на два полигона.
++            set(v1, slots.vertex_offset, d1, mc);
++            set(v2, slots.vertex_offset, d2, mc);
++            set(v3, slots.vertex_offset, d3, mc);
++            let negative = conflict_new_face(activation, ctx, face)?; // l33
++            let positive = conflict_new_face(activation, ctx, face)?; // l43
++            let mut negative_tail: Option<Object<'gc>> = None; // l18
++            let mut positive_tail: Option<Object<'gc>> = None; // l31
++
++            // Последняя вершина замыкает контур с первой.
++            let mut last_wrapper = link(link(link(face, slots.face_wrapper)?, slots.wrapper_next)?, slots.wrapper_next)?;
++            while let Some(next) = link(last_wrapper, slots.wrapper_next) {
++                last_wrapper = next;
++            }
++            let mut prev = link(last_wrapper, slots.wrapper_vertex)?; // l37
++            let mut prev_d = conflict_num(prev, slots.vertex_offset); // l24
++
++            let interpolate_normals = match face.get_slot(slots.face_material).as_object() {
++                Some(material) => match slots.material_use_normals {
++                    Some(slot) => material.get_slot(slot) == Value::Bool(true),
++                    None => return None,
++                },
++                None => false,
++            }; // l15
++
++            let mut walker = link(face, slots.face_wrapper); // l48
++            while let Some(current_wrapper) = walker {
++                let vertex = link(current_wrapper, slots.wrapper_vertex)?; // l38
++                let d = conflict_num(vertex, slots.vertex_offset); // l16
++                if (prev_d < behind_limit && d > front_limit)
++                    || (prev_d > front_limit && d < behind_limit)
++                {
++                    let t = (offset - prev_d) / (d - prev_d); // l46
++                    let created =
++                        conflict_new_vertex(activation, ctx, prev, vertex, t, interpolate_normals)?;
++                    negative_tail = Some(conflict_add_wrapper(
++                        activation, ctx, negative, negative_tail, created,
++                    )?);
++                    positive_tail = Some(conflict_add_wrapper(
++                        activation, ctx, positive, positive_tail, created,
++                    )?);
++                }
++                if d <= front_limit {
++                    negative_tail = Some(conflict_add_wrapper(
++                        activation, ctx, negative, negative_tail, vertex,
++                    )?);
++                }
++                if d >= behind_limit {
++                    positive_tail = Some(conflict_add_wrapper(
++                        activation, ctx, positive, positive_tail, vertex,
++                    )?);
++                }
++                prev = vertex;
++                prev_d = d;
++                walker = link(current_wrapper, slots.wrapper_next);
++            }
++
++            let mc = activation.gc();
++            match behind_tail {
++                Some(tail) => tail.set_slot_no_coerce(
++                    slots.face_process_next,
++                    Value::Object(negative),
++                    mc,
++                ),
++                None => behind_head = Some(negative),
++            }
++            behind_tail = Some(negative);
++            match front_tail {
++                Some(tail) => tail.set_slot_no_coerce(
++                    slots.face_process_next,
++                    Value::Object(positive),
++                    mc,
++                ),
++                None => front_head = Some(positive),
++            }
++            front_tail = Some(positive);
++            face.set_slot_no_coerce(slots.face_process_next, Value::Null, mc);
++            face.set_slot_no_coerce(slots.face_geometry, Value::Null, mc);
++        }
++
++        current = after;
++    }
++
++    // Дальняя сторона.
++    if let Some(subtree) = far {
++        subtree.set_slot_no_coerce(slots.face_geometry, geometry_value, mc);
++        if let Some(tail) = front_tail {
++            tail.set_slot_no_coerce(slots.face_process_next, Value::Null, mc);
++        }
++        result = conflict_clip_node(activation, ctx, Some(subtree), front_head, result, depth + 1)?;
++    } else if let Some(head) = front_head {
++        let tail = front_tail?;
++        if ctx.sort_flag && !Object::ptr_eq(head, tail) {
++            tail.set_slot_no_coerce(slots.face_process_next, Value::Null, mc);
++            let geometry = link(head, slots.face_geometry)?;
++            let sorting_slot = slots.vg_sorting?;
++            if geometry.get_slot(sorting_slot) == Value::Integer(2) {
++                result = conflict_clip_node(activation, ctx, None, Some(head), result, depth + 1)?;
++            } else {
++                let sorted = sort_by_average_z(activation, slots, head)?;
++                let mc = activation.gc();
++                let mut walker = sorted;
++                while let Some(next) = link(walker, slots.face_process_next) {
++                    walker = next;
++                }
++                walker.set_slot_no_coerce(slots.face_process_next, result, mc);
++                result = Value::Object(sorted);
++            }
++        } else {
++            tail.set_slot_no_coerce(slots.face_process_next, result, mc);
++            result = Value::Object(head);
++        }
++    }
++
++    // Грани «на плоскости» вместе с разделителем.
++    if let Some(plane) = splitter {
++        chain_tail?.set_slot_no_coerce(slots.face_process_next, result, mc);
++        result = Value::Object(plane);
++    }
++
++    // Ближняя сторона.
++    if let Some(subtree) = near {
++        subtree.set_slot_no_coerce(slots.face_geometry, geometry_value, mc);
++        if let Some(tail) = behind_tail {
++            tail.set_slot_no_coerce(slots.face_process_next, Value::Null, mc);
++        }
++        result = conflict_clip_node(activation, ctx, Some(subtree), behind_head, result, depth + 1)?;
++    } else if let Some(head) = behind_head {
++        let tail = behind_tail?;
++        if ctx.sort_flag && !Object::ptr_eq(head, tail) {
++            tail.set_slot_no_coerce(slots.face_process_next, Value::Null, mc);
++            let geometry = link(head, slots.face_geometry)?;
++            let sorting_slot = slots.vg_sorting?;
++            if geometry.get_slot(sorting_slot) == Value::Integer(2) {
++                result = conflict_clip_node(activation, ctx, None, Some(head), result, depth + 1)?;
++            } else {
++                let sorted = sort_by_average_z(activation, slots, head)?;
++                let mc = activation.gc();
++                let mut walker = sorted;
++                while let Some(next) = link(walker, slots.face_process_next) {
++                    walker = next;
++                }
++                walker.set_slot_no_coerce(slots.face_process_next, result, mc);
++                result = Value::Object(sorted);
++            }
++        } else {
++            tail.set_slot_no_coerce(slots.face_process_next, result, mc);
++            result = Value::Object(head);
++        }
++    }
++
++    Some(result)
++}
++
++/// Соберёт контекст резки и проверит вход; `None` — до первой записи, уступая интерпретатору.
++fn conflict_context<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++) -> Option<(ConflictCtx<'gc>, ConflictScan<'gc>, Option<Object<'gc>>, Option<Object<'gc>>)> {
++    let splitter = activation.local_register(1).as_object();
++    let list = activation.local_register(2).as_object();
++    let camera = activation.local_register(3).as_object()?;
++    let threshold = activation.local_register(4).try_as_f64()?;
++    let sort_flag = match activation.local_register(5) {
++        Value::Bool(value) => value,
++        _ => return None,
++    };
++
++    // Слоты разбираются по любой живой грани вызова.
++    let sample = splitter.or(list)?;
++    let mut slots = conflict_slots(activation, sample, camera)?;
++    if camera.vtable().id() != slots.camera_vtable {
++        return None;
++    }
++    let scan = conflict_prescan(activation, &mut slots, splitter, list)?;
++    // Дорезолвленные ленивые слоты — обратно в кэш.
++    CONFLICT_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++
++    // Учётные цепочки кадра должны быть непустыми: байткод пишет lastFace.next без проверки,
++    // и пустой хвост означал бы, что вызов пришёл не из отрисовки.
++    camera.get_slot(slots.camera_last_face).as_object()?;
++    camera.get_slot(slots.camera_last_vertex).as_object()?;
++
++    // Классы пулов — от живых объектов.
++    let face_class: Object<'gc> = sample.instance_class().class_object()?.into();
++    let first_wrapper = scan
++        .list_faces
++        .first()
++        .copied()
++        .or(scan.splitter_faces.iter().copied().find(|face| {
++            face.get_slot(slots.face_wrapper).as_object().is_some()
++        }))
++        .and_then(|face| face.get_slot(slots.face_wrapper).as_object());
++    let wrapper_class: Object<'gc> = first_wrapper?.instance_class().class_object()?.into();
++    let vertex_class: Object<'gc> = scan
++        .vertices
++        .first()?
++        .instance_class()
++        .class_object()?
++        .into();
++
++    Some((
++        ConflictCtx {
++            slots,
++            camera,
++            face_class,
++            wrapper_class,
++            vertex_class,
++            threshold,
++            sort_flag,
++        },
++        scan,
++        splitter,
++        list,
++    ))
++}
++
++/// Длина списка свободных у класса. Нужна сверке: если пул может исчерпаться, нативный счёт и
++/// байткод создали бы РАЗНЫЕ объекты, и сравнение адресов стало бы ложной тревогой.
++fn conflict_pool_len<'gc>(
++    class_as_object: Object<'gc>,
++    collector_slot: usize,
++    next_slot: usize,
++) -> usize {
++    let mut count = 0usize;
++    let mut node = class_as_object.get_slot(collector_slot).as_object();
++    while let Some(current) = node {
++        count += 1;
++        if count >= 262_144 {
++            break;
++        }
++        node = current.get_slot(next_slot).as_object();
++    }
++    count
++}
++
++/// `ConflictContainer.e48c6fdc` — художническая сортировка конфликтной прозрачной геометрии:
++/// список граней раскраивается деревом разделителей, пересекающие слой грани режутся на два
++/// полигона вершинами из пулов, куски собираются в выходную цепочку от дальних к ближним.
++/// В тяжёлых кадрах у владельца это до четверти всего ActionScript.
++fn conflict_clip<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let (ctx, scan, splitter, list) = conflict_context(activation)?;
++
++    // В режиме сверки требуем запас в пулах: на исчерпании оба прохода строили бы новые объекты,
++    // и они бы не совпали адресами. Оценка сверху: два полигона и цепочка звеньев на грань.
++    if crate::method_stats::validate_native_paths() {
++        let faces_needed = scan.list_faces.len() * 2 + 8;
++        let wrappers_needed = scan.vertices.len() * 4 + 16;
++        let vertices_needed = scan.vertices.len() * 2 + 16;
++        if conflict_pool_len(ctx.face_class, ctx.slots.face_collector, ctx.slots.face_next)
++            < faces_needed
++            || conflict_pool_len(
++                ctx.wrapper_class,
++                ctx.slots.wrapper_collector,
++                ctx.slots.wrapper_next,
++            ) < wrappers_needed
++            || conflict_pool_len(
++                ctx.vertex_class,
++                ctx.slots.vertex_collector,
++                ctx.slots.vertex_next,
++            ) < vertices_needed
++        {
++            return None;
++        }
++    }
++
++    let result = activation.local_register(6);
++    conflict_clip_node(activation, &ctx, splitter, list, result, 0)
++}
++
++/// Вход `Camera3D.sortByAverageZ` как самостоятельной замены.
++fn sort_faces_entry<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let camera = activation.local_register(0).as_object()?;
++    let head = activation.local_register(1).as_object()?;
++    let slots = conflict_slots(activation, head, camera)?;
++
++    // Валидация цепи до первой записи: классы граней, звеньев и вершин.
++    let faces = conflict_chain(Some(head), &slots)?;
++    for face in faces.iter() {
++        let mut link = face.get_slot(slots.face_wrapper).as_object();
++        while let Some(wrapper) = link {
++            if wrapper.vtable().id() != slots.wrapper_vtable {
++                return None;
++            }
++            let vertex = wrapper.get_slot(slots.wrapper_vertex).as_object()?;
++            if vertex.vtable().id() != slots.vertex_vtable {
++                return None;
++            }
++            link = wrapper.get_slot(slots.wrapper_next).as_object();
++        }
++    }
++
++    sort_by_average_z(activation, &slots, head).map(Value::Object)
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -3298,6 +4343,108 @@ pub fn snapshot<'gc>(
+         });
+     }
+ 
++    // Сортировка по среднему Z: как и сортировка конфликтов, переставляет ссылки всего списка
++    // и обновляет глубины. Снимок хранит ссылки и глубины для отката; сверяется возвращённая
++    // голова — поэлементно сравнить прогоны нельзя, обход после них идёт уже по новой цепи.
++    if native == NativeMethod::SortByAverageZ {
++        let camera = activation.local_register(0).as_object()?;
++        let head = activation.local_register(1).as_object()?;
++        let slots = conflict_slots(activation, head, camera)?;
++        let faces = conflict_chain(Some(head), &slots)?;
++        let mut links = Vec::with_capacity(faces.len() * 2);
++        for face in faces.iter() {
++            links.push((
++                *face,
++                slots.face_process_next,
++                face.get_slot(slots.face_process_next),
++            ));
++            links.push((*face, slots.face_distance, face.get_slot(slots.face_distance)));
++        }
++        return Some(Snapshot {
++            fields: Vec::new(),
++            links,
++            vectors: Vec::new(),
++        });
++    }
++
++    // Резка конфликтной геометрии: откатываются пулы целиком (значит, оба прохода возьмут одни
++    // и те же объекты в одном порядке), ссылки и геометрия граней, расстояния вершин и учётные
++    // цепочки камеры. Поля созданных объектов не откатываются: повторный проход перезапишет их
++    // теми же значениями в тех же объектах. Сверяется возвращённая голова цепочки.
++    if native == NativeMethod::ConflictClip {
++        let (ctx, scan, _, _) = conflict_context(activation)?;
++        let slots = &ctx.slots;
++        let mut links = Vec::new();
++
++        for (class_obj, collector, next_slot) in [
++            (ctx.face_class, slots.face_collector, slots.face_next),
++            (ctx.wrapper_class, slots.wrapper_collector, slots.wrapper_next),
++            (ctx.vertex_class, slots.vertex_collector, slots.vertex_next),
++        ] {
++            links.push((class_obj, collector, class_obj.get_slot(collector)));
++            let mut node = class_obj.get_slot(collector).as_object();
++            let mut count = 0usize;
++            while let Some(current) = node {
++                links.push((current, next_slot, current.get_slot(next_slot)));
++                node = current.get_slot(next_slot).as_object();
++                count += 1;
++                if count >= 100_000 {
++                    return None;
++                }
++            }
++        }
++
++        for face in scan.splitter_faces.iter() {
++            for slot in [
++                slots.face_process_next,
++                slots.face_process_negative,
++                slots.face_process_positive,
++                slots.face_geometry,
++            ] {
++                links.push((*face, slot, face.get_slot(slot)));
++            }
++        }
++        for face in scan.list_faces.iter() {
++            for slot in [
++                slots.face_process_next,
++                slots.face_geometry,
++                slots.face_distance,
++            ] {
++                links.push((*face, slot, face.get_slot(slot)));
++            }
++        }
++        for vertex in scan.vertices.iter() {
++            links.push((
++                *vertex,
++                slots.vertex_offset,
++                vertex.get_slot(slots.vertex_offset),
++            ));
++        }
++
++        links.push((
++            ctx.camera,
++            slots.camera_last_face,
++            ctx.camera.get_slot(slots.camera_last_face),
++        ));
++        links.push((
++            ctx.camera,
++            slots.camera_last_vertex,
++            ctx.camera.get_slot(slots.camera_last_vertex),
++        ));
++        if let Some(last) = ctx.camera.get_slot(slots.camera_last_face).as_object() {
++            links.push((last, slots.face_next, last.get_slot(slots.face_next)));
++        }
++        if let Some(last) = ctx.camera.get_slot(slots.camera_last_vertex).as_object() {
++            links.push((last, slots.vertex_next, last.get_slot(slots.vertex_next)));
++        }
++
++        return Some(Snapshot {
++            fields: Vec::new(),
++            links,
++            vectors: Vec::new(),
++        });
++    }
++
+     // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
+     // делается один раз за сессию и на чужом объекте запомнил бы неудачу навсегда.
+     if !matches!(
+@@ -3325,7 +4472,9 @@ pub fn snapshot<'gc>(
+         | NativeMethod::BoundIntersectSphere
+         | NativeMethod::CalculateSphere
+         | NativeMethod::BspCollectFaces
+-        | NativeMethod::WrapperCreate => return None,
++        | NativeMethod::WrapperCreate
++        | NativeMethod::ConflictClip
++        | NativeMethod::SortByAverageZ => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -3403,6 +4552,8 @@ pub fn run<'gc>(
+         NativeMethod::CalculateSphere => calculate_sphere(activation, method),
+         NativeMethod::BspCollectFaces => bsp_collect_faces(activation, method),
+         NativeMethod::WrapperCreate => wrapper_create(activation, method),
++        NativeMethod::ConflictClip => conflict_clip(activation),
++        NativeMethod::SortByAverageZ => sort_faces_entry(activation),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+-- 
+2.51.1.windows.1
+

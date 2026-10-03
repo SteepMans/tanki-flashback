@@ -1,0 +1,487 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Рейтинговый бой</title>
+  <style>
+    /* Windows com escala of tela (125%/150%) fazia o engine IE11 da StageWebView aplicar um "zoom" de
+       legibilidade, deixando o conteúdo grande demais e desalinhado só em ALGUNS usuários (os of alta-DPI).
+       @-ms-viewport=device-width desliga esse snap e força renderização 1:1. DEVE vir antes do resto. */
+    @-ms-viewport { width: device-width; }
+    @viewport { width: device-width; }
+
+    /* Tema inspirado no cliente: fundo escuro, destaques em dourado/âmbar. As texturas originais
+       do jogo NÃO são redistribuídas (ver README), então botões e cards são puro CSS. */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%; width: 100%; overflow: hidden; color: #dfe3ea;
+      font-family: "Segoe UI", Tahoma, sans-serif; -webkit-user-select: none; user-select: none;
+      /* impede o IE of inflar o tamanho da fonte automaticamente em telas escaladas (parte do "grande demais") */
+      -ms-text-size-adjust: 100%; -webkit-text-size-adjust: 100%; text-size-adjust: 100%;
+    }
+    body { position: relative; display: flex; align-items: center; justify-content: center; background: #05070a; }
+    /* backdrop: gradiente escuro. A captura do jogo que ficava aqui foi removida junto com o resto
+       das imagens do cliente. */
+    .backdrop { position: absolute; top: 0; left: 0; right: 0; bottom: 0; background-color: #05070a;
+      background-image: radial-gradient(120% 90% at 50% 0%, #121823 0%, #05070a 70%); }
+    /* card centralizado (a janela do painel) */
+    .card { position: relative; z-index: 1; width: 400px; max-width: 92%; max-height: 92%;
+      display: flex; flex-direction: column; overflow: hidden; border-radius: 6px;
+      background: linear-gradient(180deg, #1b202a, #0e1116); border: 1px solid #2b3444; border-top-color: #3a465a;
+      box-shadow: 0 22px 60px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.05); }
+    /* estado resultado: solto, sem moldura nem header */
+    .card.bare { background: none; border: 0; box-shadow: none; overflow: visible; width: 420px; }
+    .card.bare header { display: none; }
+    .card.bare #content { min-height: 0; }
+    /* busca/encontrada: widget pequeno, card arredondado translúcido (75%) sobre o fundo escuro do widget */
+    .card.compact { width: 100%; height: 100%; max-width: none; max-height: none;
+      border-radius: 16px; border: 1px solid rgba(74,88,112,.45);
+      background: rgba(17,21,29,.75); box-shadow: 0 8px 26px rgba(0,0,0,.5); }
+    .card.compact header { display: none; }
+    .card.compact #content { min-height: 0; padding: 12px 14px; justify-content: center; }
+    .card.compact #content { padding: 10px 12px; }
+    .card.compact .hero { }
+    .card.compact .htitle { font-size: 12px; }
+    .card.compact .vs { font-size: 11px; }
+    .card.compact .hsub { font-size: 10px; }
+    .card.compact .count { font-size: 24px; margin-top: 1px; }
+    .card.compact .wide { padding: 8px; margin-top: 5px; font-size: 12px; }
+    header {
+      display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto;
+      padding: 10px 14px; background: #191e27; border-bottom: 1px solid #2b3444;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.05);
+    }
+    header h1 { font-size: 13px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: #cfd5df; }
+    header h1 b { color: #f0a830; }
+    #close { appearance: none; border: 1px solid #3a4050; background: #242b38; color: #cfd5df; width: 24px; height: 24px; border-radius: 3px; font-size: 14px; cursor: pointer; line-height: 1; }
+    #close:hover { background: #303947; }
+
+    /* corpo = uma tela por estado */
+    #content { flex: 1 1 auto; min-height: 280px; max-height: 100%; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; }
+    .hero { flex: 1 1 auto; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+    /* IE11 ignora `gap` em flexbox → espaçamento vira metade. Em TODO container flex usamos margem no
+       irmão seguinte (> * + *) para o espaço ser idêntico no IE11 e no Chrome. */
+    .hero > * + * { margin-top: 6px; }
+    .card.compact .hero > * + * { margin-top: 2px; }
+
+    /* moldura escura no estilo do jogo (bevel: topo claro, sombra interna) */
+    .card { background: linear-gradient(180deg, #1a1f29, #12161d); border: 1px solid #2b3444;
+      border-top-color: #3a465a; border-radius: 4px; box-shadow: inset 0 1px 0 rgba(255,255,255,.04); }
+
+    .mmrbig { font-size: 46px; font-weight: 800; color: #f0a830; line-height: 1; text-shadow: 0 2px 6px rgba(0,0,0,.55); }
+    .mmrlbl { font-size: 11px; letter-spacing: 2px; color: #7f8798; }
+    .pill { margin-top: 10px; padding: 6px 14px; font-size: 12px; font-weight: 700; color: #cfd5df; text-transform: uppercase; letter-spacing: .5px; }
+    .who { font-size: 11px; color: #6f7788; margin-top: 2px; }
+
+    .htitle { font-size: 20px; font-weight: 800; letter-spacing: .5px; text-transform: uppercase; }
+    .htitle.gold { color: #f0a830; }
+    .hsub { font-size: 12px; color: #8b93a7; }
+    .hsub b { color: #f0a830; }
+    .vs { font-size: 15px; color: #cfd5df; }
+    .vs b { color: #fff; }
+    .count { font-size: 56px; font-weight: 800; color: #f0a830; line-height: 1.1; text-shadow: 0 2px 8px rgba(0,0,0,.5); }
+
+    /* botões escovados do jogo */
+    .gbtn, .graybtn { appearance: none; border-radius: 4px; padding: 14px; font-size: 14px; font-weight: 700;
+      letter-spacing: .5px; text-transform: uppercase; cursor: pointer; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.55);
+      border: 1px solid #000; background-repeat: no-repeat; background-position: center; background-size: 100% 100%;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.22); }
+    .errmsg { margin-top: 10px; min-height: 16px; color: #f2777a; font-size: 12px; text-align: center; }
+    /* botão of fechar flutuante no canto superior direito do backdrop (usado no modal solto of intro) */
+    #bdclose { display: none; position: absolute; top: 12px; right: 12px; z-index: 5;
+      appearance: none; border: 1px solid #3a4050; background: rgba(36,43,56,.85); color: #cfd5df;
+      width: 28px; height: 28px; border-radius: 4px; font-size: 16px; line-height: 1; cursor: pointer; }
+    #bdclose:hover { background: #303947; }
+    .intro { color: #cfd5df; font-size: 13px; line-height: 1.5; text-align: left; }
+    .intro .lead { margin: 0 0 10px; }
+    .intro .ilist { margin: 0 0 10px; padding-left: 18px; }
+    .intro .ilist li { margin: 4px 0; }
+    .intro .how { margin: 0 0 4px; color: #9aa4b2; }
+    .intro b { color: #f0a830; }
+    .gbtn { background-image: linear-gradient(180deg, #76bf45 0%, #5ea637 45%, #3f7324 100%); border-color: #26401d; }
+    .graybtn { background-image: linear-gradient(180deg, #5c646f 0%, #454c56 45%, #2b3038 100%); border-color: #333; }
+    .gbtn:hover, .graybtn:hover { filter: brightness(1.12); }
+    .wide { display: block; width: 100%; flex: 0 0 auto; }
+
+    /* tela of resultado */
+    /* título grande no topo, sem card */
+    .rtitle { font-size: 38px; font-weight: 800; letter-spacing: 2px; text-transform: uppercase; text-align: center; margin-top: 4px; }
+    .rtitle.win { color: #5ea637; text-shadow: 0 0 22px rgba(94,166,55,.45); }
+    .rtitle.loss { color: #c9453a; text-shadow: 0 0 22px rgba(201,69,58,.35); }
+    .rtitle.draw { color: #f0a830; text-shadow: 0 0 22px rgba(240,168,48,.35); }
+    /* placar 7 × 5 */
+    .score { text-align: center; font-size: 40px; font-weight: 800; line-height: 1; margin: 6px 0; color: #dfe3ea; }
+    .score i { font-style: normal; color: #5b6474; font-size: 26px; margin: 0 14px; vertical-align: middle; }
+    .score .win { color: #5ea637; } .score .loss { color: #c9453a; } .score .draw { color: #f0a830; }
+    .rmmr { font-size: 11px; color: #8b93a7; text-align: center; margin-top: 2px; }
+    .rmmr b { color: #f0a830; }
+    /* tabela of placar */
+    .sb { width: 100%; border-collapse: collapse; margin: 14px 0; font-size: 13px; }
+    .sb th { font-size: 10px; letter-spacing: .5px; text-transform: uppercase; color: #7f8798; font-weight: 700; padding: 6px 4px; border-bottom: 1px solid #2b3444; text-align: center; }
+    .sb th.lft { text-align: left; }
+    .sb td { padding: 9px 4px; text-align: center; color: #cfd5df; font-weight: 600; border-bottom: 1px solid rgba(43,52,68,.5); }
+    .sb td.lft { text-align: left; }
+    .sb tr.me td { background: rgba(240,168,48,.10); }
+    .tg { color: #f0a830; font-weight: 800; }
+    .sb td.pos { color: #5ea637; font-weight: 800; }
+    .sb td.neg { color: #c9453a; font-weight: 800; }
+    .ractions { display: flex; margin-top: auto; }
+    .ractions > * + * { margin-left: 8px; }
+    .ractions button { flex: 1; padding: 12px; }
+
+    /* classificação / leaderboard */
+    .bhead { font-size: 13px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; color: #cfd5df; text-align: center; margin-bottom: 8px; }
+    .boardlist { flex: 1 1 auto; overflow-y: auto; margin-bottom: 8px; }
+    .lbyou { font-size: 12px; color: #8b93a7; text-align: center; padding: 6px; margin-bottom: 8px; border-bottom: 1px solid #2b3444; }
+    .lbyou b { color: #f0a830; }
+    .lbempty { font-size: 12px; color: #7f8798; text-align: center; padding: 14px; }
+    .lbrow { display: flex; align-items: center; padding: 8px 10px; border-radius: 3px; }
+    .lbrow > * + * { margin-left: 10px; }
+    .lbrow:nth-child(even) { background: rgba(255,255,255,.02); }
+    .lbrow.me { background: rgba(240,168,48,.12); }
+    .lbrank { width: 22px; text-align: center; font-weight: 800; color: #7f8798; font-size: 13px; }
+    .lbrow.me .lbrank { color: #f0a830; }
+    .lbname { flex: 1; font-size: 13px; font-weight: 600; color: #dfe3ea; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lbmmr, .lbval { font-size: 13px; font-weight: 800; color: #f0a830; }
+
+    /* tela inicial: ocupa a tela inteira, grid of 12 colunas (mineiros 3 | usuário+buscar 6 | ranking 3) */
+    .card.home3 { width: 100%; height: 100%; max-width: none; max-height: none; }
+    .card.home3 #content { min-height: 0; padding: 32px 48px; }
+    /* IE11 (StageWebView) NÃO suporta CSS Grid moderno — usamos flexbox com flex-grow proporcional
+       para emular as 12 colunas: mineiros 3 + centro 6 + ranking 3 = 12. */
+    .cols3 { flex: 1 1 auto; display: flex; min-height: 0; }
+    .cols3 > .col + .col { margin-left: 32px; } /* IE11 não tem gap: espaço via margem entre colunas */
+    .span3 { -ms-flex: 3 1 0%; flex: 3 1 0%; min-width: 0; }
+    .span6 { -ms-flex: 6 1 0%; flex: 6 1 0%; min-width: 0; }
+    .col { min-width: 0; display: flex; flex-direction: column;
+      background-color: rgba(255,255,255,.02); border: 1px solid #2b3444; border-radius: 4px; padding: 14px;
+      /* fundo dos cards laterais (mineiros/ranking) — era uma imagem do cliente, agora gradiente */
+      background-image: linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,0)); }
+    .col.center { align-items: center; justify-content: center; text-align: center; background: none; border: 0; padding: 6px 4px; }
+    .col.center > * + * { margin-top: 8px; }
+    .colhd { font-size: 12px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: #cfd5df;
+      text-align: center; margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid #2b3444; }
+    .colbody { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+    .col.center .gbtn { margin-top: 12px; width: auto; min-width: 240px; padding-left: 32px; padding-right: 32px; } /* não esticar: largura pelo conteúdo */
+
+    /* seletor of modo (1v1/2v2) no centro + abas do ranking à direita: botões segmentados */
+    .modesel { display: flex; margin: 2px 0; }
+    .tabs { display: flex; justify-content: center; margin-bottom: 8px; }
+    .modesel > * + *, .tabs > * + * { margin-left: 6px; }
+    .modesel button, .tabs button { appearance: none; cursor: pointer; font-weight: 700; font-size: 12px;
+      letter-spacing: .5px; text-transform: uppercase; padding: 6px 16px; border-radius: 4px;
+      border: 1px solid #2b3444; background: #1a2029; color: #8b93a7; }
+    .modesel button.on, .tabs button.on { background: rgba(240,168,48,.15); border-color: #f0a830; color: #f0a830; }
+    .sb tr.sbsep td { padding: 0; border-bottom: 2px solid #3a465a; }
+</style>
+</head>
+<body>
+  <div class="backdrop"></div>
+  <button id="bdclose" title="Закрыть" onclick="closePanel()">&times;</button>
+  <div class="card" id="card">
+    <header>
+      <h1>Рейтинговый <b>бой</b></h1>
+      <button id="close" title="Закрыть (ESC)" onclick="closePanel()">&times;</button>
+    </header>
+    <div id="content"></div>
+  </div>
+
+  <script>
+    function closePanel() { window.location.href = "http://wpclose/"; }
+
+    function qs(name) { var m = location.search.match(new RegExp("[?&]" + name + "=([^&]*)")); return m ? decodeURIComponent(m[1]) : ""; }
+    var TOKEN = qs("token");
+    function api(method, path, body, cb) {
+      var url = path + (path.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(TOKEN);
+      // IE11 (StageWebView) cacheia GET agressivamente → o poll of status devolveria SEMPRE a 1ª resposta
+      // ("idle") e o painel nunca sairia da home. Um param único por chamada quebra o cache.
+      if (method === "GET") url += "&_=" + Date.now();
+      var xhr = new XMLHttpRequest();
+      xhr.open(method, url, true);
+      xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.setRequestHeader("Cache-Control", "no-cache");
+      xhr.onreadystatechange = function () { if (xhr.readyState !== 4) return; var d = null; try { d = JSON.parse(xhr.responseText); } catch (e) {} cb(xhr.status, d); };
+      xhr.send(body ? JSON.stringify(body) : null);
+    }
+
+    var state = "";        // estado atual renderizado
+    var username = "…";
+    var mytag = null;      // tag do clã do jogador logado (null = sem clã)
+    var closing = false;
+    var view = "home";     // sub-tela quando idle: "home" | "board" (classificação)
+    var selectedMode = "1v1"; // modo que o jogador vai JOGAR (dirige MMR exibido + Buscar)
+    var boardMode = "1v1";    // aba do ranking à direita (independente do modo of jogo)
+    var renderedKey = null;
+    // timer da "partida encontrada" roda 100% no painel; o servidor só entra/cancela
+    var foundEndsAt = 0, searchStartAt = 0, enterSent = false;
+    var lastDynShown = -1, lastCardCls = "";
+
+    api("GET", "/ranked/whoami", null, function (st, d) { if (st === 200 && d && d.username) { username = d.username; mytag = d.tag || null; touchWho(); } });
+    function touchWho() { var w = document.getElementById("who"); if (w) w.innerHTML = nameTag(username, mytag); }
+
+    function esc(s) { return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;"); }
+    // Nome do jogador com a tag do clã na frente (se houver): "[TAG] Nick".
+    function nameTag(name, tag) { return (tag ? '<span class="tg">[' + esc(tag) + '] </span>' : '') + esc(name); }
+
+    // Constrói a tela do estado (só quando o estado MUDA); valores dinâmicos são atualizados no updateDyn.
+    function build(s) {
+      lastDynShown = -1; // força o próximo tick a escrever o número
+      var c = document.getElementById("content");
+      var html = "";
+      // home não tem header (é bare/solto no backdrop): usa o botão of fechar flutuante do canto.
+      document.getElementById("bdclose").style.display = (s.state === "idle" && view === "home") ? "block" : "none";
+      if (s.state === "idle" && view === "board") {
+        html += '<div class="bhead">Таблица лидеров · опыт/БО</div>';
+        html += '<div id="boardlist" class="boardlist">загрузка…</div>';
+        html += '<button class="graybtn wide" onclick="goHome()">Назад</button>';
+        c.innerHTML = html;
+        loadBoard();
+        return;
+      } else if (s.state === "idle") {
+        // 3 colunas: maiores mineiros (servidor) | usuário + buscar | ranking MMR do XP/BP
+        html += '<div class="cols3">';
+        html += '<div class="col span3"><div class="colhd">Лучшие добытчики</div><div id="minerlist" class="colbody">загрузка…</div></div>';
+        html += '<div class="col center span6">';
+        html += '<div class="mmrbig" id="mmr">' + (s.mmr || 0) + '</div><div class="mmrlbl">ВАШ MMR · ' + selectedMode.toUpperCase() + '</div>';
+        html += '<div class="pill card">Опыт/БО · захват флага</div>';
+        // seletor do modo que vai jogar
+        html += '<div class="modesel">'
+          + '<button class="' + (selectedMode === "1v1" ? "on" : "") + '" onclick="setMode(\'1v1\')">1v1</button>'
+          + '<button class="' + (selectedMode === "2v2" ? "on" : "") + '" onclick="setMode(\'2v2\')">2v2</button>'
+          + '</div>';
+        html += '<div class="who" id="who">' + nameTag(username, mytag) + '</div>';
+        html += '<button class="gbtn wide" onclick="onSearchClick()">Найти бой</button>';
+        html += '<div id="errmsg" class="errmsg"></div>';
+        html += '</div>';
+        html += '<div class="col span3">'
+          + '<div class="colhd">Рейтинг · опыт/БО</div>'
+          + '<div class="tabs">'
+          + '<button id="tab1v1" class="' + (boardMode === "1v1" ? "on" : "") + '" onclick="setBoardMode(\'1v1\')">1v1</button>'
+          + '<button id="tab2v2" class="' + (boardMode === "2v2" ? "on" : "") + '" onclick="setBoardMode(\'2v2\')">2v2</button>'
+          + '</div>'
+          + '<div id="mmrlist" class="colbody">загрузка…</div>'
+          + '</div>';
+        html += '</div>';
+        c.innerHTML = html;
+        loadMiners();
+        loadMmrBoard();
+        return;
+      } else if (s.state === "searching") {
+        searchStartAt = 0; // nova busca: re-ancora no próximo updateDyn (evita herdar o tempo of uma fila anterior)
+        html += '<div class="hero"><div class="htitle gold">Ищем соперника</div>';
+        html += '<div class="count"><span id="dyn">0</span><span style="font-size:20px">s</span></div></div>';
+        html += '<button class="graybtn wide" onclick="onSearchClick()">Отмена</button>';
+      } else if (s.state === "found") {
+        // a contagem começa AGORA e roda no painel; ao zerar, avisamos o servidor (POST /ranked/enter)
+        foundEndsAt = Date.now() + (s.countdownMs || 10000);
+        enterSent = false;
+        html += '<div class="hero"><div class="htitle gold">Соперник найден</div>';
+        html += '<div class="count" id="dyn">' + Math.ceil((s.countdownMs || 10000) / 1000) + '</div></div>';
+        html += '<button class="graybtn wide" onclick="onSearchClick()">Отмена</button>';
+      } else if (s.state === "active") {
+        html += '<div class="hero"><div class="htitle gold">Заходим в бой…</div></div>';
+      } else if (s.state === "result" && s.result) {
+        html += buildResult(s.result);
+      }
+      c.innerHTML = html;
+    }
+
+    function buildResult(r) {
+      var title = r.outcome === "win" ? "Victory" : r.outcome === "loss" ? "Defeat" : "Draw";
+      var you = r.youTeam || [], opp = r.oppTeam || [];
+      var h = "";
+      h += '<div class="rtitle ' + r.outcome + '">' + title + '</div>';
+      h += '<div class="score"><span class="' + r.outcome + '">' + r.youFlags + '</span><i>×</i><span>' + r.oppFlags + '</span></div>';
+      h += '<div class="rmmr">' + (r.mode ? r.mode.toUpperCase() + ' · ' : '') + 'MMR ' + r.mmrAfter + (r.rank ? ' · <b>#' + r.rank + '</b> of ' + r.total : '') + '</div>';
+      h += '<table class="sb"><thead><tr><th class="lft">Игрок</th><th>K</th><th>D</th><th>K/D</th><th>Pts</th></tr></thead><tbody>';
+      for (var i = 0; i < you.length; i++) h += sbRow(you[i], you[i].nick === username);
+      if (opp.length) h += '<tr class="sbsep"><td colspan="5"></td></tr>'; // separa os dois times
+      for (var j = 0; j < opp.length; j++) h += sbRow(opp[j], false);
+      h += '</tbody></table>';
+      h += '<div class="ractions"><button class="gbtn" onclick="playAgain()">Играть ещё</button>';
+      h += '<button class="graybtn" onclick="exitRanked()">Exit</button></div>';
+      return h;
+    }
+    function sbRow(p, me) {
+      var kd = (p.deaths > 0 ? p.kills / p.deaths : p.kills).toFixed(2);
+      var pts = (p.delta > 0 ? "+" : "") + p.delta;
+      var cls = p.delta > 0 ? "pos" : (p.delta < 0 ? "neg" : "");
+      var tag = p.tag ? '<span class="tg">[' + esc(p.tag) + "]</span> " : "";
+      return '<tr class="' + (me ? "me" : "") + '"><td class="lft">' + tag + esc(p.nick) + "</td><td>" + p.kills + "</td><td>" + p.deaths + "</td><td>" + kd + '</td><td class="' + cls + '">' + pts + "</td></tr>";
+    }
+
+    // Atualiza só os valores que mudam a cada poll (sem reconstruir a tela).
+    // sincroniza SÓ o tempo of fila com o servidor (o timer do "found" é 100% local, ver build)
+    function updateDyn(s) {
+      var mmr = document.getElementById("mmr"); if (mmr && s.mmr != null) mmr.innerHTML = s.mmr;
+      if (s.state === "searching" && !searchStartAt) {
+        // Ancora o INÍCIO da fila UMA ÚNICA vez (na 1ª sincronização), a partir do queuedForMs do servidor.
+        // Nunca re-ancora depois — assim o contador é imune a jitter/latência/reset do queuedForMs e sobe
+        // sempre liso. Um novo "Buscar" reseta searchStartAt=0 no build(), então a próxima busca re-ancora.
+        searchStartAt = Date.now() - (s.queuedForMs || 0);
+      }
+      localTick();
+    }
+    // Atualiza o número. Escreve no DOM SÓ quando o valor muda (1x/seg) — o motor IE da StageWebView
+    // repinta a tela toda a cada escrita, então evitar escritas redundantes tira o "travamento".
+    function localTick() {
+      var dyn = document.getElementById("dyn");
+      if (!dyn) { lastDynShown = -1; return; }
+      var val;
+      if (state === "found") {
+        var left = Math.ceil((foundEndsAt - Date.now()) / 1000);
+        val = Math.max(0, left);
+        if (left <= 0 && !enterSent) {
+          enterSent = true;
+          api("POST", "/ranked/enter", null, function () {}); // avisa o servidor: pode entrar
+          if (!closing) { closing = true; setTimeout(closePanel, 300); }
+        }
+      } else if (state === "searching") {
+        val = searchStartAt ? Math.floor((Date.now() - searchStartAt) / 1000) : 0;
+      } else {
+        return;
+      }
+      if (val !== lastDynShown) { dyn.innerHTML = val; lastDynShown = val; }
+    }
+    setInterval(localTick, 200);
+
+    function render(s) {
+      // Alinha o modo selecionado ao da partida/fila/resultado, para "Play Again" e o MMR baterem.
+      if (s.mode && (s.state !== "idle")) selectedMode = s.mode;
+      // resultado = solto (sem card); busca/encontrada = compact (widget pequeno); resto = card normal.
+      var cc = (s.state === "result") ? "card bare" : (s.state === "searching" || s.state === "found") ? "card compact" : "card";
+      if (s.state === "idle" && view === "home") cc = "card bare home3"; // home = 3 colunas soltas direto no backdrop (sem moldura)
+      if (cc !== lastCardCls) { document.getElementById("card").className = cc; lastCardCls = cc; }
+      var key = s.state + (s.state === "idle" ? ":" + view : "");
+      if (key !== renderedKey) { renderedKey = key; state = s.state; build(s); }
+      updateDyn(s);
+      if (s.state === "active" && !closing) { closing = true; setTimeout(closePanel, 300); }
+    }
+
+    // Constrói as linhas of um rank (mineiros ou MMR); valKey = campo do valor exibido à direita.
+    function lbRows(list, valKey) {
+      if (!list || !list.length) return '<div class="lbempty">Данных пока нет.</div>';
+      var h = "";
+      for (var i = 0; i < list.length; i++) {
+        var p = list[i];
+        var me = (p.username === username) ? " me" : "";
+        h += '<div class="lbrow' + me + '"><span class="lbrank">' + (i + 1) + '</span><span class="lbname">' + nameTag(p.username, p.tag) + '</span><span class="lbval">' + p[valKey] + '</span></div>';
+      }
+      return h;
+    }
+    function loadMiners() {
+      api("GET", "/ranked/miners", null, function (st, d) {
+        var el = document.getElementById("minerlist"); if (!el) return;
+        el.innerHTML = (st === 200 && d) ? lbRows(d.top, "mines") : "failed to load.";
+      });
+    }
+    function loadMmrBoard() {
+      api("GET", "/ranked/leaderboard?mode=" + boardMode, null, function (st, d) {
+        var el = document.getElementById("mmrlist"); if (!el) return;
+        el.innerHTML = (st === 200 && d) ? lbRows(d.top, "mmr") : "failed to load.";
+      });
+    }
+    // Troca o modo que vai JOGAR: reconstrói a home (re-busca o status com o novo modo → novo MMR).
+    function setMode(m) { if (m === selectedMode) return; selectedMode = m; renderedKey = null; poll(); }
+    // Troca a aba do RANKING (independente): só recarrega a lista, sem reconstruir a tela.
+    function setBoardMode(m) {
+      if (m === boardMode) return;
+      boardMode = m;
+      var a = document.getElementById("tab1v1"), b = document.getElementById("tab2v2");
+      if (a) a.className = boardMode === "1v1" ? "on" : "";
+      if (b) b.className = boardMode === "2v2" ? "on" : "";
+      loadMmrBoard();
+    }
+
+    function goBoard() { view = "board"; renderedKey = null; poll(); }
+    function goHome() { view = "home"; renderedKey = null; poll(); }
+    function loadBoard() {
+      api("GET", "/ranked/leaderboard", null, function (st, d) {
+        var el = document.getElementById("boardlist");
+        if (!el) return;
+        if (st !== 200 || !d) { el.innerHTML = "failed to load."; return; }
+        var h = "";
+        if (d.you) h += '<div class="lbyou">Вы: <b>#' + d.you.rank + '</b> of ' + d.you.total + ' · ' + d.you.mmr + ' MMR</div>';
+        if (!d.top || d.top.length === 0) { el.innerHTML = h + '<div class="lbempty">В рейтинге пока никого нет.</div>'; return; }
+        for (var i = 0; i < d.top.length; i++) {
+          var p = d.top[i];
+          var me = (p.username === username) ? " me" : "";
+          h += '<div class="lbrow' + me + '"><span class="lbrank">' + (i + 1) + '</span><span class="lbname">' + nameTag(p.username, p.tag) + '</span><span class="lbmmr">' + p.mmr + '</span></div>';
+        }
+        el.innerHTML = h;
+      });
+    }
+
+    // Rede of segurança: se o status falhar várias vezes seguidas (ex.: sessão dessincronizada → 401),
+    // o widget "Buscando"/"Encontrada" ficaria preso na tela mesmo já dentro da batalha. Recarregamos a
+    // página, que reautentica pelo token da URL e volta a sincronizar com o estado real do servidor.
+    var pollFails = 0;
+    function poll() {
+      api("GET", "/ranked/status?mode=" + selectedMode, null, function (st, d) {
+        if (st === 200 && d) { pollFails = 0; render(d); return; }
+        if (++pollFails >= 5 && !closing) { pollFails = 0; location.reload(); }
+      });
+    }
+
+    // modo demo p/ inspecionar layout no navegador: /panel/?demo=result (ou ?demo=found)
+    var demo = qs("demo");
+    if (qs("intro") === "1") {
+      showIntro();
+    } else if (demo === "result") {
+      render({ state: "result", mmr: 1016, mode: "2v2", result: { outcome: "win", mode: "2v2", mmrAfter: 1016, rank: 3, total: 42, youFlags: 7, oppFlags: 5,
+        youTeam: [{ nick: "Danlino", tag: "LT", kills: 9, deaths: 4, delta: 16 }, { nick: "Ally", tag: "LT", kills: 6, deaths: 5, delta: 16 }],
+        oppTeam: [{ nick: "Opponent", tag: null, kills: 6, deaths: 9, delta: -16 }, { nick: "Rival", tag: "XP", kills: 4, deaths: 7, delta: -16 }] } });
+    } else if (demo === "found") {
+      render({ state: "found", mmr: 1000, mode: "2v2", opponents: ["Opponent", "Rival"], countdownMs: 10000 });
+    } else {
+      setInterval(poll, 1500);
+      poll();
+    }
+
+    function onSearchClick() {
+      if (state === "idle") {
+        api("POST", "/ranked/enqueue", { mode: selectedMode }, function (st, d) {
+          if (d && d.ok === false) { showError(d.error || "Could not find a match."); return; }
+          // Troca JÁ para o widget "Buscando" (a janela também encolhe) sem depender do round-trip do poll —
+          // no IE11 o poll pode demorar/vir of cache e o conteúdo ficaria preso na home dentro da janela pequena.
+          render({ state: "searching", mmr: 0, mode: selectedMode, queuedForMs: 0 });
+          poll();
+        });
+      } else {
+        api("POST", "/ranked/cancel", null, function () { view = "home"; renderedKey = null; poll(); });
+      }
+    }
+    function showError(msg) { var e = document.getElementById("errmsg"); if (e) e.innerHTML = esc(msg); }
+    function playAgain() {
+      state = "";
+      api("POST", "/ranked/enqueue", { mode: selectedMode }, function () {
+        render({ state: "searching", mmr: 0, mode: selectedMode, queuedForMs: 0 });
+        poll();
+      });
+    }
+    function exitRanked() { api("POST", "/ranked/dismiss", null, function () { closePanel(); }); }
+
+    // Modal informativo mostrado no login: explica a Ranqueada e como acessá-la. Sem polling.
+    function showIntro() {
+      // conteúdo solto (sem card/header); o fechar fica no canto sup. direito do backdrop.
+      document.getElementById("card").className = "card bare";
+      document.getElementById("bdclose").style.display = "block";
+      var c = document.getElementById("content");
+      var h = "";
+      h += '<div class="intro">';
+      h += '<p class="lead">В <b>рейтинговом режиме (опыт/БО)</b> вы играете дуэли <b>1 на 1 в захвате флага</b> за очки <b>MMR</b>.</p>';
+      h += '<ul class="ilist">';
+      h += '<li><b>Побеждайте</b>, чтобы набирать MMR: поражения и уходы его снижают.</li>';
+      h += '<li><b>Снаряжение ограничено</b>: заходите с подходящим набором для режима.</li>';
+      h += '<li>Поднимайтесь в <b>таблице лидеров</b> и боритесь за первое место.</li>';
+      h += '</ul>';
+      h += '<p class="how">Чтобы играть, откройте панель кнопкой <b>приглашений</b> или введите в чате <b>/ranked</b>.</p>';
+      h += '</div>';
+      h += '<button class="gbtn wide" onclick="closePanel()">Понятно</button>';
+      c.innerHTML = h;
+    }
+  </script>
+</body>
+</html>

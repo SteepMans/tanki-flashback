@@ -1,0 +1,918 @@
+From 3f07e34b49266706ecf66997ef08cca31b7586d8 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 13:45:38 +0300
+Subject: [PATCH] core: native shadow visibility with matrix leaf methods
+
+---
+ core/src/avm2/fast_paths.rs | 839 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 836 insertions(+), 3 deletions(-)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 0a266d83..2b659d4b 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -98,6 +98,16 @@ pub enum NativeMethod {
+     ObjectConcat,
+     /// Батчи прозрачных треугольников: константы пакетами по восемнадцать и отрисовка.
+     CameraTransparentBatch,
++    /// Сборка матрицы объекта из углов, масштаба и позиции — без домножения на родителя.
++    ObjectComposeMatrix,
++    /// То же, но исходные углы и позиция берутся с другого объекта.
++    ObjectComposeMatrixFromSource,
++    /// Обращение матрицы объекта на месте.
++    ObjectInvertMatrix,
++    /// Домножение матрицы объекта на матрицу аргумента слева.
++    ObjectAppendMatrix,
++    /// Видимость тени: матрица света, обход кастеров и отсечение камерой.
++    ShadowCheckVisibility,
+ }
+ 
+ impl NativeMethod {
+@@ -134,6 +144,11 @@ impl NativeMethod {
+             ("KDContainer", "d33b25fe") => Some(Self::KdCollectPlanes),
+             ("Object3D", "concat") => Some(Self::ObjectConcat),
+             ("Camera3D", "a2c88d8c") => Some(Self::CameraTransparentBatch),
++            (ENGINE_CLASS, "composeMatrix") => Some(Self::ObjectComposeMatrix),
++            (ENGINE_CLASS, "composeMatrixFromSource") => Some(Self::ObjectComposeMatrixFromSource),
++            (ENGINE_CLASS, "invertMatrix") => Some(Self::ObjectInvertMatrix),
++            (ENGINE_CLASS, "appendMatrix") => Some(Self::ObjectAppendMatrix),
++            ("Shadow", "checkVisibility") => Some(Self::ShadowCheckVisibility),
+             _ => None,
+         }
+     }
+@@ -152,6 +167,10 @@ impl NativeMethod {
+                 | Self::KdCollectPlanes
+                 | Self::ObjectConcat
+                 | Self::CameraTransparentBatch
++                | Self::ObjectComposeMatrix
++                | Self::ObjectComposeMatrixFromSource
++                | Self::ObjectInvertMatrix
++                | Self::ObjectAppendMatrix
+         )
+     }
+ 
+@@ -170,7 +189,10 @@ impl NativeMethod {
+     pub fn comparable(self) -> bool {
+         !matches!(
+             self,
+-            Self::PadTexture | Self::KdCollectPlanes | Self::CameraTransparentBatch
++            Self::PadTexture
++                | Self::KdCollectPlanes
++                | Self::CameraTransparentBatch
++                | Self::ShadowCheckVisibility
+         )
+     }
+ }
+@@ -5394,6 +5416,750 @@ fn concat_slots<'gc>(
+     }
+ }
+ 
++/// Двенадцать значений матрицы объекта, собранной из его углов, масштаба и позиции — общая
++/// часть composeMatrix, composeMatrixFromSource и composeAndAppend. Порядок операций байткодный,
++/// имена промежуточных повторяют байткодные локали composeAndAppend.
++#[allow(unused_parens)]
++fn compose_values<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    source: Object<'gc>,
++    slots: &MatrixSlots,
++) -> Option<[f64; 12]> {
++    let l7 = (get(activation, source, slots.p_rotationX)?).cos();
++    let l4 = (get(activation, source, slots.p_rotationX)?).sin();
++    let l3 = (get(activation, source, slots.p_rotationY)?).cos();
++    let l18 = (get(activation, source, slots.p_rotationY)?).sin();
++    let l8 = (get(activation, source, slots.p_rotationZ)?).cos();
++    let l25 = (get(activation, source, slots.p_rotationZ)?).sin();
++    let l26 = (l8 * l18);
++    let l5 = (l25 * l18);
++    let l6 = (l3 * get(activation, source, slots.p_scaleX)?);
++    let l9 = (l4 * get(activation, source, slots.p_scaleY)?);
++    let l22 = (l7 * get(activation, source, slots.p_scaleY)?);
++    let l24 = (l7 * get(activation, source, slots.p_scaleZ)?);
++    let l2 = (l4 * get(activation, source, slots.p_scaleZ)?);
++    Some([
++        (l8 * l6),
++        ((l26 * l9) - (l25 * l22)),
++        ((l26 * l24) + (l25 * l2)),
++        get(activation, source, slots.p_x)?,
++        (l25 * l6),
++        ((l5 * l9) + (l8 * l22)),
++        ((l5 * l24) - (l8 * l2)),
++        get(activation, source, slots.p_y)?,
++        ((-(l18)) * get(activation, source, slots.p_scaleX)?),
++        (l3 * l9),
++        (l3 * l24),
++        get(activation, source, slots.p_z)?,
++    ])
++}
++
++/// Запись двенадцати значений в ma..ml объекта.
++fn write_matrix<'gc>(
++    object: Object<'gc>,
++    slots: &MatrixSlots,
++    values: &[f64; 12],
++    mc: &Mutation<'gc>,
++) {
++    let places = [
++        slots.e_ma, slots.e_mb, slots.e_mc, slots.e_md, slots.e_me, slots.e_mf, slots.e_mg,
++        slots.e_mh, slots.e_mi, slots.e_mj, slots.e_mk, slots.e_ml,
++    ];
++    for (slot, value) in places.iter().zip(values.iter()) {
++        set(object, *slot, *value, mc);
++    }
++}
++
++/// Чтение двенадцати значений ma..ml объекта.
++fn read_matrix<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    object: Object<'gc>,
++    slots: &MatrixSlots,
++) -> Option<[f64; 12]> {
++    Some([
++        get(activation, object, slots.e_ma)?,
++        get(activation, object, slots.e_mb)?,
++        get(activation, object, slots.e_mc)?,
++        get(activation, object, slots.e_md)?,
++        get(activation, object, slots.e_me)?,
++        get(activation, object, slots.e_mf)?,
++        get(activation, object, slots.e_mg)?,
++        get(activation, object, slots.e_mh)?,
++        get(activation, object, slots.e_mi)?,
++        get(activation, object, slots.e_mj)?,
++        get(activation, object, slots.e_mk)?,
++        get(activation, object, slots.e_ml)?,
++    ])
++}
++
++/// `Object3D.invertMatrix()` — обращение матрицы на месте. Формулы — те же, что у
++/// calculateInverseMatrix, но байткод сперва снимает все двенадцать значений в локали и пишет
++/// результат обратно в ma..ml.
++#[allow(unused_parens)]
++fn invert_matrix_in_place<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++    slots: &MatrixSlots,
++) -> Option<()> {
++    let [ma, mb, mc_, md, me, mf, mg, mh, mi, mj, mk, ml] = read_matrix(activation, this, slots)?;
++    let d = (1.0
++        / ((((((((-(mc_)) * mf) * mi) + ((mb * mg) * mi)) + ((mc_ * me) * mj))
++            - ((ma * mg) * mj))
++            - ((mb * me) * mk))
++            + ((ma * mf) * mk)));
++    let mc = activation.gc();
++    set(this, slots.e_ma, ((((-(mg)) * mj) + (mf * mk)) * d), mc);
++    set(this, slots.e_mb, (((mc_ * mj) - (mb * mk)) * d), mc);
++    set(this, slots.e_mc, ((((-(mc_)) * mf) + (mb * mg)) * d), mc);
++    set(
++        this,
++        slots.e_md,
++        ((((((((md * mg) * mj) - ((mc_ * mh) * mj)) - ((md * mf) * mk)) + ((mb * mh) * mk))
++            + ((mc_ * mf) * ml))
++            - ((mb * mg) * ml))
++            * d),
++        mc,
++    );
++    set(this, slots.e_me, (((mg * mi) - (me * mk)) * d), mc);
++    set(this, slots.e_mf, ((((-(mc_)) * mi) + (ma * mk)) * d), mc);
++    set(this, slots.e_mg, (((mc_ * me) - (ma * mg)) * d), mc);
++    set(
++        this,
++        slots.e_mh,
++        ((((((((mc_ * mh) * mi) - ((md * mg) * mi)) + ((md * me) * mk)) - ((ma * mh) * mk))
++            - ((mc_ * me) * ml))
++            + ((ma * mg) * ml))
++            * d),
++        mc,
++    );
++    set(this, slots.e_mi, ((((-(mf)) * mi) + (me * mj)) * d), mc);
++    set(this, slots.e_mj, (((mb * mi) - (ma * mj)) * d), mc);
++    set(this, slots.e_mk, ((((-(mb)) * me) + (ma * mf)) * d), mc);
++    set(
++        this,
++        slots.e_ml,
++        ((((((((md * mf) * mi) - ((mb * mh) * mi)) - ((md * me) * mj)) + ((ma * mh) * mj))
++            + ((mb * me) * ml))
++            - ((ma * mf) * ml))
++            * d),
++        mc,
++    );
++    Some(())
++}
++
++/// `Object3D.appendMatrix(outer)` — домножение слева: this.m = outer.m × this.m. Байткод сперва
++/// снимает свою матрицу в локали; при this == outer его строки читали бы уже переписанные
++/// значения — такой вызов уступается интерпретатору ради дословности.
++#[allow(unused_parens)]
++fn append_matrix<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++    outer: Object<'gc>,
++    slots: &MatrixSlots,
++) -> Option<()> {
++    if Object::ptr_eq(this, outer) {
++        return None;
++    }
++    let [l2, l3, l4, l5, l6, l7, l8, l9, l10, l11, l12, l13] =
++        read_matrix(activation, this, slots)?;
++    let [a_ma, a_mb, a_mc, a_md, a_me, a_mf, a_mg, a_mh, a_mi, a_mj, a_mk, a_ml] =
++        read_matrix(activation, outer, slots)?;
++    let mc = activation.gc();
++    set(this, slots.e_ma, (((a_ma * l2) + (a_mb * l6)) + (a_mc * l10)), mc);
++    set(this, slots.e_mb, (((a_ma * l3) + (a_mb * l7)) + (a_mc * l11)), mc);
++    set(this, slots.e_mc, (((a_ma * l4) + (a_mb * l8)) + (a_mc * l12)), mc);
++    set(this, slots.e_md, ((((a_ma * l5) + (a_mb * l9)) + (a_mc * l13)) + a_md), mc);
++    set(this, slots.e_me, (((a_me * l2) + (a_mf * l6)) + (a_mg * l10)), mc);
++    set(this, slots.e_mf, (((a_me * l3) + (a_mf * l7)) + (a_mg * l11)), mc);
++    set(this, slots.e_mg, (((a_me * l4) + (a_mf * l8)) + (a_mg * l12)), mc);
++    set(this, slots.e_mh, ((((a_me * l5) + (a_mf * l9)) + (a_mg * l13)) + a_mh), mc);
++    set(this, slots.e_mi, (((a_mi * l2) + (a_mj * l6)) + (a_mk * l10)), mc);
++    set(this, slots.e_mj, (((a_mi * l3) + (a_mj * l7)) + (a_mk * l11)), mc);
++    set(this, slots.e_mk, (((a_mi * l4) + (a_mj * l8)) + (a_mk * l12)), mc);
++    set(this, slots.e_ml, ((((a_mi * l5) + (a_mj * l9)) + (a_mk * l13)) + a_ml), mc);
++    Some(())
++}
++
++/// Номер метода по одному лишь имени — для приватных методов, чьё пространство имён снаружи не
++/// построить. Как и слоты, имена в классе единственны.
++fn method_by_local_name<'gc>(object: Object<'gc>, name: &str) -> Option<usize> {
++    object
++        .vtable()
++        .resolved_traits()
++        .iter()
++        .find_map(|(local, _, property)| match property {
++            Property::Method { disp_id, .. } if &*local.to_utf8_lossy() == name => {
++                Some(*disp_id as usize)
++            }
++            _ => None,
++        })
++}
++
++/// Слоты видимости тени (`Shadow.checkVisibility`). Shadow — самостоятельный класс (не Object3D),
++/// его границы и флаг камеры внутри — свои поля.
++#[derive(Clone, Copy)]
++struct ShadowVisSlots {
++    shadow_vtable: u32,
++    camera_vtable: u32,
++    vertex_vtable: u32,
++    /// Приватные поля тени: счётчик кастеров, направление-вектор, объект света, вектор кастеров,
++    /// голова списка вершин границ, размер текселя и левый нижний угол карты, минимальная глубина.
++    s_count: usize,
++    s_direction: usize,
++    s_dirvec: usize,
++    s_light: usize,
++    s_casters: usize,
++    s_bound_list: usize,
++    s_map_size: usize,
++    s_blur: usize,
++    s_offset: usize,
++    s_attenuation: usize,
++    s_far_distance: usize,
++    s_min_z: usize,
++    s_texel: usize,
++    s_left: usize,
++    s_bottom: usize,
++    s_bound: [usize; 6],
++    s_camera_inside: usize,
++    /// Границы и родитель на объектах сцены (свет и кастеры — наследники Object3D).
++    o_bound: [usize; 6],
++    o_parent: usize,
++    /// Вершина списка границ: координаты, ссылка дальше, камерные координаты.
++    v_xyz: [usize; 3],
++    v_next: usize,
++    v_cam: [usize; 3],
++    /// Камера: дальняя и ближняя плоскости, множитель дистанции теней, глобальная позиция.
++    c_far: usize,
++    c_near: usize,
++    c_sdm: usize,
++    c_gm: [usize; 3],
++    /// Приватное отсечение тени камерой — считается интерпретатором.
++    culling_disp: usize,
++}
++
++thread_local! {
++    static SHADOW_VIS_SLOTS: RefCell<Option<ShadowVisSlots>> = const { RefCell::new(None) };
++    static SHADOW_VIS_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++/// Класс Object3D по цепочке предков экземпляра: нужен и как ключ кэша матричных слотов (тот же,
++/// что у composeAndAppend), и ради статического tA.
++fn object3d_class_of<'gc>(sample: Object<'gc>) -> Option<crate::avm2::object::ClassObject<'gc>> {
++    let mut class = sample.instance_class();
++    loop {
++        if &*class.name().local_name().to_utf8_lossy() == ENGINE_CLASS {
++            return class.class_object();
++        }
++        class = class.super_class()?;
++    }
++}
++
++fn shadow_vis_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    shadow: Object<'gc>,
++    camera: Object<'gc>,
++    light: Object<'gc>,
++    vertex: Object<'gc>,
++) -> Option<ShadowVisSlots> {
++    if let Some(slots) = SHADOW_VIS_SLOTS.with(|cache| *cache.borrow()) {
++        if shadow.vtable().id() == slots.shadow_vtable
++            && camera.vtable().id() == slots.camera_vtable
++        {
++            return Some(slots);
++        }
++        return None;
++    }
++    if SHADOW_VIS_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Option<ShadowVisSlots> {
++        Some(ShadowVisSlots {
++            shadow_vtable: shadow.vtable().id(),
++            camera_vtable: camera.vtable().id(),
++            vertex_vtable: vertex.vtable().id(),
++            s_count: slot_by_local_name(shadow, "e58516dc")?,
++            s_direction: slot_of(activation, shadow, "direction", false)?,
++            s_dirvec: slot_by_local_name(shadow, "f143e037")?,
++            s_light: slot_by_local_name(shadow, "light")?,
++            s_casters: slot_by_local_name(shadow, "a1b6c041")?,
++            s_bound_list: slot_by_local_name(shadow, "boundVertexList")?,
++            s_map_size: slot_of(activation, shadow, "mapSize", false)?,
++            s_blur: slot_of(activation, shadow, "blur", false)?,
++            s_offset: slot_of(activation, shadow, "offset", false)?,
++            s_attenuation: slot_of(activation, shadow, "attenuation", false)?,
++            s_far_distance: slot_of(activation, shadow, "farDistance", false)?,
++            s_min_z: slot_by_local_name(shadow, "minZ")?,
++            s_texel: slot_by_local_name(shadow, "f33f76d7")?,
++            s_left: slot_by_local_name(shadow, "d1ab29a0")?,
++            s_bottom: slot_by_local_name(shadow, "f46509b3")?,
++            s_bound: [
++                slot_of(activation, shadow, "boundMinX", true)?,
++                slot_of(activation, shadow, "boundMinY", true)?,
++                slot_of(activation, shadow, "boundMinZ", true)?,
++                slot_of(activation, shadow, "boundMaxX", true)?,
++                slot_of(activation, shadow, "boundMaxY", true)?,
++                slot_of(activation, shadow, "boundMaxZ", true)?,
++            ],
++            s_camera_inside: slot_of(activation, shadow, "cameraInside", true)?,
++            o_bound: [
++                slot_of(activation, light, "boundMinX", false)?,
++                slot_of(activation, light, "boundMinY", false)?,
++                slot_of(activation, light, "boundMinZ", false)?,
++                slot_of(activation, light, "boundMaxX", false)?,
++                slot_of(activation, light, "boundMaxY", false)?,
++                slot_of(activation, light, "boundMaxZ", false)?,
++            ],
++            o_parent: slot_of(activation, light, "_parent", true)?,
++            v_xyz: [
++                slot_of(activation, vertex, "x", false)?,
++                slot_of(activation, vertex, "y", false)?,
++                slot_of(activation, vertex, "z", false)?,
++            ],
++            v_next: slot_of(activation, vertex, "next", true)?,
++            v_cam: [
++                slot_of(activation, vertex, "cameraX", true)?,
++                slot_of(activation, vertex, "cameraY", true)?,
++                slot_of(activation, vertex, "cameraZ", true)?,
++            ],
++            c_far: slot_of(activation, camera, "farClipping", false)?,
++            c_near: slot_of(activation, camera, "nearClipping", false)?,
++            c_sdm: slot_of(activation, camera, "shadowsDistanceMultiplier", false)?,
++            c_gm: [
++                slot_of(activation, camera, "gmd", true)?,
++                slot_of(activation, camera, "gmh", true)?,
++                slot_of(activation, camera, "gml", true)?,
++            ],
++            culling_disp: method_by_local_name(shadow, "cullingInCamera")?,
++        })
++    };
++    match resolve(activation) {
++        Some(slots) => {
++            SHADOW_VIS_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            Some(slots)
++        }
++        None => {
++            SHADOW_VIS_HOPELESS.with(|flag| flag.set(true));
++            None
++        }
++    }
++}
++
++/// `Shadow.checkVisibility(camera)` — матрица света из направления, обход кастеров с гранями
++/// их ограничивающих коробок, отсечение камерой и границы тени. Кадры владельца отдавали этому
++/// пути три-восемь процентов; тяжесть — в матричных листьях и отсечении, но и сам обход переведён.
++///
++/// Приватное cullingInCamera считает интерпретатор через вызов по номеру метода; его исключение
++/// уходит дальше как есть, без отката — байткод вёл бы себя так же. Замена несравнима: поля света,
++/// вершин и самой тени переписываются по ходу.
++#[allow(unused_parens)]
++fn shadow_check_visibility<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++) -> Result<Option<Value<'gc>>, crate::avm2::Error<'gc>> {
++    let _ = method;
++    let Some(this) = activation.local_register(0).as_object() else {
++        return Ok(None);
++    };
++    let Some(camera) = activation.local_register(1).as_object() else {
++        return Ok(None);
++    };
++
++    // Прескан: все объекты и слоты на месте; до первой записи любой сход — в интерпретатор.
++    let Some(light_probe) = SHADOW_VIS_SLOTS
++        .with(|cache| cache.borrow().map(|slots| slots.s_light))
++        .map(|slot| this.get_slot(slot).as_object())
++        .unwrap_or_else(|| {
++            // Слотов ещё нет: найдём поле света перебором один раз, резолв ниже закэширует всё.
++            slot_by_local_name(this, "light").and_then(|slot| this.get_slot(slot).as_object())
++        })
++    else {
++        return Ok(None);
++    };
++    let Some(vertex_probe) = slot_by_local_name(this, "boundVertexList")
++        .and_then(|slot| this.get_slot(slot).as_object())
++    else {
++        return Ok(None);
++    };
++    let Some(slots) = shadow_vis_slots(activation, this, camera, light_probe, vertex_probe)
++    else {
++        return Ok(None);
++    };
++
++    let count_value = this.get_slot(slots.s_count).try_as_f64().unwrap_or(f64::NAN);
++    if count_value == 0.0 {
++        return Ok(Some(Value::Bool(false)));
++    }
++    if !(count_value > 0.0) || count_value.fract() != 0.0 || count_value > 100_000.0 {
++        return Ok(None);
++    }
++    let count = count_value as usize;
++
++    let Some(dirvec) = this.get_slot(slots.s_dirvec).as_object() else {
++        return Ok(None);
++    };
++    let Some(v3) = vector3d_slots(activation, dirvec) else {
++        return Ok(None);
++    };
++    let direction = this.get_slot(slots.s_direction).as_object();
++    if let Some(direction) = direction
++        && direction.vtable().id() != v3.vtable
++    {
++        return Ok(None);
++    }
++    let Some(light) = this.get_slot(slots.s_light).as_object() else {
++        return Ok(None);
++    };
++    let Some(object3d_class) = object3d_class_of(light) else {
++        return Ok(None);
++    };
++    let Some(matrix) = matrix_slots(activation, object3d_class, light) else {
++        return Ok(None);
++    };
++    let object3d_class_object: Object<'gc> = object3d_class.into();
++    let Some(ta_slot) = slot_by_local_name(object3d_class_object, "tA") else {
++        return Ok(None);
++    };
++    let Some(ta) = object3d_class_object.get_slot(ta_slot).as_object() else {
++        return Ok(None);
++    };
++
++    // Кастеры: элементы вектора по номеру, каждый — объект сцены.
++    let mut casters = Vec::with_capacity(count);
++    {
++        let Some(container) = this.get_slot(slots.s_casters).as_object() else {
++            return Ok(None);
++        };
++        let Some(storage) = container.as_vector_storage() else {
++            return Ok(None);
++        };
++        if storage.length() < count {
++            return Ok(None);
++        }
++        for at in 0..count {
++            let Some(caster) = storage.get_optional(at).and_then(|value| value.as_object())
++            else {
++                return Ok(None);
++            };
++            casters.push(caster);
++        }
++    }
++
++    // Список вершин границ: не меньше восьми звеньев одного класса.
++    let mut chain = Vec::with_capacity(8);
++    {
++        let mut link = this.get_slot(slots.s_bound_list).as_object();
++        for _ in 0..100_000 {
++            let Some(vertex) = link else { break };
++            if vertex.vtable().id() != slots.vertex_vtable {
++                return Ok(None);
++            }
++            chain.push(vertex);
++            link = vertex.get_slot(slots.v_next).as_object();
++        }
++        if chain.len() < 8 || link.is_some() {
++            return Ok(None);
++        }
++    }
++
++    // Дальше записи — дословный перевод.
++    let mc = activation.gc();
++    if let Some(direction) = direction {
++        for at in 0..3 {
++            let value = direction
++                .get_slot(v3.coords[at])
++                .try_as_f64()
++                .unwrap_or(f64::NAN);
++            set(dirvec, v3.coords[at], value, mc);
++        }
++        // Vector3D.normalize по книжке: нулевая длина обнуляет, NaN разносит NaN.
++        let x = dirvec.get_slot(v3.coords[0]).try_as_f64().unwrap_or(f64::NAN);
++        let y = dirvec.get_slot(v3.coords[1]).try_as_f64().unwrap_or(f64::NAN);
++        let z = dirvec.get_slot(v3.coords[2]).try_as_f64().unwrap_or(f64::NAN);
++        let length = ((x * x) + (y * y) + (z * z)).sqrt();
++        let (nx, ny, nz) = if length == 0.0 {
++            (0.0, 0.0, 0.0)
++        } else if length > 0.0 {
++            (x / length, y / length, z / length)
++        } else {
++            (f64::NAN, f64::NAN, f64::NAN)
++        };
++        set(dirvec, v3.coords[0], nx, mc);
++        set(dirvec, v3.coords[1], ny, mc);
++        set(dirvec, v3.coords[2], nz, mc);
++    } else {
++        set(dirvec, v3.coords[0], 0.0, mc);
++        set(dirvec, v3.coords[1], 0.0, mc);
++        set(dirvec, v3.coords[2], 255.0, mc);
++    }
++
++    let fx = dirvec.get_slot(v3.coords[0]).try_as_f64().unwrap_or(f64::NAN);
++    let fy = dirvec.get_slot(v3.coords[1]).try_as_f64().unwrap_or(f64::NAN);
++    let fz = dirvec.get_slot(v3.coords[2]).try_as_f64().unwrap_or(f64::NAN);
++    set(
++        light,
++        matrix.p_rotationX,
++        (fz.atan2(((fx * fx) + (fy * fy)).sqrt()) - (std::f64::consts::PI / 2.0)),
++        mc,
++    );
++    set(light, matrix.p_rotationY, 0.0, mc);
++    set(light, matrix.p_rotationZ, (-(fx.atan2(fy))), mc);
++
++    let Some(values) = compose_values(activation, light, &matrix) else {
++        return Ok(None);
++    };
++    let mc = activation.gc();
++    write_matrix(light, &matrix, &values, mc);
++    let Some(saved) = read_matrix(activation, light, &matrix) else {
++        return Ok(None);
++    };
++    if invert_matrix_in_place(activation, light, &matrix).is_none() {
++        return Ok(None);
++    }
++    let mc = activation.gc();
++    let inverse_places = [
++        matrix.e_ima, matrix.e_imb, matrix.e_imc, matrix.e_imd, matrix.e_ime, matrix.e_imf,
++        matrix.e_img, matrix.e_imh, matrix.e_imi, matrix.e_imj, matrix.e_imk, matrix.e_iml,
++    ];
++    let direct_places = [
++        matrix.e_ma, matrix.e_mb, matrix.e_mc, matrix.e_md, matrix.e_me, matrix.e_mf, matrix.e_mg,
++        matrix.e_mh, matrix.e_mi, matrix.e_mj, matrix.e_mk, matrix.e_ml,
++    ];
++    for (inverse, direct) in inverse_places.iter().zip(direct_places.iter()) {
++        let value = light.get_slot(*direct).try_as_f64().unwrap_or(f64::NAN);
++        set(light, *inverse, value, mc);
++    }
++    for at in 0..3 {
++        set(light, slots.o_bound[at], 1e22, mc);
++        set(light, slots.o_bound[at + 3], -1e22, mc);
++    }
++
++    // Обход кастеров: матрица по иерархии, восемь углов коробки, границы света.
++    for caster in casters.iter().copied() {
++        let Some(values) = compose_values(activation, caster, &matrix) else {
++            return Ok(None);
++        };
++        write_matrix(caster, &matrix, &values, activation.gc());
++        let mut parent = caster.get_slot(slots.o_parent).as_object();
++        let mut guard = 0;
++        while let Some(step) = parent {
++            let Some(values) = compose_values(activation, step, &matrix) else {
++                return Ok(None);
++            };
++            write_matrix(ta, &matrix, &values, activation.gc());
++            if append_matrix(activation, caster, ta, &matrix).is_none() {
++                return Ok(None);
++            }
++            parent = step.get_slot(slots.o_parent).as_object();
++            guard += 1;
++            if guard > 100_000 {
++                return Ok(None);
++            }
++        }
++        if append_matrix(activation, caster, light, &matrix).is_none() {
++            return Ok(None);
++        }
++
++        let bound = |at: usize| caster.get_slot(slots.o_bound[at]).try_as_f64().unwrap_or(f64::NAN);
++        let (min_x, min_y, min_z) = (bound(0), bound(1), bound(2));
++        let (max_x, max_y, max_z) = (bound(3), bound(4), bound(5));
++        let corners = [
++            (min_x, min_y, min_z),
++            (max_x, min_y, min_z),
++            (min_x, max_y, min_z),
++            (max_x, max_y, min_z),
++            (min_x, min_y, max_z),
++            (max_x, min_y, max_z),
++            (min_x, max_y, max_z),
++            (max_x, max_y, max_z),
++        ];
++        let mc = activation.gc();
++        for (vertex, (x, y, z)) in chain.iter().take(8).zip(corners.iter()) {
++            set(*vertex, slots.v_xyz[0], *x, mc);
++            set(*vertex, slots.v_xyz[1], *y, mc);
++            set(*vertex, slots.v_xyz[2], *z, mc);
++        }
++
++        let Some(world) = read_matrix(activation, caster, &matrix) else {
++            return Ok(None);
++        };
++        let mc = activation.gc();
++        for vertex in chain.iter().copied() {
++            let x = vertex.get_slot(slots.v_xyz[0]).try_as_f64().unwrap_or(f64::NAN);
++            let y = vertex.get_slot(slots.v_xyz[1]).try_as_f64().unwrap_or(f64::NAN);
++            let z = vertex.get_slot(slots.v_xyz[2]).try_as_f64().unwrap_or(f64::NAN);
++            let cx = ((((world[0] * x) + (world[1] * y)) + (world[2] * z)) + world[3]);
++            let cy = ((((world[4] * x) + (world[5] * y)) + (world[6] * z)) + world[7]);
++            let cz = ((((world[8] * x) + (world[9] * y)) + (world[10] * z)) + world[11]);
++            set(vertex, slots.v_cam[0], cx, mc);
++            set(vertex, slots.v_cam[1], cy, mc);
++            set(vertex, slots.v_cam[2], cz, mc);
++            let coords = [cx, cy, cz];
++            for at in 0..3 {
++                let low = light.get_slot(slots.o_bound[at]).try_as_f64().unwrap_or(f64::NAN);
++                if coords[at] < low {
++                    set(light, slots.o_bound[at], coords[at], mc);
++                }
++                let high = light
++                    .get_slot(slots.o_bound[at + 3])
++                    .try_as_f64()
++                    .unwrap_or(f64::NAN);
++                if coords[at] > high {
++                    set(light, slots.o_bound[at + 3], coords[at], mc);
++                }
++            }
++        }
++    }
++
++    // Квадрат карты теней: границы света растягиваются до кратности текселю.
++    let read_this = |slot: usize| this.get_slot(slot).try_as_f64().unwrap_or(f64::NAN);
++    let read_light = |slot: usize| light.get_slot(slot).try_as_f64().unwrap_or(f64::NAN);
++    let map_size = read_this(slots.s_map_size);
++    let blur = read_this(slots.s_blur);
++    let pixels = crate::ecma_conversions::f64_to_wrapping_i32((((map_size - 1.0) - 1.0) - blur) - blur);
++    let size_x = (read_light(slots.o_bound[3]) - read_light(slots.o_bound[0]));
++    let size_y = (read_light(slots.o_bound[4]) - read_light(slots.o_bound[1]));
++    let largest = if size_x > size_y { size_x } else { size_y };
++    let texel = (largest / f64::from(pixels));
++    let mut pad_x = ((1.0 + blur) * texel);
++    let mut pad_y = ((1.0 + blur) * texel);
++    if size_x > size_y {
++        pad_y = (pad_y
++            + (((((size_y - 0.01) / (texel + texel)).ceil() * (texel + texel)) - size_y) * 0.5));
++    } else {
++        pad_x = (pad_x
++            + (((((size_x - 0.01) / (texel + texel)).ceil() * (texel + texel)) - size_x) * 0.5));
++    }
++    let mc = activation.gc();
++    set(light, slots.o_bound[0], (read_light(slots.o_bound[0]) - pad_x), mc);
++    set(light, slots.o_bound[3], (read_light(slots.o_bound[3]) + pad_x), mc);
++    set(light, slots.o_bound[1], (read_light(slots.o_bound[1]) - pad_y), mc);
++    set(light, slots.o_bound[4], (read_light(slots.o_bound[4]) + pad_y), mc);
++    set(
++        light,
++        slots.o_bound[2],
++        (read_light(slots.o_bound[2]) + read_this(slots.s_offset)),
++        mc,
++    );
++    set(
++        light,
++        slots.o_bound[5],
++        (read_light(slots.o_bound[5]) + read_this(slots.s_attenuation)),
++        mc,
++    );
++    set(this, slots.s_texel, ((largest * map_size) / f64::from(pixels)), mc);
++    if size_x > size_y {
++        set(this, slots.s_left, read_light(slots.o_bound[0]), mc);
++        set(
++            this,
++            slots.s_bottom,
++            (read_light(slots.o_bound[1])
++                - (((read_light(slots.o_bound[3]) - read_light(slots.o_bound[0]))
++                    - (read_light(slots.o_bound[4]) - read_light(slots.o_bound[1])))
++                    * 0.5)),
++            mc,
++        );
++    } else {
++        set(
++            this,
++            slots.s_left,
++            (read_light(slots.o_bound[0])
++                - (((read_light(slots.o_bound[4]) - read_light(slots.o_bound[1]))
++                    - (read_light(slots.o_bound[3]) - read_light(slots.o_bound[0])))
++                    * 0.5)),
++            mc,
++        );
++        set(this, slots.s_bottom, read_light(slots.o_bound[1]), mc);
++    }
++
++    // Отсечение камерой с временно раздвинутой дальней плоскостью.
++    let saved_far = camera.get_slot(slots.c_far).try_as_f64().unwrap_or(f64::NAN);
++    let sdm = camera.get_slot(slots.c_sdm).try_as_f64().unwrap_or(f64::NAN);
++    set(camera, slots.c_far, (read_this(slots.s_far_distance) * sdm), mc);
++    write_matrix(light, &matrix, &saved, mc);
++    if append_matrix(activation, light, camera, &matrix).is_none() {
++        return Ok(None);
++    }
++    let culled = Value::Object(this).call_method(
++        slots.culling_disp,
++        &[Value::Object(camera)],
++        activation,
++    )?;
++    let visible = culled.coerce_to_boolean();
++    let mc = activation.gc();
++    set(camera, slots.c_far, saved_far, mc);
++
++    if visible {
++        for at in 0..3 {
++            set(this, slots.s_bound[at], 1e22, mc);
++            set(this, slots.s_bound[at + 3], -1e22, mc);
++        }
++        // Список вершин перечитывается: между пресканом и этим местом работал интерпретатор.
++        let mut link = this.get_slot(slots.s_bound_list).as_object();
++        let mut guard = 0;
++        while let Some(vertex) = link {
++            if vertex.vtable().id() != slots.vertex_vtable {
++                break;
++            }
++            let x = vertex.get_slot(slots.v_xyz[0]).try_as_f64().unwrap_or(f64::NAN);
++            let y = vertex.get_slot(slots.v_xyz[1]).try_as_f64().unwrap_or(f64::NAN);
++            let z = vertex.get_slot(slots.v_xyz[2]).try_as_f64().unwrap_or(f64::NAN);
++            let cx = ((((saved[0] * x) + (saved[1] * y)) + (saved[2] * z)) + saved[3]);
++            let cy = ((((saved[4] * x) + (saved[5] * y)) + (saved[6] * z)) + saved[7]);
++            let cz = ((((saved[8] * x) + (saved[9] * y)) + (saved[10] * z)) + saved[11]);
++            set(vertex, slots.v_cam[0], cx, mc);
++            set(vertex, slots.v_cam[1], cy, mc);
++            set(vertex, slots.v_cam[2], cz, mc);
++            let coords = [cx, cy, cz];
++            for at in 0..3 {
++                let low = this.get_slot(slots.s_bound[at]).try_as_f64().unwrap_or(f64::NAN);
++                if coords[at] < low {
++                    set(this, slots.s_bound[at], coords[at], mc);
++                }
++                let high = this
++                    .get_slot(slots.s_bound[at + 3])
++                    .try_as_f64()
++                    .unwrap_or(f64::NAN);
++                if coords[at] > high {
++                    set(this, slots.s_bound[at + 3], coords[at], mc);
++                }
++            }
++            link = vertex.get_slot(slots.v_next).as_object();
++            guard += 1;
++            if guard > 10_000_000 {
++                break;
++            }
++        }
++        this.set_slot_no_coerce(slots.s_camera_inside, Value::Bool(false), mc);
++        let near = camera.get_slot(slots.c_near).try_as_f64().unwrap_or(f64::NAN);
++        if read_this(slots.s_min_z) > near {
++            let gm = [
++                camera.get_slot(slots.c_gm[0]).try_as_f64().unwrap_or(f64::NAN),
++                camera.get_slot(slots.c_gm[1]).try_as_f64().unwrap_or(f64::NAN),
++                camera.get_slot(slots.c_gm[2]).try_as_f64().unwrap_or(f64::NAN),
++            ];
++            let im = |slot: usize| light.get_slot(slot).try_as_f64().unwrap_or(f64::NAN);
++            let mut inside = true;
++            for axis in 0..3 {
++                let base = axis * 4;
++                let point = ((((im(inverse_places[base]) * gm[0])
++                    + (im(inverse_places[base + 1]) * gm[1]))
++                    + (im(inverse_places[base + 2]) * gm[2]))
++                    + im(inverse_places[base + 3]));
++                let low = read_light(slots.o_bound[axis]);
++                let high = read_light(slots.o_bound[axis + 3]);
++                if !((point - near) <= high && (point + near) >= low) {
++                    inside = false;
++                    break;
++                }
++            }
++            if inside {
++                this.set_slot_no_coerce(slots.s_camera_inside, Value::Bool(true), mc);
++            }
++        }
++    }
++    Ok(Some(Value::Bool(visible)))
++}
++
+ /// Слоты батчинга прозрачных треугольников (`Camera3D.a2c88d8c`).
+ #[derive(Clone, Copy)]
+ struct BatchSlots {
+@@ -6564,7 +7330,12 @@ pub fn snapshot<'gc>(
+     // делается один раз за сессию и на чужом объекте запомнил бы неудачу навсегда.
+     if !matches!(
+         native,
+-        NativeMethod::ComposeAndAppend | NativeMethod::CalculateInverseMatrix
++        NativeMethod::ComposeAndAppend
++            | NativeMethod::CalculateInverseMatrix
++            | NativeMethod::ObjectComposeMatrix
++            | NativeMethod::ObjectComposeMatrixFromSource
++            | NativeMethod::ObjectInvertMatrix
++            | NativeMethod::ObjectAppendMatrix
+     ) {
+         return None;
+     }
+@@ -6595,7 +7366,8 @@ pub fn snapshot<'gc>(
+         | NativeMethod::SpriteBillboard
+         | NativeMethod::KdCollectPlanes
+         | NativeMethod::ObjectConcat
+-        | NativeMethod::CameraTransparentBatch => return None,
++        | NativeMethod::CameraTransparentBatch
++        | NativeMethod::ShadowCheckVisibility => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -6624,6 +7396,24 @@ pub fn snapshot<'gc>(
+             slots.e_imk,
+             slots.e_iml,
+         ],
++        // Четыре матричных метода тени пишут только в ma..ml объекта.
++        NativeMethod::ObjectComposeMatrix
++        | NativeMethod::ObjectComposeMatrixFromSource
++        | NativeMethod::ObjectInvertMatrix
++        | NativeMethod::ObjectAppendMatrix => [
++            slots.e_ma,
++            slots.e_mb,
++            slots.e_mc,
++            slots.e_md,
++            slots.e_me,
++            slots.e_mf,
++            slots.e_mg,
++            slots.e_mh,
++            slots.e_mi,
++            slots.e_mj,
++            slots.e_mk,
++            slots.e_ml,
++        ],
+     };
+ 
+     let mut fields = Vec::with_capacity(12);
+@@ -6657,6 +7447,49 @@ pub fn run<'gc>(
+         NativeMethod::CameraTransparentBatch => {
+             return camera_transparent_batch(activation, method);
+         }
++        NativeMethod::ObjectComposeMatrix => {
++            let mut run = || -> Option<Value<'gc>> {
++                let this = activation.local_register(0).as_object()?;
++                let slots = matrix_slots(activation, declaring_class(method)?, this)?;
++                let values = compose_values(activation, this, &slots)?;
++                write_matrix(this, &slots, &values, activation.gc());
++                Some(Value::Undefined)
++            };
++            Ok(run())
++        }
++        NativeMethod::ObjectComposeMatrixFromSource => {
++            let mut run = || -> Option<Value<'gc>> {
++                let this = activation.local_register(0).as_object()?;
++                let source = activation.local_register(1).as_object()?;
++                let slots = matrix_slots(activation, declaring_class(method)?, this)?;
++                let values = compose_values(activation, source, &slots)?;
++                write_matrix(this, &slots, &values, activation.gc());
++                Some(Value::Undefined)
++            };
++            Ok(run())
++        }
++        NativeMethod::ObjectInvertMatrix => {
++            let mut run = || -> Option<Value<'gc>> {
++                let this = activation.local_register(0).as_object()?;
++                let slots = matrix_slots(activation, declaring_class(method)?, this)?;
++                invert_matrix_in_place(activation, this, &slots)?;
++                Some(Value::Undefined)
++            };
++            Ok(run())
++        }
++        NativeMethod::ObjectAppendMatrix => {
++            let mut run = || -> Option<Value<'gc>> {
++                let this = activation.local_register(0).as_object()?;
++                let outer = activation.local_register(1).as_object()?;
++                let slots = matrix_slots(activation, declaring_class(method)?, this)?;
++                append_matrix(activation, this, outer, &slots)?;
++                Some(Value::Undefined)
++            };
++            Ok(run())
++        }
++        NativeMethod::ShadowCheckVisibility => {
++            return shadow_check_visibility(activation, method);
++        }
+         NativeMethod::BoxBoxOverlapOnAxis => {
+             Ok(get_overlap_on_axis(activation, 0, 3).ok().map(Value::Number))
+         }
+-- 
+2.51.1.windows.1
+

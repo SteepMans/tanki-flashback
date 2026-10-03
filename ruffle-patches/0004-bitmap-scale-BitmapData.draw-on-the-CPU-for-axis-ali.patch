@@ -1,0 +1,150 @@
+From 4fb53a98ae2e0b1d3d592b4eda356ec2da00cc85 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 23:07:43 +0300
+Subject: [PATCH 04/17] bitmap: scale BitmapData.draw on the CPU for
+ axis-aligned transforms
+
+---
+ core/src/bitmap/operations.rs | 112 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 112 insertions(+)
+
+diff --git a/core/src/bitmap/operations.rs b/core/src/bitmap/operations.rs
+index d573665c..cac11637 100644
+--- a/core/src/bitmap/operations.rs
++++ b/core/src/bitmap/operations.rs
+@@ -1075,6 +1075,7 @@ pub fn copy_pixels<'gc>(
+         dest_region,
+         (source_transparency && !transparency) || merge_alpha,
+     );
++
+ }
+ 
+ #[expect(clippy::too_many_arguments)]
+@@ -1293,6 +1294,98 @@ pub fn apply_filter<'gc>(
+     }
+ }
+ 
++/// Draws `source` into `target` with an axis-aligned scale, sampling on the CPU.
++///
++/// With `smoothing` the source area covered by a destination pixel is averaged (a box filter, which
++/// is what downscaling a texture needs); without it the nearest source pixel is taken, matching
++/// Flash's unsmoothed draw.
++fn scale_on_cpu<'gc>(
++    context: &mut UpdateContext<'gc>,
++    source: BitmapData<'gc>,
++    target: BitmapData<'gc>,
++    matrix: Matrix,
++    smoothing: bool,
++) {
++    let src = source.sync(context.renderer);
++    let src = src.borrow();
++
++    let scale_x = matrix.a as f64;
++    let scale_y = matrix.d as f64;
++    let offset_x = matrix.tx.to_pixels();
++    let offset_y = matrix.ty.to_pixels();
++
++    let (src_width, src_height) = (src.width() as f64, src.height() as f64);
++    let dest_width = target.width();
++    let dest_height = target.height();
++
++    let mut pixels = Vec::with_capacity((dest_width * dest_height) as usize);
++
++    for y in 0..dest_height {
++        for x in 0..dest_width {
++            // Source rectangle this destination pixel covers.
++            let x0 = ((x as f64 + 0.0 - offset_x) / scale_x).max(0.0);
++            let x1 = ((x as f64 + 1.0 - offset_x) / scale_x).min(src_width);
++            let y0 = ((y as f64 + 0.0 - offset_y) / scale_y).max(0.0);
++            let y1 = ((y as f64 + 1.0 - offset_y) / scale_y).min(src_height);
++
++            if x1 <= x0 || y1 <= y0 {
++                pixels.push(Color::rgba(0, 0, 0, 0));
++                continue;
++            }
++
++            let (mut r, mut g, mut b, mut a, mut count) = (0u32, 0u32, 0u32, 0u32, 0u32);
++            let (sx0, sx1) = (x0.floor() as u32, (x1.ceil() as u32).min(src.width()));
++            let (sy0, sy1) = (y0.floor() as u32, (y1.ceil() as u32).min(src.height()));
++
++            if smoothing {
++                for sy in sy0..sy1.max(sy0 + 1) {
++                    for sx in sx0..sx1.max(sx0 + 1) {
++                        let c = src.get_pixel32_raw(sx, sy).to_un_multiplied_alpha();
++                        r += c.red() as u32;
++                        g += c.green() as u32;
++                        b += c.blue() as u32;
++                        a += c.alpha() as u32;
++                        count += 1;
++                    }
++                }
++            }
++
++            let color = if smoothing && count > 0 {
++                Color::rgba(
++                    (r / count) as u8,
++                    (g / count) as u8,
++                    (b / count) as u8,
++                    (a / count) as u8,
++                )
++            } else {
++                let sx = (((x as f64 + 0.5 - offset_x) / scale_x) as u32).min(src.width() - 1);
++                let sy = (((y as f64 + 0.5 - offset_y) / scale_y) as u32).min(src.height() - 1);
++                src.get_pixel32_raw(sx, sy).to_un_multiplied_alpha()
++            };
++
++            pixels.push(if target.transparency() {
++                color.to_premultiplied_alpha(true)
++            } else {
++                Color::rgba(color.red(), color.green(), color.blue(), 255)
++            });
++        }
++    }
++
++    drop(src);
++
++    let (target, _) = target.overwrite_cpu_pixels_from_gpu(context.gc());
++    let mut write = target.borrow_mut(context.gc());
++    for (i, color) in pixels.into_iter().enumerate() {
++        let x = (i as u32) % dest_width;
++        let y = (i as u32) / dest_width;
++        write.set_pixel32_raw(x, y, color);
++    }
++    write.set_cpu_dirty(
++        context.gc(),
++        PixelRegion::for_whole_size(dest_width, dest_height),
++    );
++}
++
+ fn copy_on_cpu<'gc>(
+     context: &Mutation<'gc>,
+     renderer: &mut dyn RenderBackend,
+@@ -1461,6 +1554,25 @@ pub fn draw<'gc>(
+             return Ok(());
+         }
+ 
++        // Axis-aligned scaling of one bitmap into another: this is how content builds mip chains
++        // (draw the texture into ever smaller bitmaps). Doing it on the CPU keeps the result in the
++        // pixels the caller reads back afterwards — the GPU path leaves the bitmap in a state whose
++        // read-back gave a flat, single-colour image, which showed up in-game as untextured
++        // surfaces at distance while the full-size texture looked correct.
++        if (blend_mode == BlendMode::Normal || blend_mode == BlendMode::Layer)
++            && transform.matrix.b == 0.0
++            && transform.matrix.c == 0.0
++            && transform.matrix.a > 0.0
++            && transform.matrix.d > 0.0
++            && (transform.matrix.a != 1.0 || transform.matrix.d != 1.0)
++            && transform.color_transform == ColorTransform::default()
++            && clip_rect.is_none()
++            && !source.ptr_eq(target)
++        {
++            scale_on_cpu(context, *source, target, transform.matrix, smoothing);
++            return Ok(());
++        }
++
+         if (blend_mode == BlendMode::Normal || blend_mode == BlendMode::Layer)
+             && transform.matrix.a == 1.0
+             && transform.matrix.b == 0.0
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,249 @@
+From 97fd664b5881d7d2e4829e15fb8399932e6ae328 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 21:46:06 +0300
+Subject: [PATCH] core: fuse slot-to-slot copies and log every hitch with its
+ breakdown
+
+---
+ core/src/avm2/activation.rs           | 36 +++++++++++++++++++++++++++
+ core/src/avm2/method_stats.rs         |  5 ++--
+ core/src/avm2/op.rs                   | 11 ++++++++
+ core/src/avm2/optimizer/peephole.rs   | 20 +++++++++++++++
+ core/src/avm2/optimizer/type_aware.rs |  3 ++-
+ core/src/player.rs                    | 11 ++++++++
+ web/src/lib.rs                        | 15 ++++++++++-
+ 7 files changed, 97 insertions(+), 4 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 9373623e..ace63608 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -709,6 +709,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+                     slot_index,
+                     dst,
+                 } => self.op_slot_to_local(*local_index, *slot_index as usize, *dst),
++                Op::SlotToSlot {
++                    src_local,
++                    src_slot,
++                    dst_slot,
++                    coerce,
++                } => self.op_slot_to_slot(*src_local, *src_slot as usize, *dst_slot as usize, *coerce),
+                 Op::MoveLocal { src, dst } => {
+                     let value = self.local_register(*src);
+                     self.set_local_register(*dst, value);
+@@ -1094,6 +1100,36 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         Ok(())
+     }
+ 
++    /// `getlocal`+`getslot`+`setslot` одной инструкцией: значение не кладётся на стек, а объект-
++    /// приёмник снимается со стека ровно так же, как это делал бы обычный setslot.
++    fn op_slot_to_slot(
++        &mut self,
++        src_local: u32,
++        src_slot: usize,
++        dst_slot: usize,
++        coerce: bool,
++    ) -> Result<(), Error<'gc>> {
++        let source = self
++            .local_register(src_local)
++            .null_check(self, None)?
++            .as_object()
++            .expect("Cannot get_slot on primitive");
++        let value = source.get_slot(src_slot);
++
++        let target = self
++            .pop_stack()
++            .null_check(self, None)?
++            .as_object()
++            .expect("Cannot set_slot on primitive");
++        if coerce {
++            target.set_slot(dst_slot, value, self)?;
++        } else {
++            target.set_slot_no_coerce(dst_slot, value, self.gc());
++        }
++
++        Ok(())
++    }
++
+     /// `getlocal`+`getslot`+`setlocal` одной инструкцией: значение поля не кладётся на стек.
+     fn op_slot_to_local(&mut self, register_index: u32, index: usize, dst: u32) -> Result<(), Error<'gc>> {
+         let object = self
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index ff312afa..5a5536e6 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -92,12 +92,12 @@ pub fn record(method: Method<'_>, ops: u64) {
+ 
+ /// Виды инструкций для гистограммы. Отдельно выделены обращения к полям: у Ruffle их несколько
+ /// видов, и по соотношению видно, справился ли анализатор — Slot дешёвый, Slow ищет имя в таблице.
+-pub const OP_KINDS: [&str; 21] = [
++pub const OP_KINDS: [&str; 22] = [
+     "GetSlot", "SetSlot", "GetPropertyStatic", "GetPropertyFast", "GetPropertySlow",
+     "SetProperty", "CallMethod", "CallNative", "CallProperty", "Construct",
+     "Local", "Arithmetic/Compare", "Branch", "Coerce", "Stack/Scope", "прочее",
+     "GetLocalSlot(склейка)", "GetLocal2(склейка)",
+-    "MultiplyLocalSlot(склейка)", "SlotToLocal(склейка)", "MoveLocal(склейка)",
++    "MultiplyLocalSlot(склейка)", "SlotToLocal(склейка)", "MoveLocal(склейка)", "SlotToSlot(склейка)",
+ ];
+ 
+ /// Номер вида инструкции в `OP_KINDS`.
+@@ -108,6 +108,7 @@ pub fn op_kind(op: &crate::avm2::op::Op<'_>) -> usize {
+         Op::MultiplyLocalSlot { .. } => 18,
+         Op::SlotToLocal { .. } => 19,
+         Op::MoveLocal { .. } => 20,
++        Op::SlotToSlot { .. } => 21,
+         Op::GetLocal2 { .. } => 17,
+         Op::GetSlot { .. } => 0,
+         Op::SetSlot { .. } | Op::SetSlotNoCoerce { .. } | Op::SetSlotCoerceI { .. } => 1,
+diff --git a/core/src/avm2/op.rs b/core/src/avm2/op.rs
+index 6559309f..7669ff43 100644
+--- a/core/src/avm2/op.rs
++++ b/core/src/avm2/op.rs
+@@ -170,6 +170,17 @@ pub enum Op<'gc> {
+         slot_index: u32,
+         dst: u32,
+     },
++    /// Склейка `getlocal`+`getslot`+`setslot` — «переложить поле одного объекта в поле другого».
++    /// В заливке габаритов объекта перед отсечением сцены таких переносов 24 подряд, и делается
++    /// это для каждого объекта каждый кадр.
++    SlotToSlot {
++        src_local: u32,
++        src_slot: u32,
++        dst_slot: u32,
++        /// Приводить ли значение к типу слота: анализатор типов заменяет `setslot` на вариант без
++        /// приведения, когда тип и так подходит.
++        coerce: bool,
++    },
+     /// Склейка `getlocal`+`setlocal` — копирование переменной без прохода через стек.
+     MoveLocal {
+         src: u32,
+diff --git a/core/src/avm2/optimizer/peephole.rs b/core/src/avm2/optimizer/peephole.rs
+index e37e5255..d10e9aec 100644
+--- a/core/src/avm2/optimizer/peephole.rs
++++ b/core/src/avm2/optimizer/peephole.rs
+@@ -98,6 +98,26 @@ pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<
+                         slot_index,
+                     });
+                 }
++                (
++                    Op::GetLocalSlot {
++                        local_index,
++                        slot_index,
++                    },
++                    Op::SetSlot { index: dst_slot } | Op::SetSlotNoCoerce { index: dst_slot },
++                ) if fusion_enabled
++                    && slot_index <= u32::MAX as usize
++                    && dst_slot <= u32::MAX as usize =>
++                {
++                    // `приёмник.поле = источник.поле` одной инструкцией.
++                    let coerce = matches!(current_op.get(), Op::SetSlot { .. });
++                    last_op.set(Op::Nop);
++                    current_op.set(Op::SlotToSlot {
++                        src_local: local_index,
++                        src_slot: slot_index as u32,
++                        dst_slot: dst_slot as u32,
++                        coerce,
++                    });
++                }
+                 (
+                     Op::GetLocalSlot {
+                         local_index,
+diff --git a/core/src/avm2/optimizer/type_aware.rs b/core/src/avm2/optimizer/type_aware.rs
+index 1fe9c801..ad3ca39e 100644
+--- a/core/src/avm2/optimizer/type_aware.rs
++++ b/core/src/avm2/optimizer/type_aware.rs
+@@ -838,7 +838,8 @@ fn abstract_interpret_ops<'gc>(
+             | Op::GetLocalSlot { .. }
+             | Op::MultiplyLocalSlot { .. }
+             | Op::SlotToLocal { .. }
+-            | Op::MoveLocal { .. } => {
++            | Op::MoveLocal { .. }
++            | Op::SlotToSlot { .. } => {
+                 unreachable!("fused ops are created after the type-aware pass")
+             }
+             Op::CoerceA => {
+diff --git a/core/src/player.rs b/core/src/player.rs
+index d0858ae9..ca24764f 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -284,6 +284,10 @@ enum RunState {
+ }
+ 
+ pub struct Player {
++    /// Сколько миллисекунд заняла сборка мусора в последнем обновлении. Нужно, чтобы объяснить
++    /// провал кадра: сборка и выполнение кода игры выглядят одинаково, если их не разделить.
++    last_gc_ms: f32,
++
+     /// The version of the player we're emulating.
+     ///
+     /// This serves a few purposes, primarily for compatibility:
+@@ -2429,12 +2433,18 @@ impl Player {
+         let started = web_time::Instant::now();
+         self.gc_arena.borrow_mut().collect_debt();
+         let gc = started.elapsed();
++        self.last_gc_ms = gc.as_secs_f32() * 1000.0;
+ 
+         Self::report_update_timings(scripts, mouse, gc);
+ 
+         rval
+     }
+ 
++    /// Время последней сборки мусора, мс.
++    pub fn last_gc_ms(&self) -> f32 {
++        self.last_gc_ms
++    }
++
+     pub fn flush_shared_objects(&mut self) {
+         self.update(|context| {
+             if let Some(mut avm1_activation) =
+@@ -3056,6 +3066,7 @@ impl PlayerBuilder {
+                 frame_rate,
+                 forced_frame_rate,
+                 frame_phase: Default::default(),
++                last_gc_ms: 0.0,
+                 frame_accumulator: FloatDuration::ZERO,
+                 recent_run_frame_timings: VecDeque::with_capacity(10),
+                 start_time: Instant::now(),
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 1863e0b9..e9ef16db 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1126,6 +1126,7 @@ impl RuffleHandle {
+         tick_time: std::time::Duration,
+         render_time: std::time::Duration,
+         rendered: bool,
++        gc_ms: f32,
+     ) {
+         // Кроме средних за секунду считаем ХУДШИЙ кадр и число кадров дольше 33 мс: провалы
+         // частоты видны только так, в среднем они растворяются.
+@@ -1136,6 +1137,18 @@ impl RuffleHandle {
+ 
+         FRAME_STATS.with_borrow_mut(|(started, ticks, renders, tick_ms, render_ms, worst_ms, slow_frames)| {
+             let frame_ms = (tick_time + render_time).as_secs_f32() * 1000.0;
++            // Каждый провал пишем отдельной строкой с разбором: по ней сразу видно, кто виноват —
++            // код игры, отрисовка или сборка мусора. Иначе провал теряется в среднем за секунду.
++            if frame_ms > 33.0 {
++                tracing::warn!(
++                    "hitch {:.1} ms: ActionScript {:.1} ms, render {:.1} ms, gc {:.1} ms{}",
++                    frame_ms,
++                    tick_time.as_secs_f32() * 1000.0,
++                    render_time.as_secs_f32() * 1000.0,
++                    gc_ms,
++                    if rendered { "" } else { ", кадр не рисовался" },
++                );
++            }
+             if frame_ms > *worst_ms {
+                 *worst_ms = frame_ms;
+             }
+@@ -1367,7 +1380,7 @@ impl RuffleHandle {
+                 false
+             };
+ 
+-            Self::report_frame_time(tick_time, render_started.elapsed(), rendered);
++            Self::report_frame_time(tick_time, render_started.elapsed(), rendered, core.last_gc_ms());
+         });
+     }
+ 
+-- 
+2.51.1.windows.1
+

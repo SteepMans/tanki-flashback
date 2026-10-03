@@ -1,0 +1,19 @@
+{
+  "needInviteCode": "false",
+  "maxClients": "1000",
+  "captchaLocations": "[]",
+  "socialAuthLinks": "{\"google\":\"https://www.google.com\",\"facebook\":\"https://www.facebook.com\",\"vkontakte\":\"https://vk.com\"}",
+  "chatEnabled": "true",
+  "chatAntifloodEnabled": "true",
+  "chatTypingSpeedAntifloodEnabled": "true",
+  "chatShowLinks": "true",
+  "chatBufferSize": "60",
+  "chatMinChar": "60",
+  "chatMinWord": "5",
+  "chatLinksWhitelist": "[\"http://example.com\"]",
+  "chatCharDelayFactor": "176",
+  "chatMessageBaseDelay": "880",
+  "chatHistoryLimit": "70",
+  "shopEnabledCountries": "{\"BR\":\"Brazil\",\"US\":\"United States\",\"RU\":\"Russia\"}",
+  "shopLocationSwitchingEnabled": "true"
+}

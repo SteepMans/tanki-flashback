@@ -1,0 +1,686 @@
+From dd608abbb5ecd45f091bdc39e2cb8100c173fb1d Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 08:02:05 +0300
+Subject: [PATCH 2/3] core: translate VG.calculateOOBB, validation-only until
+ proven on live
+
+---
+ core/src/avm2/activation.rs   |   8 +-
+ core/src/avm2/fast_paths.rs   | 523 +++++++++++++++++++++++++++++++++-
+ core/src/avm2/method_stats.rs |  23 ++
+ web/src/lib.rs                |  18 ++
+ 4 files changed, 569 insertions(+), 3 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 11720bfc..0c8296c0 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -674,7 +674,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             if crate::avm2::method_stats::validate_native_paths() {
+                 return self.run_actions_validating(method, native);
+             }
+-            if let Some(result) = crate::avm2::fast_paths::run(self, native, method) {
++            // Перевод, ещё не доказавший совпадение на живом бою, исполняется только в режиме
++            // сверки — обычный запуск идёт байткодом.
++            if !native.validate_only()
++                && let Some(result) = crate::avm2::fast_paths::run(self, native, method)
++            {
+                 return Ok(result);
+             }
+         }
+@@ -719,12 +723,14 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             && let Some(bytecode_wrote) = crate::avm2::fast_paths::snapshot(self, native, method)
+             && let Some((at, mine, theirs)) = native_wrote.mismatch(&bytecode_wrote)
+         {
++            crate::avm2::method_stats::record_native_mismatch(&format!("{native:?}"));
+             tracing::warn!(
+                 "native mismatch: {native:?}, поле {at}: нативно {mine}, байткодом {theirs}"
+             );
+         }
+         crate::avm2::method_stats::record_validated(&format!("{native:?}"));
+         if !crate::avm2::fast_paths::values_match(result, *interpreted) {
++            crate::avm2::method_stats::record_native_mismatch(&format!("{native:?}"));
+             tracing::warn!("native mismatch: {native:?}, нативно {result:?}, байткодом {interpreted:?}");
+         }
+ 
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index ce50b1e7..c697c4ff 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -68,6 +68,8 @@ pub enum NativeMethod {
+     VgBound,
+     /// Сортировка списка прозрачной геометрии по габаритам вдоль оси.
+     ConflictSort,
++    /// Сборка ориентированного габаритного ящика прозрачной геометрии.
++    CalculateOobb,
+ }
+ 
+ impl NativeMethod {
+@@ -85,13 +87,23 @@ impl NativeMethod {
+             ("VG", "b6deb45e") => Some(Self::VgTransformBound),
+             ("VG", "f5407f49") => Some(Self::VgBound),
+             ("ConflictContainer", "f5e49019") => Some(Self::ConflictSort),
++            ("VG", "calculateOOBB") => Some(Self::CalculateOobb),
+             _ => None,
+         }
+     }
+ 
+     /// Возвращает ли метод значение: у void-методов сверять нечего, кроме записанных полей.
+     pub fn returns_value(self) -> bool {
+-        !matches!(self, Self::ComposeAndAppend | Self::CalculateInverseMatrix)
++        !matches!(
++            self,
++            Self::ComposeAndAppend | Self::CalculateInverseMatrix | Self::CalculateOobb
++        )
++    }
++
++    /// Метод исполняется нативно только в режиме сверки: перевод готов, но по умолчанию не
++    /// включается, пока живой бой не покажет ноль расхождений с байткодом.
++    pub fn validate_only(self) -> bool {
++        matches!(self, Self::CalculateOobb)
+     }
+ }
+ 
+@@ -1693,6 +1705,460 @@ fn vg_collect<'gc>(
+     }
+ }
+ 
++/// Номера слотов для сборки ориентированного габаритного ящика (`VG.calculateOOBB`).
++#[derive(Clone, Copy)]
++struct OobbSlots {
++    /// space, faceStruct, object, viewAligned, boundVertexList, boundPlaneList на самой `VG`.
++    space: usize,
++    face_struct: usize,
++    object: usize,
++    view_aligned: usize,
++    bound_vertex_list: usize,
++    bound_plane_list: usize,
++    /// transformId и матрица прямого преобразования на `Object3D`. Номера общие для всех
++    /// наследников: таблица наследника продолжает таблицу предка. Обратная матрица (`ima`..`iml`)
++    /// не нужна: байткод передаёт её обходу габаритов, а тот её не читает.
++    transform_id: usize,
++    m: [usize; 12],
++    /// next и offset у `Vertex`: вершины ящика и его плоскости — те же объекты `Vertex`.
++    vertex_next: usize,
++    vertex_offset: usize,
++}
++
++thread_local! {
++    static OOBB_SLOTS: RefCell<Option<(u32, OobbSlots)>> = const { RefCell::new(None) };
++    static OOBB_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn oobb_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
++    this: Object<'gc>,
++) -> Option<OobbSlots> {
++    let key = class_object.vtable().id();
++    if let Some((known, slots)) = OOBB_SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if OOBB_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    match resolve_oobb_slots(activation, this) {
++        Ok(slots) => {
++            OOBB_SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++            Some(slots)
++        }
++        Err(hopeless) => {
++            if hopeless {
++                OOBB_HOPELESS.with(|flag| flag.set(true));
++            }
++            None
++        }
++    }
++}
++
++fn resolve_oobb_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++) -> Result<OobbSlots, bool> {
++    let engine = |activation: &mut Activation<'_, 'gc>, object, name| {
++        slot_of(activation, object, name, true).ok_or(true)
++    };
++
++    let object_slot = engine(activation, this, "object")?;
++    let bound_vertex_list = engine(activation, this, "boundVertexList")?;
++
++    // Слоты `Object3D` и `Vertex` разбираются по живым объектам: имена известны, класс — нет.
++    let object = this
++        .get_slot(object_slot)
++        .as_object()
++        .ok_or(("объект не назначен", false).1)?;
++    let vertex = this
++        .get_slot(bound_vertex_list)
++        .as_object()
++        .ok_or(("список вершин ящика ещё не создан", false).1)?;
++
++    let m_names = [
++        "ma", "mb", "mc", "md", "me", "mf", "mg", "mh", "mi", "mj", "mk", "ml",
++    ];
++    let mut m = [0usize; 12];
++    for at in 0..12 {
++        m[at] = engine(activation, object, m_names[at])?;
++    }
++
++    Ok(OobbSlots {
++        space: engine(activation, this, "space")?,
++        face_struct: engine(activation, this, "faceStruct")?,
++        object: object_slot,
++        view_aligned: engine(activation, this, "viewAligned")?,
++        bound_vertex_list,
++        bound_plane_list: engine(activation, this, "boundPlaneList")?,
++        transform_id: engine(activation, object, "transformId")?,
++        m,
++        vertex_next: engine(activation, vertex, "next")?,
++        vertex_offset: engine(activation, vertex, "offset")?,
++    })
++}
++
++/// Цепочка `Vertex` по полю `next`. `None` — звено чужого класса или цепочка длиннее разумного:
++/// тогда нативный путь уступает место байткоду ещё до первой записи.
++fn oobb_chain<'gc>(
++    head: Value<'gc>,
++    next_slot: usize,
++    vertex_vtable: u32,
++) -> Option<Vec<Object<'gc>>> {
++    let mut out = Vec::new();
++    let mut node = head.as_object();
++    while let Some(vertex) = node {
++        if vertex.vtable().id() != vertex_vtable || out.len() >= 64 {
++            return None;
++        }
++        out.push(vertex);
++        node = vertex.get_slot(next_slot).as_object();
++    }
++    Some(out)
++}
++
++/// Всё, что нужно `calculateOOBB`, собранное до первой записи. Общий для счёта и снимка сверки:
++/// если это не собирается, нативный путь не запускается вовсе.
++struct OobbContext<'gc> {
++    slots: OobbSlots,
++    vg: VgSlots,
++    object: Object<'gc>,
++    face: Option<Object<'gc>>,
++    /// Восемь вершин габаритного ящика (и хвост списка, если он длиннее — байткод обходит цепочку
++    /// до конца) и шесть плоскостей.
++    vertices: Vec<Object<'gc>>,
++    planes: Vec<Object<'gc>>,
++}
++
++fn oobb_context<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
++    this: Object<'gc>,
++) -> Option<OobbContext<'gc>> {
++    let slots = oobb_slots(activation, class_object, this)?;
++    let object = this.get_slot(slots.object).as_object()?;
++    let face = this.get_slot(slots.face_struct).as_object();
++    // Обходы граней уже разобрали слоты `Face`/`Wrapper`/`Vertex`; без живой грани разбирать не на
++    // чем — но и без неё кэш обычно уже тёплый после transformStruct.
++    let vg = match face {
++        Some(face) => vg_slots(activation, class_object, this, face)?,
++        None => {
++            let (known, vg) = VG_SLOTS.with(|cache| *cache.borrow())?;
++            if known != class_object.vtable().id() {
++                return None;
++            }
++            vg
++        }
++    };
++
++    let vertices = oobb_chain(
++        this.get_slot(slots.bound_vertex_list),
++        slots.vertex_next,
++        vg.vertex_vtable,
++    )?;
++    let planes = oobb_chain(
++        this.get_slot(slots.bound_plane_list),
++        slots.vertex_next,
++        vg.vertex_vtable,
++    )?;
++
++    Some(OobbContext {
++        slots,
++        vg,
++        object,
++        face,
++        vertices,
++        planes,
++    })
++}
++
++/// Прибавить единицу к номеру преобразования объекта и вернуть новый номер — как это делает
++/// `increment` с последующей записью в поле типа `int`.
++fn oobb_next_transform_id<'gc>(
++    context: &OobbContext<'gc>,
++    mc: &Mutation<'gc>,
++) -> Option<i32> {
++    let old = match context.object.get_slot(context.slots.transform_id) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let new_id = old.wrapping_add(1);
++    context
++        .object
++        .set_slot_no_coerce(context.slots.transform_id, Value::Integer(new_id), mc);
++    Some(new_id)
++}
++
++/// Одна пара плоскостей ящика: нормаль по трём вершинам, смещения — по опорной и противоположной.
++/// Порядок умножений и вычитаний повторяет байткод дословно.
++#[allow(clippy::too_many_arguments)]
++fn oobb_plane_pair<'gc>(
++    a: Object<'gc>,
++    b: Object<'gc>,
++    c: Object<'gc>,
++    plane: Object<'gc>,
++    opposite_plane: Object<'gc>,
++    opposite_corner: Object<'gc>,
++    slots: &OobbSlots,
++    vg: &VgSlots,
++    mc: &Mutation<'gc>,
++) {
++    let read = |vertex: Object<'gc>, slot: usize| {
++        vertex.get_slot(slot).try_as_f64().unwrap_or(f64::NAN)
++    };
++
++    let ax = read(a, vg.vertex_camera[0]);
++    let ay = read(a, vg.vertex_camera[1]);
++    let az = read(a, vg.vertex_camera[2]);
++    let abx = read(b, vg.vertex_camera[0]) - ax;
++    let aby = read(b, vg.vertex_camera[1]) - ay;
++    let abz = read(b, vg.vertex_camera[2]) - az;
++    let acx = read(c, vg.vertex_camera[0]) - ax;
++    let acy = read(c, vg.vertex_camera[1]) - ay;
++    let acz = read(c, vg.vertex_camera[2]) - az;
++
++    let mut nx = acz * aby - acy * abz;
++    let mut ny = acx * abz - acz * abx;
++    let mut nz = acy * abx - acx * aby;
++    let k = 1.0 / (nx * nx + ny * ny + nz * nz).sqrt();
++    nx *= k;
++    ny *= k;
++    nz *= k;
++
++    set(plane, vg.vertex_camera[0], nx, mc);
++    set(plane, vg.vertex_camera[1], ny, mc);
++    set(plane, vg.vertex_camera[2], nz, mc);
++    set(plane, slots.vertex_offset, ax * nx + ay * ny + az * nz, mc);
++
++    set(opposite_plane, vg.vertex_camera[0], -nx, mc);
++    set(opposite_plane, vg.vertex_camera[1], -ny, mc);
++    set(opposite_plane, vg.vertex_camera[2], -nz, mc);
++    let ox = read(opposite_corner, vg.vertex_camera[0]);
++    let oy = read(opposite_corner, vg.vertex_camera[1]);
++    let oz = read(opposite_corner, vg.vertex_camera[2]);
++    set(
++        opposite_plane,
++        slots.vertex_offset,
++        (-ox) * nx - oy * ny - oz * nz,
++        mc,
++    );
++}
++
++/// Перевернуть нормаль и смещение плоскости.
++fn oobb_flip_plane<'gc>(plane: Object<'gc>, slots: &OobbSlots, vg: &VgSlots, mc: &Mutation<'gc>) {
++    for slot in [
++        vg.vertex_camera[0],
++        vg.vertex_camera[1],
++        vg.vertex_camera[2],
++        slots.vertex_offset,
++    ] {
++        let value = plane.get_slot(slot).try_as_f64().unwrap_or(f64::NAN);
++        set(plane, slot, -value, mc);
++    }
++}
++
++/// `VG.calculateOOBB` — сборка ориентированного габаритного ящика прозрачной геометрии: перевод
++/// вершин структуры граней, габариты по ним, восемь углов ящика в координатах камеры и три пары
++/// плоскостей с нормалями. На сценах с прозрачной геометрией это до шести процентов кадра.
++///
++/// Перевод байткода дословный; исполняется только в режиме сверки (`NativeMethod::validate_only`),
++/// пока живой бой не покажет ноль расхождений.
++fn calculate_oobb<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let context = oobb_context(activation, declaring_class(method)?, this)?;
++    let slots = &context.slots;
++
++    let space = match this.get_slot(slots.space) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let view_aligned = match this.get_slot(slots.view_aligned) {
++        Value::Bool(value) => value,
++        _ => return None,
++    };
++
++    // Всё, что нужно каждой ветке, проверяется до первой записи: наполовину посчитанный метод
++    // хуже честного отказа в пользу интерпретатора.
++    let camera_matrix = if space == 1 {
++        let camera = activation.local_register(1).as_object()?;
++        let mut matrix = [0.0f64; 12];
++        for (at, cell) in matrix.iter_mut().enumerate() {
++            *cell = camera.get_slot(slots.m[at]).try_as_f64()?;
++        }
++        Some(matrix)
++    } else {
++        None
++    };
++    let mut object_matrix = [0.0f64; 12];
++    if !view_aligned {
++        if context.vertices.len() < 8 || context.planes.len() < 6 {
++            return None;
++        }
++        for (at, cell) in object_matrix.iter_mut().enumerate() {
++            *cell = context.object.get_slot(slots.m[at]).try_as_f64()?;
++        }
++    }
++    if !matches!(
++        context.object.get_slot(slots.transform_id),
++        Value::Integer(_)
++    ) {
++        return None;
++    }
++
++    let mc = activation.gc();
++
++    if let Some(matrix) = camera_matrix {
++        let transform_id = oobb_next_transform_id(&context, mc)?;
++        if let Some(face) = context.face {
++            // Прерванный на чужом классе обход оставляем как есть — как и сами обходы граней:
++            // непройденные вершины байткод пересчитал бы в те же значения.
++            let mut bounds = VgBounds {
++                min: [0.0; 3],
++                max: [0.0; 3],
++            };
++            vg_walk_node(
++                face,
++                &context.vg,
++                VgWalk::Transform,
++                transform_id,
++                &matrix,
++                &mut bounds,
++                0,
++                mc,
++            );
++        }
++    }
++
++    if !view_aligned {
++        for (at, value) in [1e22, 1e22, 1e22, -1e22, -1e22, -1e22].iter().enumerate() {
++            set(this, context.vg.bound[at], *value, mc);
++        }
++
++        let transform_id = oobb_next_transform_id(&context, mc)?;
++        let mut bounds = VgBounds {
++            min: [1e22; 3],
++            max: [-1e22; 3],
++        };
++        if let Some(face) = context.face {
++            vg_walk_node(
++                face,
++                &context.vg,
++                VgWalk::Bound,
++                transform_id,
++                &object_matrix,
++                &mut bounds,
++                0,
++                mc,
++            );
++        }
++        for at in 0..3 {
++            // Вырожденный ящик раздвигается до единичной толщины — сравнение повторяет `ifnlt`,
++            // то есть на NaN габариты не трогаются.
++            if bounds.max[at] - bounds.min[at] < 1.0 {
++                bounds.max[at] = bounds.min[at] + 1.0;
++            }
++            set(this, context.vg.bound[at], bounds.min[at], mc);
++            set(this, context.vg.bound[at + 3], bounds.max[at], mc);
++        }
++
++        // Восемь углов ящика: x меняется быстрее всех, затем y, затем z — как в байткоде.
++        let corners = [
++            [0, 0, 0],
++            [1, 0, 0],
++            [0, 1, 0],
++            [1, 1, 0],
++            [0, 0, 1],
++            [1, 0, 1],
++            [0, 1, 1],
++            [1, 1, 1],
++        ];
++        for (vertex, corner) in context.vertices.iter().zip(corners.iter()) {
++            for at in 0..3 {
++                let value = if corner[at] == 0 {
++                    bounds.min[at]
++                } else {
++                    bounds.max[at]
++                };
++                set(*vertex, context.vg.vertex_local[at], value, mc);
++            }
++        }
++
++        // Байткод идёт по цепочке до конца, даже если в ней больше восьми вершин.
++        for vertex in context.vertices.iter() {
++            let x = vertex
++                .get_slot(context.vg.vertex_local[0])
++                .try_as_f64()
++                .unwrap_or(f64::NAN);
++            let y = vertex
++                .get_slot(context.vg.vertex_local[1])
++                .try_as_f64()
++                .unwrap_or(f64::NAN);
++            let z = vertex
++                .get_slot(context.vg.vertex_local[2])
++                .try_as_f64()
++                .unwrap_or(f64::NAN);
++            let m = &object_matrix;
++            set(
++                *vertex,
++                context.vg.vertex_camera[0],
++                m[0] * x + m[1] * y + m[2] * z + m[3],
++                mc,
++            );
++            set(
++                *vertex,
++                context.vg.vertex_camera[1],
++                m[4] * x + m[5] * y + m[6] * z + m[7],
++                mc,
++            );
++            set(
++                *vertex,
++                context.vg.vertex_camera[2],
++                m[8] * x + m[9] * y + m[10] * z + m[11],
++                mc,
++            );
++        }
++
++        let v = &context.vertices;
++        let p = &context.planes;
++        // Пары плоскостей: (опорная A и вершины B, C для нормали; противоположный угол для
++        // второй плоскости пары) — ровно те вершины, что берёт байткод.
++        oobb_plane_pair(v[0], v[1], v[4], p[0], p[1], v[2], slots, &context.vg, mc);
++        oobb_plane_pair(v[0], v[4], v[2], p[2], p[3], v[1], slots, &context.vg, mc);
++        oobb_plane_pair(v[4], v[5], v[6], p[4], p[5], v[0], slots, &context.vg, mc);
++
++        // Разворот пар, у которых смещения разошлись со знаком. Порядок переворотов в паре
++        // повторяет байткод, хотя друг на друга они не влияют.
++        let offset = |plane: Object<'gc>| {
++            plane
++                .get_slot(slots.vertex_offset)
++                .try_as_f64()
++                .unwrap_or(f64::NAN)
++        };
++        if offset(p[0]) < -offset(p[1]) {
++            oobb_flip_plane(p[1], slots, &context.vg, mc);
++            oobb_flip_plane(p[0], slots, &context.vg, mc);
++        }
++        if offset(p[2]) < -offset(p[3]) {
++            oobb_flip_plane(p[2], slots, &context.vg, mc);
++            oobb_flip_plane(p[3], slots, &context.vg, mc);
++        }
++        if offset(p[5]) < -offset(p[4]) {
++            oobb_flip_plane(p[5], slots, &context.vg, mc);
++            oobb_flip_plane(p[4], slots, &context.vg, mc);
++        }
++    }
++
++    this.set_slot_no_coerce(slots.space, Value::Integer(2), mc);
++    Some(Value::Undefined)
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -2060,6 +2526,57 @@ pub fn snapshot<'gc>(
+         return Some(Snapshot { fields, links: Vec::new() });
+     }
+ 
++    // Сборка ящика переписывает габариты и номер преобразования, координаты вершин дерева граней,
++    // углы ящика и его плоскости — снимается всё, что метод может задеть, независимо от веток:
++    // набор полей обязан совпадать у снимков «до», «нативно» и «байткодом».
++    if native == NativeMethod::CalculateOobb {
++        let this = activation.local_register(0).as_object()?;
++        let context = oobb_context(activation, declaring_class(method)?, this)?;
++        let grab = |object: Object<'gc>, slot: usize| {
++            object.get_slot(slot).try_as_f64().unwrap_or(f64::NAN)
++        };
++
++        let mut fields = Vec::new();
++        for slot in context.vg.bound.iter() {
++            fields.push((Place::Slot(this, *slot), grab(this, *slot)));
++        }
++        fields.push((
++            Place::IntSlot(this, context.slots.space),
++            grab(this, context.slots.space),
++        ));
++        fields.push((
++            Place::IntSlot(context.object, context.slots.transform_id),
++            grab(context.object, context.slots.transform_id),
++        ));
++        if let Some(face) = context.face {
++            vg_collect(face, &context.vg, &mut fields, 0);
++        }
++        for vertex in context.vertices.iter() {
++            for slot in context
++                .vg
++                .vertex_local
++                .iter()
++                .chain(context.vg.vertex_camera.iter())
++            {
++                fields.push((Place::Slot(*vertex, *slot), grab(*vertex, *slot)));
++            }
++        }
++        for plane in context.planes.iter().take(6) {
++            for slot in context
++                .vg
++                .vertex_camera
++                .iter()
++                .chain([context.slots.vertex_offset].iter())
++            {
++                fields.push((Place::Slot(*plane, *slot), grab(*plane, *slot)));
++            }
++        }
++        return Some(Snapshot {
++            fields,
++            links: Vec::new(),
++        });
++    }
++
+     // Столкновение эллипсоида пишет в два вектора, и по ним только и видно, совпал ли счёт:
+     // возвращаемое «да/нет» слишком грубое, чтобы поймать расхождение в последнем бите.
+     if native == NativeMethod::EllipsoidCollide {
+@@ -2098,7 +2615,8 @@ pub fn snapshot<'gc>(
+         | NativeMethod::VgTransform
+         | NativeMethod::VgTransformBound
+         | NativeMethod::VgBound
+-        | NativeMethod::ConflictSort => return None,
++        | NativeMethod::ConflictSort
++        | NativeMethod::CalculateOobb => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -2165,6 +2683,7 @@ pub fn run<'gc>(
+         }
+         NativeMethod::VgBound => vg_struct_walk(activation, method, VgWalk::Bound),
+         NativeMethod::ConflictSort => conflict_sort(activation, method),
++        NativeMethod::CalculateOobb => calculate_oobb(activation, method),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 84e36abb..168b4d50 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -335,6 +335,29 @@ pub fn validated_methods() -> Vec<String> {
+     VALIDATED.with(|validated| validated.borrow().clone())
+ }
+ 
++thread_local! {
++    /// Замена -> сколько раз её ответ разошёлся с байткодом. Не обнуляется: «ноль расхождений за
++    /// бой» должен означать ноль с самого начала сессии, а не с последней выдачи статистики.
++    static MISMATCHES: RefCell<Vec<(String, u64)>> = const { RefCell::new(Vec::new()) };
++}
++
++/// Режим сверки поймал расхождение нативного счёта с байткодом.
++pub fn record_native_mismatch(name: &str) {
++    MISMATCHES.with(|mismatches| {
++        let mut mismatches = mismatches.borrow_mut();
++        if let Some(entry) = mismatches.iter_mut().find(|(known, _)| known == name) {
++            entry.1 += 1;
++        } else {
++            mismatches.push((name.to_owned(), 1));
++        }
++    });
++}
++
++/// Все расхождения с начала сессии.
++pub fn native_mismatches() -> Vec<(String, u64)> {
++    MISMATCHES.with(|mismatches| mismatches.borrow().clone())
++}
++
+ /// Попадания и промахи инлайн-кэшей обращений к свойствам. Нужны, чтобы отличить «кэш работает»
+ /// от «кэш молотит вхолостую»: если по одному месту ходят объекты разных классов, ячейка на
+ /// каждом обращении перезаписывается и из ускорителя превращается в накладной расход.
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 09da8dea..5d8400e4 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1269,6 +1269,24 @@ impl RuffleHandle {
+                     let _ = js_sys::Reflect::set(&stats, &JsValue::from_str("opKinds"), &list);
+                 }
+ 
++                // Счётчик расхождений режима сверки — всегда, не только при включённом счётчике
++                // методов: «ноль расхождений» проверяется по нему, и он должен быть виден с
++                // самого начала сессии.
++                {
++                    let list = js_sys::Array::new();
++                    for (name, count) in ruffle_core::method_stats::native_mismatches() {
++                        let row = js_sys::Array::new();
++                        row.push(&JsValue::from_str(&name));
++                        row.push(&JsValue::from_f64(count as f64));
++                        list.push(&row);
++                    }
++                    let _ = js_sys::Reflect::set(
++                        &stats,
++                        &JsValue::from_str("nativeMismatches"),
++                        &list,
++                    );
++                }
++
+                 // Вклад эмулятора в игровой пинг: сколько входящие порции сокета ждали между
+                 // приходом WS-сообщения и доставкой ActionScript, и сколько исходящие — между
+                 // flush() и фактической отправкой. Если пинг большой, а эти цифры маленькие,
+-- 
+2.51.1.windows.1
+

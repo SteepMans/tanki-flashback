@@ -1,0 +1,652 @@
+From 542a40a412f4e3bb6a50ed97fe0d7614c1040bc7 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 20:11:25 +0300
+Subject: [PATCH] core: sweep the player ellipsoid against map triangles
+ natively
+
+---
+ core/src/avm2/activation.rs |  36 +--
+ core/src/avm2/fast_paths.rs | 515 ++++++++++++++++++++++++++++++++++--
+ 2 files changed, 511 insertions(+), 40 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 09985d1e..b3c1ea78 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -695,30 +695,18 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             return interpreted;
+         };
+ 
+-        if let Some(native_wrote) = &native_wrote {
+-            if let Some(bytecode_wrote) = crate::avm2::fast_paths::snapshot(self, native, method)
+-                && let Some((at, mine, theirs)) = native_wrote.mismatch(&bytecode_wrote)
+-            {
+-                tracing::warn!(
+-                    "native mismatch: {native:?}, поле {at}: нативно {mine}, байткодом {theirs}"
+-                );
+-            }
+-        } else {
+-            // Сравнение побитовое: методы столкновений возвращают дробное число, и физика решает
+-            // по нему, есть касание или нет. Два NaN считаются одинаковыми.
+-            let (mine, theirs) = (result.try_as_f64(), interpreted.try_as_f64());
+-            let same = match (mine, theirs) {
+-                (Some(mine), Some(theirs)) => {
+-                    mine.to_bits() == theirs.to_bits() || (mine.is_nan() && theirs.is_nan())
+-                }
+-                (None, None) => true,
+-                _ => false,
+-            };
+-            if !same {
+-                tracing::warn!(
+-                    "native mismatch: {native:?}, нативно {mine:?}, байткодом {theirs:?}"
+-                );
+-            }
++        // Сверяется и записанное, и возвращённое: у столкновения эллипсоида ответ — грубое
++        // «да/нет», и одним им расхождение в последнем бите не поймать.
++        if let Some(native_wrote) = &native_wrote
++            && let Some(bytecode_wrote) = crate::avm2::fast_paths::snapshot(self, native, method)
++            && let Some((at, mine, theirs)) = native_wrote.mismatch(&bytecode_wrote)
++        {
++            tracing::warn!(
++                "native mismatch: {native:?}, поле {at}: нативно {mine}, байткодом {theirs}"
++            );
++        }
++        if !crate::avm2::fast_paths::values_match(result, *interpreted) {
++            tracing::warn!("native mismatch: {native:?}, нативно {result:?}, байткодом {interpreted:?}");
+         }
+ 
+         Ok(*interpreted)
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index b4346430..72143d3b 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -54,6 +54,8 @@ pub enum NativeMethod {
+     BoxBoxOverlapOnAxis,
+     /// Перекрытие коробки с прямоугольником вдоль оси.
+     BoxRectOverlapOnAxis,
++    /// Столкновение эллипсоида игрока с треугольниками карты.
++    EllipsoidCollide,
+ }
+ 
+ impl NativeMethod {
+@@ -65,6 +67,7 @@ impl NativeMethod {
+             (ENGINE_CLASS, "calculateInverseMatrix") => Some(Self::CalculateInverseMatrix),
+             ("BoxBoxCollider", "getOverlapOnAxis") => Some(Self::BoxBoxOverlapOnAxis),
+             ("BoxRectCollider", "getOverlapOnAxis") => Some(Self::BoxRectOverlapOnAxis),
++            ("EllipsoidCollider", "ecfa5c3") => Some(Self::EllipsoidCollide),
+             _ => None,
+         }
+     }
+@@ -630,35 +633,502 @@ fn get_overlap_on_axis<'gc>(
+     Ok(sum - bytecode_abs(between))
+ }
+ 
++/// Номер слота по одному лишь имени, без пространства имён. Поля коллайдера объявлены в приватном
++/// пространстве своего класса, а такое пространство снаружи не построить: у него внутренний
++/// номер, уникальный на единицу трансляции. Имена там обфусцированы и в классе единственны, так
++/// что совпадения по имени достаточно. Перебор идёт один раз, при разборе слотов.
++fn slot_by_local_name<'gc>(object: Object<'gc>, name: &str) -> Option<usize> {
++    object
++        .vtable()
++        .resolved_traits()
++        .iter()
++        .find_map(|(local, _, property)| match property {
++            Property::Slot { slot_id } | Property::ConstSlot { slot_id }
++                if &*local.to_utf8_lossy() == name =>
++            {
++                Some(*slot_id)
++            }
++            _ => None,
++        })
++}
++
++/// Обфусцированные имена полей `EllipsoidCollider`. Как и у коробок, они постоянны от сборки к
++/// сборке; если сборка клиента поменяется, поле не найдётся и метод посчитает интерпретатор.
++mod ellipsoid_fields {
++    /// Треугольники карты, отобранные для проверки, и их число.
++    pub const FACES: &str = "faces";
++    pub const FACE_COUNT: &str = "e6b9feef";
++    /// Радиус эллипсоида в его собственном масштабе.
++    pub const RADIUS: &str = "radius";
++    /// Положение центра, вектор перемещения за шаг и положение на прошлом шаге.
++    pub const POSITION: &str = "c6464302";
++    pub const DISPLACEMENT: &str = "d3246eba";
++    pub const PREVIOUS: &str = "c6a71617";
++    /// Куда метод кладёт найденную точку касания и плоскость касания (в `w` — её смещение).
++    pub const CONTACT_POINT: &str = "cad4534";
++    pub const CONTACT_PLANE: &str = "a440cac7";
++}
++
++/// Номера слотов, нужных для столкновения эллипсоида с треугольниками.
++#[derive(Clone, Copy)]
++struct EllipsoidSlots {
++    faces: usize,
++    face_count: usize,
++    radius: usize,
++    position: usize,
++    displacement: usize,
++    previous: usize,
++    contact_point: usize,
++    contact_plane: usize,
++    /// `wrapper` у треугольника, `vertex` и `next` у звена списка.
++    face_wrapper: usize,
++    wrapper_vertex: usize,
++    wrapper_next: usize,
++    /// cameraX, cameraY, cameraZ вершины.
++    vertex_camera: [usize; 3],
++    /// x, y, z, w вектора.
++    vector: [usize; 4],
++    /// Таблицы методов, на которых слоты разобраны: объект другого класса имеет свои номера.
++    face_vtable: u32,
++    wrapper_vtable: u32,
++    vertex_vtable: u32,
++    vector_vtable: u32,
++}
++
++thread_local! {
++    /// Как и у остальных замен, запоминается только удача.
++    static ELLIPSOID_SLOTS: RefCell<Option<(u32, EllipsoidSlots)>> = const { RefCell::new(None) };
++    /// Не найденное имя поля не появится, повторять разбор незачем.
++    static ELLIPSOID_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn ellipsoid_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++) -> Option<EllipsoidSlots> {
++    let key = this.vtable().id();
++    if let Some((known, slots)) = ELLIPSOID_SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if ELLIPSOID_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    match resolve_ellipsoid_slots(activation, this) {
++        Ok(slots) => {
++            ELLIPSOID_SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++            Some(slots)
++        }
++        Err((reason, hopeless)) => {
++            tracing::debug!("native ellipsoid: слоты не разобраны: {reason} (навсегда={hopeless})");
++            if hopeless {
++                ELLIPSOID_HOPELESS.with(|flag| flag.set(true));
++            }
++            None
++        }
++    }
++}
++
++/// Во второй половине ответа — окончательна ли неудача: не найденное имя поля не появится, а
++/// незаполненное поле объекта (коллайдер ещё не получил ни одного треугольника) появится позже.
++fn resolve_ellipsoid_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++) -> Result<EllipsoidSlots, (&'static str, bool)> {
++    use ellipsoid_fields::*;
++
++    let named = |name, reason| slot_by_local_name(this, name).ok_or((reason, true));
++
++    let faces = named(FACES, "нет поля треугольников")?;
++    let position = named(POSITION, "нет поля положения")?;
++    let contact_point = named(CONTACT_POINT, "нет поля точки касания")?;
++
++    // Классы треугольника, звена и вершины видны только по живым объектам: имена их полей нам
++    // известны, а вот на каком классе их искать — нет.
++    let face = this
++        .get_slot(faces)
++        .as_object()
++        .ok_or(("список треугольников не заполнен", false))?
++        .as_vector_storage()
++        .ok_or(("список треугольников не вектор", true))?
++        .get_optional(0)
++        .ok_or(("список треугольников пуст", false))?
++        .as_object()
++        .ok_or(("первый треугольник пуст", false))?;
++    let wrapper = face
++        .get_slot(slot_of(activation, face, "wrapper", true).ok_or(("нет поля звена", true))?)
++        .as_object()
++        .ok_or(("звено не заполнено", false))?;
++    let vertex = wrapper
++        .get_slot(slot_of(activation, wrapper, "vertex", true).ok_or(("нет поля вершины", true))?)
++        .as_object()
++        .ok_or(("вершина не заполнена", false))?;
++    let vector = this
++        .get_slot(contact_point)
++        .as_object()
++        .ok_or(("точка касания не заполнена", false))?;
++
++    let engine = |activation: &mut Activation<'_, 'gc>, object, name| {
++        slot_of(activation, object, name, true).ok_or(("нет поля движка", true))
++    };
++    let public = |activation: &mut Activation<'_, 'gc>, object, name| {
++        slot_of(activation, object, name, false).ok_or(("нет поля вектора", true))
++    };
++
++    Ok(EllipsoidSlots {
++        faces,
++        face_count: named(FACE_COUNT, "нет поля числа треугольников")?,
++        radius: named(RADIUS, "нет поля радиуса")?,
++        position,
++        displacement: named(DISPLACEMENT, "нет поля смещения")?,
++        previous: named(PREVIOUS, "нет поля прошлого положения")?,
++        contact_point,
++        contact_plane: named(CONTACT_PLANE, "нет поля плоскости касания")?,
++        face_wrapper: engine(activation, face, "wrapper")?,
++        wrapper_vertex: engine(activation, wrapper, "vertex")?,
++        wrapper_next: engine(activation, wrapper, "next")?,
++        vertex_camera: [
++            engine(activation, vertex, "cameraX")?,
++            engine(activation, vertex, "cameraY")?,
++            engine(activation, vertex, "cameraZ")?,
++        ],
++        vector: [
++            public(activation, vector, "x")?,
++            public(activation, vector, "y")?,
++            public(activation, vector, "z")?,
++            public(activation, vector, "w")?,
++        ],
++        face_vtable: face.vtable().id(),
++        wrapper_vtable: wrapper.vtable().id(),
++        vertex_vtable: vertex.vtable().id(),
++        vector_vtable: vector.vtable().id(),
++    })
++}
++
++/// Три координаты вектора движка (`flash.geom.Vector3D`).
++#[inline(always)]
++fn vector3<'gc>(vector: Object<'gc>, slots: &EllipsoidSlots) -> Option<(f64, f64, f64)> {
++    if vector.vtable().id() != slots.vector_vtable {
++        return None;
++    }
++    Some((
++        vector.get_slot(slots.vector[0]).try_as_f64()?,
++        vector.get_slot(slots.vector[1]).try_as_f64()?,
++        vector.get_slot(slots.vector[2]).try_as_f64()?,
++    ))
++}
++
++/// Три координаты вершины треугольника в системе координат камеры.
++#[inline(always)]
++fn vertex3<'gc>(vertex: Object<'gc>, slots: &EllipsoidSlots) -> Option<(f64, f64, f64)> {
++    if vertex.vtable().id() != slots.vertex_vtable {
++        return None;
++    }
++    Some((
++        vertex.get_slot(slots.vertex_camera[0]).try_as_f64()?,
++        vertex.get_slot(slots.vertex_camera[1]).try_as_f64()?,
++        vertex.get_slot(slots.vertex_camera[2]).try_as_f64()?,
++    ))
++}
++
++/// `EllipsoidCollider.ecfa5c3()` — заметание эллипсоида игрока по треугольникам карты: самый
++/// крупный кусок кадра в бою (порядка 384 тысяч инструкций за вызов, раз в кадр). Для каждого
++/// треугольника считается плоскость, точка касания уточняется по рёбрам и вершинам, и из всех
++/// касаний остаётся самое раннее по времени шага.
++///
++/// Тело переведено из байткода один в один: имена переменных повторяют номера локальных ячеек
++/// (`l2` — это `local2`), скобки и порядок действий оставлены как есть. В плавающей точке порядок
++/// влияет на последний бит, а по этому биту физика решает, упёрся танк в стену или проехал.
++///
++/// Оба вектора-результата (`cad4534`, `a440cac7`) заполняются одной записью в самом конце, а не по
++/// ходу перебора, как в байткоде. Это единственное намеренное отличие, и оно не видно снаружи:
++/// внутри метода эти поля читаются только сразу после собственной записи, а наружу видно лишь
++/// последнее — зато при отказе на середине объект остаётся нетронутым и байткод считает с чистого
++/// листа.
++#[allow(clippy::too_many_lines)]
++fn ellipsoid_collide<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let slots = ellipsoid_slots(activation, this)?;
++
++    let radius = this.get_slot(slots.radius).try_as_f64()?;
++    let face_count = match this.get_slot(slots.face_count) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let faces = this.get_slot(slots.faces).as_object()?;
++    let (cx, cy, cz) = vector3(this.get_slot(slots.position).as_object()?, &slots)?;
++    let displacement = this.get_slot(slots.displacement).as_object()?;
++    let (dx, dy, dz) = vector3(displacement, &slots)?;
++    let (px, py, pz) = vector3(this.get_slot(slots.previous).as_object()?, &slots)?;
++
++    // `Vector3D.length` — геттер, а не поле: повторяем его счёт.
++    let l32 = (dx * dx + dy * dy + dz * dz).sqrt();
++    let mut l7 = 1.0f64;
++    // Лучшее найденное касание: точка и плоскость. Пока его нет, векторы не трогаем.
++    let mut hit: Option<([f64; 3], [f64; 4])> = None;
++    // Точка касания живёт МЕЖДУ треугольниками, а не заводится заново на каждом: если у очередного
++    // треугольника ни одно ребро не оказалось ближе (например, длина ребра дала NaN), байткод
++    // возьмёт сюда значение от предыдущего треугольника, а на первом — NaN.
++    let (mut l38, mut l10, mut l25) = (f64::NAN, f64::NAN, f64::NAN);
++
++    let faces = faces.as_vector_storage()?;
++    for l29 in 0..face_count {
++        let face = faces.get_optional(l29 as usize)?.as_object()?;
++        if face.vtable().id() != slots.face_vtable {
++            return None;
++        }
++        let mut l37 = face.get_slot(slots.face_wrapper).as_object()?;
++        if l37.vtable().id() != slots.wrapper_vtable {
++            return None;
++        }
++        let l20 = l37.get_slot(slots.wrapper_vertex).as_object()?;
++        l37 = l37.get_slot(slots.wrapper_next).as_object()?;
++        if l37.vtable().id() != slots.wrapper_vtable {
++            return None;
++        }
++        let l21 = l37.get_slot(slots.wrapper_vertex).as_object()?;
++        l37 = l37.get_slot(slots.wrapper_next).as_object()?;
++        if l37.vtable().id() != slots.wrapper_vtable {
++            return None;
++        }
++        let l23 = l37.get_slot(slots.wrapper_vertex).as_object()?;
++
++        let (v0x, v0y, v0z) = vertex3(l20, &slots)?;
++        let (v1x, v1y, v1z) = vertex3(l21, &slots)?;
++        let (v2x, v2y, v2z) = vertex3(l23, &slots)?;
++
++        let l34 = v1x - v0x;
++        let l43 = v1y - v0y;
++        let l11 = v1z - v0z;
++        let l40 = v2x - v0x;
++        let l22 = v2y - v0y;
++        let l1 = v2z - v0z;
++
++        let mut l2 = l1 * l43 - l22 * l11;
++        let mut l3 = l40 * l11 - l1 * l34;
++        let mut l4 = l22 * l34 - l40 * l43;
++
++        let mut l45 = l2 * l2 + l3 * l3 + l4 * l4;
++        // Вырожденный треугольник пропускается: нормаль у него не считается.
++        if !(l45 > 0.001) {
++            continue;
++        }
++        l45 = 1.0 / l45.sqrt();
++        l2 *= l45;
++        l3 *= l45;
++        l4 *= l45;
++
++        let l24 = v0x * l2 + v0y * l3 + v0z * l4;
++        let l5 = (cx * l2 + cy * l3 + cz * l4) - l24;
++
++        // Куда упирается эллипсоид в плоскость треугольника: если центр уже ближе радиуса, берём
++        // проекцию центра, иначе — точку, где сфера коснётся плоскости по ходу шага.
++        let (l16, l30, l36) = if l5 < radius {
++            (cx - l2 * l5, cy - l3 * l5, cz - l4 * l5)
++        } else {
++            let l35 = (l5 - radius) / (l5 - px * l2 - py * l3 - pz * l4 + l24);
++            (
++                (cx + dx * l35) - l2 * radius,
++                (cy + dy * l35) - l3 * radius,
++                (cz + dz * l35) - l4 * radius,
++            )
++        };
++
++        // Лежит ли точка внутри треугольника; если нет — ищем ближайшую точку на рёбрах.
++        let mut l14 = 1e22f64;
++        let mut l27 = true;
++        let mut l6 = Some(face.get_slot(slots.face_wrapper).as_object()?);
++        while let Some(wrapper) = l6 {
++            if wrapper.vtable().id() != slots.wrapper_vtable {
++                return None;
++            }
++            let l20 = wrapper.get_slot(slots.wrapper_vertex).as_object()?;
++            let next = wrapper.get_slot(slots.wrapper_next);
++            let l21 = match next.as_object() {
++                Some(next) => {
++                    if next.vtable().id() != slots.wrapper_vtable {
++                        return None;
++                    }
++                    next.get_slot(slots.wrapper_vertex).as_object()?
++                }
++                None => face
++                    .get_slot(slots.face_wrapper)
++                    .as_object()?
++                    .get_slot(slots.wrapper_vertex)
++                    .as_object()?,
++            };
++
++            let (e0x, e0y, e0z) = vertex3(l20, &slots)?;
++            let (e1x, e1y, e1z) = vertex3(l21, &slots)?;
++
++            let mut l34 = e1x - e0x;
++            let mut l43 = e1y - e0y;
++            let mut l11 = e1z - e0z;
++            let mut l40 = l16 - e0x;
++            let mut l22 = l30 - e0y;
++            let mut l1 = l36 - e0z;
++
++            let l26 = l1 * l43 - l22 * l11;
++            let l8 = l40 * l11 - l1 * l34;
++            let l39 = l22 * l34 - l40 * l43;
++
++            if l26 * l2 + l8 * l3 + l39 * l4 < 0.0 {
++                let mut l12 = l34 * l34 + l43 * l43 + l11 * l11;
++                let l46 = (l26 * l26 + l8 * l8 + l39 * l39) / l12;
++                if l46 < l14 {
++                    l12 = l12.sqrt();
++                    l34 /= l12;
++                    l43 /= l12;
++                    l11 /= l12;
++                    let l35 = l34 * l40 + l43 * l22 + l11 * l1;
++                    if l35 < 0.0 {
++                        // Ближе всего начало ребра.
++                        let l19 = l40 * l40 + l22 * l22 + l1 * l1;
++                        if l19 < l14 {
++                            l14 = l19;
++                            l38 = e0x;
++                            l10 = e0y;
++                            l25 = e0z;
++                        }
++                    } else if l35 > l12 {
++                        // Ближе всего конец ребра.
++                        l40 = l16 - e1x;
++                        l22 = l30 - e1y;
++                        l1 = l36 - e1z;
++                        let l19 = l40 * l40 + l22 * l22 + l1 * l1;
++                        if l19 < l14 {
++                            l14 = l19;
++                            l38 = e1x;
++                            l10 = e1y;
++                            l25 = e1z;
++                        }
++                    } else {
++                        // Ближе всего точка на самом ребре.
++                        l14 = l46;
++                        l38 = e0x + l34 * l35;
++                        l10 = e0y + l43 * l35;
++                        l25 = e0z + l11 * l35;
++                    }
++                }
++                l27 = false;
++            }
++
++            l6 = wrapper.get_slot(slots.wrapper_next).as_object();
++        }
++
++        // Точка оказалась внутри треугольника — она и есть точка касания.
++        if l27 {
++            l38 = l16;
++            l10 = l30;
++            l25 = l36;
++        }
++
++        let l44 = cx - l38;
++        let l31 = cy - l10;
++        let l41 = cz - l25;
++
++        // Если движемся от треугольника, а не к нему, касания не будет.
++        if !(l44 * dx + l31 * dy + l41 * dz <= 0.0) {
++            continue;
++        }
++
++        let l17 = -dx / l32;
++        let l15 = -dy / l32;
++        let l13 = -dz / l32;
++        let l9 = l44 * l44 + l31 * l31 + l41 * l41;
++        let l18 = l44 * l17 + l31 * l15 + l41 * l13;
++        let l28 = radius * radius - l9 + l18 * l18;
++        if !(l28 > 0.0) {
++            continue;
++        }
++        let l42 = (l18 - l28.sqrt()) / l32;
++        if !(l42 < l7) {
++            continue;
++        }
++        l7 = l42;
++
++        let point = [l38, l10, l25];
++        let plane = if l27 {
++            [l2, l3, l4, l24]
++        } else {
++            let l9 = l9.sqrt();
++            let (nx, ny, nz) = (l44 / l9, l31 / l9, l41 / l9);
++            [nx, ny, nz, l38 * nx + l10 * ny + l25 * nz]
++        };
++        hit = Some((point, plane));
++    }
++
++    drop(faces);
++    if let Some((point, plane)) = hit {
++        let mc = activation.gc();
++        let contact_point = this.get_slot(slots.contact_point).as_object()?;
++        let contact_plane = this.get_slot(slots.contact_plane).as_object()?;
++        if contact_point.vtable().id() != slots.vector_vtable
++            || contact_plane.vtable().id() != slots.vector_vtable
++        {
++            return None;
++        }
++        for (at, value) in point.iter().enumerate() {
++            set(contact_point, slots.vector[at], *value, mc);
++        }
++        for (at, value) in plane.iter().enumerate() {
++            set(contact_plane, slots.vector[at], *value, mc);
++        }
++    }
++
++    Some(Value::Bool(l7 < 1.0))
++}
++
+ /// Снимок полей, которые метод перезаписывает. Нужен режиму сверки: метод ничего не возвращает,
+ /// поэтому сравнить нативный счёт с байткодом можно только по записанному — а чтобы байткод считал
+ /// с того же входа, снимок сначала откатывают.
+ pub struct Snapshot<'gc> {
+-    object: Object<'gc>,
+-    slots: [usize; 12],
+-    values: [f64; 12],
++    /// Объект, номер слота и значение. Полей может быть с разных объектов: столкновение
++    /// эллипсоида пишет в два вектора сразу.
++    fields: Vec<(Object<'gc>, usize, f64)>,
+ }
+ 
+ impl<'gc> Snapshot<'gc> {
+     /// Вернуть поля в состояние до нативного счёта.
+     pub fn restore(&self, mc: &Mutation<'gc>) {
+-        for (slot, value) in self.slots.iter().zip(self.values.iter()) {
+-            set(self.object, *slot, *value, mc);
++        for (object, slot, value) in self.fields.iter() {
++            set(*object, *slot, *value, mc);
+         }
+     }
+ 
+     /// Первое расхождение с другим снимком: номер поля и оба значения. Сравнение побитовое по
+     /// значению, но два NaN считаются одинаковыми — в матрице вырожденного объекта они законны.
+     pub fn mismatch(&self, other: &Self) -> Option<(usize, f64, f64)> {
+-        for (at, (mine, theirs)) in self.values.iter().zip(other.values.iter()).enumerate() {
++        for (at, (mine, theirs)) in self.fields.iter().zip(other.fields.iter()).enumerate() {
++            let (mine, theirs) = (mine.2, theirs.2);
+             if mine != theirs && !(mine.is_nan() && theirs.is_nan()) {
+-                return Some((at, *mine, *theirs));
++                return Some((at, mine, theirs));
+             }
+         }
+         None
+     }
+ }
+ 
++/// Совпадают ли два ответа метода. Сравнение побитовое: методы столкновений возвращают дробное
++/// число, и физика решает по нему, есть касание или нет. Два NaN считаются одинаковыми.
++pub fn values_match(mine: Value<'_>, theirs: Value<'_>) -> bool {
++    if let (Value::Bool(mine), Value::Bool(theirs)) = (mine, theirs) {
++        return mine == theirs;
++    }
++    match (mine.try_as_f64(), theirs.try_as_f64()) {
++        (Some(mine), Some(theirs)) => {
++            mine.to_bits() == theirs.to_bits() || (mine.is_nan() && theirs.is_nan())
++        }
++        (None, None) => matches!(
++            (mine, theirs),
++            (Value::Undefined, Value::Undefined) | (Value::Null, Value::Null)
++        ),
++        _ => false,
++    }
++}
++
+ /// Снять состояние полей, которые метод перезапишет. `None` — методу нечего снимать (отсечение
+ /// сцены сверяется по возвращённому числу) или слоты не разобрались.
+ pub fn snapshot<'gc>(
+@@ -666,6 +1136,21 @@ pub fn snapshot<'gc>(
+     native: NativeMethod,
+     method: Method<'gc>,
+ ) -> Option<Snapshot<'gc>> {
++    // Столкновение эллипсоида пишет в два вектора, и по ним только и видно, совпал ли счёт:
++    // возвращаемое «да/нет» слишком грубое, чтобы поймать расхождение в последнем бите.
++    if native == NativeMethod::EllipsoidCollide {
++        let this = activation.local_register(0).as_object()?;
++        let slots = ellipsoid_slots(activation, this)?;
++        let mut fields = Vec::with_capacity(7);
++        for (slot, count) in [(slots.contact_point, 3), (slots.contact_plane, 4)] {
++            let vector = this.get_slot(slot).as_object()?;
++            for at in 0..count {
++                fields.push((vector, slots.vector[at], vector.get_slot(slots.vector[at]).try_as_f64()?));
++            }
++        }
++        return Some(Snapshot { fields });
++    }
++
+     // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
+     // делается один раз за сессию и на чужом объекте запомнил бы неудачу навсегда.
+     if !matches!(
+@@ -680,7 +1165,8 @@ pub fn snapshot<'gc>(
+     let slots = match native {
+         NativeMethod::CullingInCamera
+         | NativeMethod::BoxBoxOverlapOnAxis
+-        | NativeMethod::BoxRectOverlapOnAxis => return None,
++        | NativeMethod::BoxRectOverlapOnAxis
++        | NativeMethod::EllipsoidCollide => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -711,15 +1197,11 @@ pub fn snapshot<'gc>(
+         ],
+     };
+ 
+-    let mut values = [0.0f64; 12];
+-    for (at, slot) in slots.iter().enumerate() {
+-        values[at] = object.get_slot(*slot).try_as_f64()?;
++    let mut fields = Vec::with_capacity(12);
++    for slot in slots.iter() {
++        fields.push((object, *slot, object.get_slot(*slot).try_as_f64()?));
+     }
+-    Some(Snapshot {
+-        object,
+-        slots,
+-        values,
+-    })
++    Some(Snapshot { fields })
+ }
+ 
+ /// Объект класса, в котором объявлен выполняемый метод. Нужен ради статических полей движка
+@@ -743,6 +1225,7 @@ pub fn run<'gc>(
+             get_overlap_on_axis(activation, 1, 2).ok().map(Value::Number)
+         }
+         NativeMethod::CullingInCamera => culling_in_camera(activation, declaring_class(method)?),
++        NativeMethod::EllipsoidCollide => ellipsoid_collide(activation),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+-- 
+2.51.1.windows.1
+

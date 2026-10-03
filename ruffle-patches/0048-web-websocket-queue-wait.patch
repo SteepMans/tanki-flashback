@@ -1,0 +1,288 @@
+From 5ca78cd59b3cd6741ecabdbd87f7ec4cca21be5f Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 10:23:27 +0300
+Subject: [PATCH 2/2] web: raw websocket path that measures the main thread
+ queue wait
+
+---
+ core/src/avm2/method_stats.rs |  17 ++++
+ web/Cargo.toml                |   3 +-
+ web/src/lib.rs                |   9 ++
+ web/src/navigator.rs          | 153 +++++++++++++++++++++-------------
+ 4 files changed, 121 insertions(+), 61 deletions(-)
+
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index f29e9afd..b22e223a 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -412,6 +412,10 @@ thread_local! {
+     static SOCKET_IN_ARRIVALS: RefCell<VecDeque<Instant>> = const { RefCell::new(VecDeque::new()) };
+     /// (сумма мс, максимум мс, порций) времени «пришло из сети → отдано ActionScript» за период.
+     static SOCKET_IN_LAG: Cell<(f64, f64, u64)> = const { Cell::new((0.0, 0.0, 0)) };
++    /// (сумма мс, максимум мс, событий) ожидания WS-события в очереди главного потока: от
++    /// постановки события (event.timeStamp) до начала обработчика. Метка прихода этого не
++    /// видит — она ставится уже внутри обработчика.
++    static SOCKET_QUEUE_WAIT: Cell<(f64, f64, u64)> = const { Cell::new((0.0, 0.0, 0)) };
+     /// Моменты, когда ActionScript отдал порции на отправку, ещё не ушедшие в WebSocket.
+     static SOCKET_OUT_STARTS: RefCell<VecDeque<Instant>> = const { RefCell::new(VecDeque::new()) };
+     /// (сумма мс, максимум мс, порций) времени «flush() → отправлено в WebSocket» за период.
+@@ -436,6 +440,19 @@ pub fn socket_wake_enabled() -> bool {
+     SOCKET_WAKE.load(Ordering::Relaxed)
+ }
+ 
++/// WS-событие простояло в очереди главного потока указанное время до начала обработчика.
++pub fn record_socket_queue_wait(ms: f64) {
++    SOCKET_QUEUE_WAIT.with(|wait| {
++        let (sum, max, count) = wait.get();
++        wait.set((sum + ms, max.max(ms), count + 1));
++    });
++}
++
++/// (сумма мс, максимум мс, событий) ожидания в очереди за период; счётчики обнуляются.
++pub fn take_socket_queue_wait() -> (f64, f64, u64) {
++    SOCKET_QUEUE_WAIT.with(|wait| wait.replace((0.0, 0.0, 0)))
++}
++
+ /// Пришла порция данных сокета из сети (вызывает web-обвязка при WS-сообщении).
+ pub fn record_socket_in_arrival() {
+     SOCKET_IN_ARRIVALS.with(|queue| {
+diff --git a/web/Cargo.toml b/web/Cargo.toml
+index 4cfa0cd0..996df9a2 100644
+--- a/web/Cargo.toml
++++ b/web/Cargo.toml
+@@ -75,7 +75,8 @@ features = [
+     "HtmlInputElement", "HtmlTextAreaElement", "KeyboardEvent", "Location", "PageTransitionEvent", "PointerEvent",
+     "Request", "RequestInit", "Response", "Storage", "WheelEvent", "Window", "ReadableStream", "RequestCredentials",
+     "Url", "WebGlContextEvent", "Clipboard", "FocusEvent", "FocusOptions", "ShadowRoot", "Gamepad", "GamepadButton", "OffscreenCanvas",
+-    "TextMetrics", "OffscreenCanvasRenderingContext2d"
++    "TextMetrics", "OffscreenCanvasRenderingContext2d",
++    "WebSocket", "MessageEvent", "BinaryType", "CloseEvent", "Performance"
+ ]
+ 
+ [target.'cfg(target_family = "wasm")'.dependencies.getrandom]
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 61395d76..61a5a32a 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1392,6 +1392,8 @@ impl RuffleHandle {
+                     ruffle_core::method_stats::take_socket_in_lag();
+                 let (out_sum, out_max, out_count) =
+                     ruffle_core::method_stats::take_socket_out_lag();
++                let (queue_sum, queue_max, queue_count) =
++                    ruffle_core::method_stats::take_socket_queue_wait();
+ 
+                 for (name, value) in [
+                     ("ticks", *ticks as f64 / elapsed as f64),
+@@ -1417,6 +1419,13 @@ impl RuffleHandle {
+                     ),
+                     ("socketOutMaxMs", out_max),
+                     ("socketOutPerSec", out_count as f64 / elapsed as f64),
++                    // Ожидание WS-события в очереди главного потока — недостающая часть пинга:
++                    // ставится браузером до того, как метка прихода вообще возможна.
++                    (
++                        "socketQueueMs",
++                        if queue_count > 0 { queue_sum / queue_count as f64 } else { 0.0 },
++                    ),
++                    ("socketQueueMaxMs", queue_max),
+                     // Худший промежуток между RAF за секунду и его разбор: что не объясняется
+                     // процессорной работой кадра, то ожидание браузера или видеокарты.
+                     ("worstGapMs", worst_gap as f64),
+diff --git a/web/src/navigator.rs b/web/src/navigator.rs
+index 7f97b0ee..8e30f98c 100644
+--- a/web/src/navigator.rs
++++ b/web/src/navigator.rs
+@@ -1,9 +1,6 @@
+ //! Navigator backend for web
+ use crate::SocketProxy;
+ use async_channel::{Receiver, Sender};
+-use futures_util::future::Either;
+-use futures_util::{SinkExt, StreamExt, future};
+-use gloo_net::websocket::{Message, futures::WebSocket};
+ use js_sys::{Array, Promise, RegExp, Uint8Array};
+ use ruffle_core::Player;
+ use ruffle_core::backend::navigator::{
+@@ -24,6 +21,7 @@ use tracing_subscriber::Registry;
+ use tracing_subscriber::layer::Layered;
+ use tracing_wasm::WASMLayer;
+ use url::{ParseError, Url};
++use wasm_bindgen::closure::Closure;
+ use wasm_bindgen::{JsCast, JsValue};
+ use wasm_bindgen_futures::{JsFuture, spawn_local};
+ use wasm_streams::readable::ReadableStream;
+@@ -515,18 +513,24 @@ impl NavigatorBackend for WebNavigatorBackend {
+ 
+         tracing::info!("Connecting to {}", proxy.proxy_url);
+ 
+-        let ws = match WebSocket::open(&proxy.proxy_url) {
+-            Ok(x) => x,
+-            Err(e) => {
+-                tracing::error!("Failed to create WebSocket, reason {:?}", e);
++        // Сокет открывается напрямую через web_sys, а не через gloo: обёртка не отдаёт само
++        // событие сообщения, а без него не видно, сколько событие простояло в очереди главного
++        // потока (event.timeStamp) — недостающую часть игрового пинга. Заодно пропадает лишний
++        // канал между обработчиком и задачей чтения: данные уходят плееру прямо из обработчика.
++        let ws = match web_sys::WebSocket::new(&proxy.proxy_url) {
++            Ok(ws) => ws,
++            Err(error) => {
++                tracing::error!("Failed to create WebSocket, reason {:?}", error);
+                 sender
+                     .try_send(SocketAction::Connect(handle, ConnectionState::Failed))
+                     .expect("working channel send");
+                 return;
+             }
+         };
++        ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+ 
+-        let (mut ws_write, mut ws_read) = ws.split();
++        // Как и раньше, подключение объявляется состоявшимся сразу после создания сокета:
++        // игра начинает писать только по этому событию, а настоящий сбой придёт onerror/onclose.
+         sender
+             .try_send(SocketAction::Connect(handle, ConnectionState::Connected))
+             .expect("working channel send");
+@@ -537,62 +541,91 @@ impl NavigatorBackend for WebNavigatorBackend {
+         ruffle_core::method_stats::enable_socket_probe();
+ 
+         let player = self.player.clone();
+-        self.spawn_future(Box::pin(async move {
+-            loop {
+-                match future::select(ws_read.next(), std::pin::pin!(receiver.recv())).await {
+-                    // Handle incoming messages.
+-                    Either::Left((Some(msg), _)) => match msg {
+-                        Ok(Message::Bytes(buf)) => {
+-                            ruffle_core::method_stats::record_socket_in_arrival();
+-                            sender
+-                                .try_send(SocketAction::Data(handle, buf))
+-                                .expect("working channel send");
+-                            // Раньше входящие ждали в канале до конца очередного кадра: при
+-                            // тридцати кадрах в секунду это до 30-40 мс на каждую половину
+-                            // обмена. Здесь плеер будится сразу: WS-сообщение приходит своей
+-                            // JS-задачей, кадр в этот момент не исполняется, и замок свободен.
+-                            // Если же он занят (гонка с чем-то другим), ничего не теряется —
+-                            // кадр сам доставит данные, как и раньше.
+-                            if ruffle_core::method_stats::socket_wake_enabled()
+-                                && let Some(player) = player.upgrade()
+-                                && let Ok(mut player) = player.try_lock()
+-                            {
+-                                player.update_sockets();
+-                            }
+-                        }
+-                        Ok(_) => tracing::warn!("Server sent an unexpected text message"),
+-                        Err(_) => {
+-                            sender
+-                                .try_send(SocketAction::Close(handle))
+-                                .expect("working channel send");
+-                            break;
+-                        }
+-                    },
+-                    // Handle outgoing messages.
+-                    Either::Right((Ok(msg), _)) => {
+-                        let result = ws_write.send(Message::Bytes(msg)).await;
+-                        // Пара снимается и при ошибке, чтобы очередь замера не разъехалась.
+-                        ruffle_core::method_stats::record_socket_out_sent();
+-                        if let Err(e) = result {
+-                            tracing::warn!("Failed to send message to WebSocket {}", e);
+-                            sender
+-                                .try_send(SocketAction::Close(handle))
+-                                .expect("working channel send");
+-                        }
+-                    }
+-                    // The connection was closed.
+-                    _ => break,
++        let message_sender = sender.clone();
++        let performance = window().and_then(|window| window.performance());
++        let on_message = Closure::<dyn FnMut(web_sys::MessageEvent)>::new(
++            move |event: web_sys::MessageEvent| {
++                let Ok(buffer) = event.data().dyn_into::<js_sys::ArrayBuffer>() else {
++                    tracing::warn!("Server sent an unexpected text message");
++                    return;
+                 };
++                let bytes = Uint8Array::new(&buffer).to_vec();
++                // Сколько событие простояло в очереди главного потока: от постановки
++                // (event.timeStamp) до этого обработчика. Метка прихода ниже этого не видит —
++                // она ставится, когда обработчик уже исполняется.
++                if let Some(performance) = performance.as_ref() {
++                    let waited = performance.now() - event.time_stamp();
++                    ruffle_core::method_stats::record_socket_queue_wait(waited.max(0.0));
++                }
++                ruffle_core::method_stats::record_socket_in_arrival();
++                if message_sender
++                    .try_send(SocketAction::Data(handle, bytes))
++                    .is_err()
++                {
++                    return;
++                }
++                // Плеер будится прямо из обработчика: кадр в этот момент не исполняется, и
++                // замок свободен. Если он всё же занят, ничего не теряется — данные доставит
++                // ближайший кадр, как и раньше.
++                if ruffle_core::method_stats::socket_wake_enabled()
++                    && let Some(player) = player.upgrade()
++                    && let Ok(mut player) = player.try_lock()
++                {
++                    player.update_sockets();
++                }
++            },
++        );
++        ws.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
++
++        let close_sender = sender.clone();
++        let on_close = Closure::<dyn FnMut(web_sys::CloseEvent)>::new(
++            move |_event: web_sys::CloseEvent| {
++                let _ = close_sender.try_send(SocketAction::Close(handle));
++            },
++        );
++        ws.set_onclose(Some(on_close.as_ref().unchecked_ref()));
++
++        let error_sender = sender.clone();
++        let on_error = Closure::<dyn FnMut(web_sys::Event)>::new(move |_event: web_sys::Event| {
++            let _ = error_sender.try_send(SocketAction::Close(handle));
++        });
++        ws.set_onerror(Some(on_error.as_ref().unchecked_ref()));
++
++        // Отправлять до фактического открытия нельзя (send бросил бы ошибку), поэтому задача
++        // исходящих ждёт сигнала onopen; порции тем временем копятся в канале плеера.
++        let (open_sender, open_receiver) = async_channel::bounded::<()>(1);
++        let on_open = Closure::<dyn FnMut()>::new(move || {
++            let _ = open_sender.try_send(());
++        });
++        ws.set_onopen(Some(on_open.as_ref().unchecked_ref()));
++
++        self.spawn_future(Box::pin(async move {
++            // Err значит, что сокет закрыли до открытия: цикл ниже сразу увидит закрытый канал
++            // или ошибку отправки и свернётся сам.
++            let _ = open_receiver.recv().await;
++
++            while let Ok(message) = receiver.recv().await {
++                // Отправка у браузерного сокета неблокирующая: буфером управляет сам браузер.
++                if let Err(error) = ws.send_with_u8_array(&message) {
++                    tracing::warn!("Failed to send message to WebSocket {:?}", error);
++                    let _ = sender.try_send(SocketAction::Close(handle));
++                }
++                // Пара к отметке flush() снимается и при ошибке, чтобы замер не разъехался.
++                ruffle_core::method_stats::record_socket_out_sent();
+             }
+ 
+-            // Что осталось в очереди исходящих порций, уже не отправится — снять, чтобы не
+-            // портить пары следующего соединения.
++            // Канал закрыт — сокет закрыла игра. Что осталось в очереди замера исходящих, уже
++            // не отправится; обработчики снимаются до close, чтобы не получить своё же событие.
+             ruffle_core::method_stats::reset_socket_out_queue();
+-
+-            let ws = ws_write
+-                .reunite(ws_read)
+-                .expect("both originate from the same websocket");
+-            let _ = ws.close(None, None);
++            ws.set_onmessage(None);
++            ws.set_onclose(None);
++            ws.set_onerror(None);
++            ws.set_onopen(None);
++            let _ = ws.close();
++            drop(on_message);
++            drop(on_close);
++            drop(on_error);
++            drop(on_open);
+ 
+             Ok(())
+         }));
+-- 
+2.51.1.windows.1
+

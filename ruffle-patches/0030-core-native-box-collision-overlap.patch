@@ -1,0 +1,385 @@
+From 8cf76357b9177102d4048875b8a632780383893c Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 17:50:22 +0300
+Subject: [PATCH] core: compute box collision overlap natively
+
+---
+ core/src/avm2/activation.rs |  22 ++-
+ core/src/avm2/fast_paths.rs | 258 ++++++++++++++++++++++++++++++++++--
+ core/src/avm2/verify.rs     |  23 +---
+ 3 files changed, 272 insertions(+), 31 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 1129fa7b..adc335a8 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -703,12 +703,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+                     "native mismatch: {native:?}, поле {at}: нативно {mine}, байткодом {theirs}"
+                 );
+             }
+-        } else if interpreted.as_i32() != result.as_i32() {
+-            tracing::warn!(
+-                "native mismatch: {native:?}, нативно {}, байткодом {}",
+-                result.as_i32(),
+-                interpreted.as_i32()
+-            );
++        } else {
++            // Сравнение побитовое: методы столкновений возвращают дробное число, и физика решает
++            // по нему, есть касание или нет. Два NaN считаются одинаковыми.
++            let (mine, theirs) = (result.try_as_f64(), interpreted.try_as_f64());
++            let same = match (mine, theirs) {
++                (Some(mine), Some(theirs)) => {
++                    mine.to_bits() == theirs.to_bits() || (mine.is_nan() && theirs.is_nan())
++                }
++                (None, None) => true,
++                _ => false,
++            };
++            if !same {
++                tracing::warn!(
++                    "native mismatch: {native:?}, нативно {mine:?}, байткодом {theirs:?}"
++                );
++            }
+         }
+ 
+         Ok(*interpreted)
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 8dd9b007..96a55df4 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -50,22 +50,28 @@ pub enum NativeMethod {
+     ComposeAndAppend,
+     /// Обратная матрица объекта.
+     CalculateInverseMatrix,
++    /// Перекрытие коробки с коробкой вдоль оси.
++    BoxBoxOverlapOnAxis,
++    /// Перекрытие коробки с прямоугольником вдоль оси.
++    BoxRectOverlapOnAxis,
+ }
+ 
+ impl NativeMethod {
+-    /// Узнаёт метод по имени. Класс проверяется отдельно.
+-    pub fn from_name(name: &str) -> Option<Self> {
+-        match name {
+-            "cullingInCamera" => Some(Self::CullingInCamera),
+-            "composeAndAppend" => Some(Self::ComposeAndAppend),
+-            "calculateInverseMatrix" => Some(Self::CalculateInverseMatrix),
++    /// Узнаёт метод по классу и имени: одноимённый метод чужого класса считает совсем другое.
++    pub fn from_name(class: &str, name: &str) -> Option<Self> {
++        match (class, name) {
++            (ENGINE_CLASS, "cullingInCamera") => Some(Self::CullingInCamera),
++            (ENGINE_CLASS, "composeAndAppend") => Some(Self::ComposeAndAppend),
++            (ENGINE_CLASS, "calculateInverseMatrix") => Some(Self::CalculateInverseMatrix),
++            ("BoxBoxCollider", "getOverlapOnAxis") => Some(Self::BoxBoxOverlapOnAxis),
++            ("BoxRectCollider", "getOverlapOnAxis") => Some(Self::BoxRectOverlapOnAxis),
+             _ => None,
+         }
+     }
+ 
+     /// Возвращает ли метод значение: у void-методов сверять нечего, кроме записанных полей.
+     pub fn returns_value(self) -> bool {
+-        matches!(self, Self::CullingInCamera)
++        !matches!(self, Self::ComposeAndAppend | Self::CalculateInverseMatrix)
+     }
+ }
+ 
+@@ -353,6 +359,225 @@ fn calculate_inverse_matrix<'gc>(
+     Some(())
+ }
+ 
++/// Имена полей физики в клиенте обфусцированы, но постоянны от сборки к сборке. Если сборка
++/// клиента всё же поменяется, поле просто не найдётся, и метод посчитает интерпретатор: «почти
++/// правильно» нативный путь ответить не может.
++mod collider_fields {
++    /// Поворот тела — матрица 3x3.
++    pub const ROTATION: &str = "5214232323232336123423632234";
++    /// Половина размеров тела — вектор.
++    pub const HALF: &str = "var finally get";
++    /// Третья координата вектора; `x` и `y` не обфусцированы.
++    pub const Z: &str = "5214239363239376123423632234";
++    /// Матрица поворота построчно: три поля в строке.
++    pub const MATRIX: [&str; 9] = [
++        "521423171502317163123423632234",
++        "521423162832316296123423632234",
++        "default var",
++        "in use break",
++        "extends use case",
++        "5214239279239292123423632234",
++        "throw switch finally",
++        "extends for null",
++        "5214238543238556123423632234",
++    ];
++}
++
++/// Номера слотов, нужных для перекрытия тел вдоль оси.
++#[derive(Clone, Copy)]
++struct OverlapSlots {
++    /// Поворот и полуразмеры у первого и второго тела: классы у них разные (коробка и
++    /// прямоугольник), номера слотов тоже.
++    rotation: [usize; 2],
++    half: [usize; 2],
++    matrix: [usize; 9],
++    vector: [usize; 3],
++    /// Таблицы методов, на которых разобраны матрица и вектор. Проверяются на каждом вызове:
++    /// придёт объект другого класса — номера слотов будут чужими, и считать должен байткод.
++    matrix_vtable: u32,
++    vector_vtable: u32,
++}
++
++thread_local! {
++    /// По набору слотов на каждую пару классов тел. Ключ — таблицы методов обоих тел.
++    /// Запоминается только удача: неудача из-за незаполненного поля временная, и запомнить её
++    /// значило бы навсегда отключить замену из-за одного неудачного первого вызова.
++    static OVERLAP_SLOTS: RefCell<[Option<(u32, u32, OverlapSlots)>; 2]> =
++        const { RefCell::new([None, None]) };
++    /// Разбор слотов, провалившийся по именам полей, повторять бессмысленно: имена от вызова к
++    /// вызову не меняются, а поиск имени в таблице класса дороже самого метода.
++    static OVERLAP_HOPELESS: RefCell<[Option<(u32, u32)>; 2]> = const { RefCell::new([None, None]) };
++}
++
++fn overlap_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    at: usize,
++    body1: Object<'gc>,
++    body2: Object<'gc>,
++) -> Result<OverlapSlots, &'static str> {
++    let key = (body1.vtable().id(), body2.vtable().id());
++    if let Some((first, second, slots)) = OVERLAP_SLOTS.with(|cache| cache.borrow()[at])
++        && (first, second) == key
++    {
++        return Ok(slots);
++    }
++    if OVERLAP_HOPELESS.with(|cache| cache.borrow()[at]) == Some(key) {
++        return Err("классы тел уже признаны непокрытыми");
++    }
++
++    match resolve_overlap_slots(activation, body1, body2) {
++        Ok(slots) => {
++            OVERLAP_SLOTS.with(|cache| cache.borrow_mut()[at] = Some((key.0, key.1, slots)));
++            Ok(slots)
++        }
++        Err((reason, hopeless)) => {
++            if hopeless {
++                OVERLAP_HOPELESS.with(|cache| cache.borrow_mut()[at] = Some(key));
++            }
++            Err(reason)
++        }
++    }
++}
++
++/// Разбирает номера слотов. Во второй половине ответа — можно ли считать неудачу окончательной:
++/// не найденное имя поля не появится, а незаполненное поле объекта появится на следующем вызове.
++fn resolve_overlap_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    body1: Object<'gc>,
++    body2: Object<'gc>,
++) -> Result<OverlapSlots, (&'static str, bool)> {
++    use collider_fields::*;
++
++    let named = |activation: &mut Activation<'_, 'gc>, object, name, reason| {
++        slot_of(activation, object, name, false).ok_or((reason, true))
++    };
++
++    let rotation = [
++        named(activation, body1, ROTATION, "нет поля поворота у тела 1")?,
++        named(activation, body2, ROTATION, "нет поля поворота у тела 2")?,
++    ];
++    let half = [
++        named(activation, body1, HALF, "нет полуразмеров у тела 1")?,
++        named(activation, body2, HALF, "нет полуразмеров у тела 2")?,
++    ];
++
++    // Слоты матрицы и вектора берутся с живых объектов первого тела: имена полей у них тоже
++    // обфусцированы, а классы одни и те же для обоих тел.
++    let matrix_object = body1
++        .get_slot(rotation[0])
++        .as_object()
++        .ok_or(("поворот тела 1 не заполнен", false))?;
++    let vector_object = body1
++        .get_slot(half[0])
++        .as_object()
++        .ok_or(("полуразмеры тела 1 не заполнены", false))?;
++
++    let mut matrix = [0usize; 9];
++    for (at, name) in MATRIX.iter().enumerate() {
++        matrix[at] = named(activation, matrix_object, name, "нет поля матрицы")?;
++    }
++    let vector = [
++        named(activation, vector_object, "x", "нет поля x")?,
++        named(activation, vector_object, "y", "нет поля y")?,
++        named(activation, vector_object, Z, "нет поля z")?,
++    ];
++
++    Ok(OverlapSlots {
++        rotation,
++        half,
++        matrix,
++        vector,
++        matrix_vtable: matrix_object.vtable().id(),
++        vector_vtable: vector_object.vtable().id(),
++    })
++}
++
++/// Модуль числа ровно так, как его берёт байткод: сравнением с нулём и сменой знака. `f64::abs`
++/// отличался бы на минус нуле, а по этому числу физика решает, есть столкновение или нет.
++#[inline(always)]
++fn bytecode_abs(value: f64) -> f64 {
++    if value < 0.0 { -value } else { value }
++}
++
++/// `BoxBoxCollider.getOverlapOnAxis` и `BoxRectCollider.getOverlapOnAxis` — насколько два тела
++/// перекрываются вдоль оси: сумма проекций их полуразмеров минус проекция вектора между центрами.
++/// Метод листовой и в бою идёт под сорок тысяч раз в секунду на два класса, съедая около
++/// девятой части всех выполненных инструкций.
++///
++/// `second_terms` — сколько полуразмеров у второго тела: у коробки три, у прямоугольника два.
++/// Порядок сложений и умножений повторяет байткод: в плавающей точке он влияет на последний бит.
++fn get_overlap_on_axis<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    at: usize,
++    second_terms: usize,
++) -> Result<f64, &'static str> {
++    let body1 = activation.local_register(1).as_object().ok_or("тело 1 не объект")?;
++    let body2 = activation.local_register(2).as_object().ok_or("тело 2 не объект")?;
++    let axis = activation.local_register(3).as_object().ok_or("ось не объект")?;
++    let between = activation.local_register(4).as_object().ok_or("вектор не объект")?;
++
++    let slots = overlap_slots(activation, at, body1, body2)?;
++    if axis.vtable().id() != slots.vector_vtable || between.vtable().id() != slots.vector_vtable {
++        return Err("ось или вектор другого класса");
++    }
++
++    let ax = axis.get_slot(slots.vector[0]).try_as_f64().ok_or("ось.x не число")?;
++    let ay = axis.get_slot(slots.vector[1]).try_as_f64().ok_or("ось.y не число")?;
++    let az = axis.get_slot(slots.vector[2]).try_as_f64().ok_or("ось.z не число")?;
++
++    let mut sum = 0.0f64;
++    for (body_at, (body, terms)) in [(body1, 3usize), (body2, second_terms)].iter().enumerate() {
++        let rotation = body
++            .get_slot(slots.rotation[body_at])
++            .as_object()
++            .ok_or("поворот не объект")?;
++        let half = body
++            .get_slot(slots.half[body_at])
++            .as_object()
++            .ok_or("полуразмеры не объект")?;
++        if rotation.vtable().id() != slots.matrix_vtable {
++            return Err("поворот другого класса");
++        }
++        if half.vtable().id() != slots.vector_vtable {
++            return Err("полуразмеры другого класса");
++        }
++
++        for row in 0..*terms {
++            let m0 = rotation
++                .get_slot(slots.matrix[row * 3])
++                .try_as_f64()
++                .ok_or("поворот не число")?;
++            let m1 = rotation
++                .get_slot(slots.matrix[row * 3 + 1])
++                .try_as_f64()
++                .ok_or("поворот не число")?;
++            let m2 = rotation
++                .get_slot(slots.matrix[row * 3 + 2])
++                .try_as_f64()
++                .ok_or("поворот не число")?;
++            let h = half
++                .get_slot(slots.vector[row])
++                .try_as_f64()
++                .ok_or("полуразмер не число")?;
++
++            let term = bytecode_abs((m0 * ax + m1 * ay + m2 * az) * h);
++            // Первое слагаемое именно присваивается, а не прибавляется к нулю: у минус нуля от
++            // этого зависит знак.
++            sum = if body_at == 0 && row == 0 {
++                term
++            } else {
++                sum + term
++            };
++        }
++    }
++
++    let between = between.get_slot(slots.vector[0]).try_as_f64().ok_or("вектор.x не число")? * ax
++        + between.get_slot(slots.vector[1]).try_as_f64().ok_or("вектор.y не число")? * ay
++        + between.get_slot(slots.vector[2]).try_as_f64().ok_or("вектор.z не число")? * az;
++
++    Ok(sum - bytecode_abs(between))
++}
++
+ /// Снимок полей, которые метод перезаписывает. Нужен режиму сверки: метод ничего не возвращает,
+ /// поэтому сравнить нативный счёт с байткодом можно только по записанному — а чтобы байткод считал
+ /// с того же входа, снимок сначала откатывают.
+@@ -388,10 +613,21 @@ pub fn snapshot<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+     method: NativeMethod,
+ ) -> Option<Snapshot<'gc>> {
++    // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
++    // делается один раз за сессию и на чужом объекте запомнил бы неудачу навсегда.
++    if !matches!(
++        method,
++        NativeMethod::ComposeAndAppend | NativeMethod::CalculateInverseMatrix
++    ) {
++        return None;
++    }
++
+     let object = activation.local_register(0).as_object()?;
+     let slots = matrix_slots(activation, object)?;
+     let slots = match method {
+-        NativeMethod::CullingInCamera => return None,
++        NativeMethod::CullingInCamera
++        | NativeMethod::BoxBoxOverlapOnAxis
++        | NativeMethod::BoxRectOverlapOnAxis => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -439,6 +675,12 @@ pub fn run<'gc>(
+     method: NativeMethod,
+ ) -> Option<Value<'gc>> {
+     match method {
++        NativeMethod::BoxBoxOverlapOnAxis => {
++            get_overlap_on_axis(activation, 0, 3).ok().map(Value::Number)
++        }
++        NativeMethod::BoxRectOverlapOnAxis => {
++            get_overlap_on_axis(activation, 1, 2).ok().map(Value::Number)
++        }
+         NativeMethod::CullingInCamera => culling_in_camera(activation),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+diff --git a/core/src/avm2/verify.rs b/core/src/avm2/verify.rs
+index 6d8bfc82..8f64615a 100644
+--- a/core/src/avm2/verify.rs
++++ b/core/src/avm2/verify.rs
+@@ -531,25 +531,14 @@ pub fn verify_method<'gc>(
+         jump_targets,
+     )?;
+ 
+-    // Нативная замена привязана к конкретному классу движка: одноимённый метод чужого класса
+-    // считает совсем другое, поэтому имя класса проверяется вместе с именем метода.
+-    let in_engine_class = method
+-        .bound_class()
+-        .map(|class| {
+-            class
+-                .name()
+-                .local_name()
+-                .to_utf8_lossy()
+-                .eq(crate::avm2::fast_paths::ENGINE_CLASS)
+-        })
+-        .unwrap_or(false);
+-    let native_method = if in_engine_class {
++    // Нативная замена привязана к конкретному классу: одноимённый метод чужого класса считает
++    // совсем другое, поэтому имя класса проверяется вместе с именем метода.
++    let native_method = method.bound_class().and_then(|class| {
++        let class_name = class.name().local_name().to_utf8_lossy().into_owned();
+         method
+             .method_name()
+-            .and_then(|name| crate::avm2::fast_paths::NativeMethod::from_name(&name))
+-    } else {
+-        None
+-    };
++            .and_then(|name| crate::avm2::fast_paths::NativeMethod::from_name(&class_name, &name))
++    });
+ 
+     // Раздача ячеек инлайн-кэша — после всех проходов оптимизатора: он успевает заменить часть
+     // обращений на прямой номер слота или метода, и кэш таким местам уже не нужен.
+-- 
+2.51.1.windows.1
+

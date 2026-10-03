@@ -1,0 +1,191 @@
+From 42162bb9c221e550a9732fb078ac36427bd942e1 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 08:03:29 +0300
+Subject: [PATCH 3/3] core: skip device texture and vertex buffer rebinds on
+ shadow state hits
+
+---
+ core/src/avm2/fast_paths.rs | 118 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 116 insertions(+), 2 deletions(-)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index c697c4ff..070747e4 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -70,6 +70,10 @@ pub enum NativeMethod {
+     ConflictSort,
+     /// Сборка ориентированного габаритного ящика прозрачной геометрии.
+     CalculateOobb,
++    /// Установка текстуры сэмплера через теневое состояние устройства.
++    SetTextureAt,
++    /// Установка вершинного буфера через теневое состояние устройства.
++    SetVertexBufferAt,
+ }
+ 
+ impl NativeMethod {
+@@ -88,6 +92,8 @@ impl NativeMethod {
+             ("VG", "f5407f49") => Some(Self::VgBound),
+             ("ConflictContainer", "f5e49019") => Some(Self::ConflictSort),
+             ("VG", "calculateOOBB") => Some(Self::CalculateOobb),
++            ("Device", "setTextureAt") => Some(Self::SetTextureAt),
++            ("Device", "setVertexBufferAt") => Some(Self::SetVertexBufferAt),
+             _ => None,
+         }
+     }
+@@ -96,7 +102,11 @@ impl NativeMethod {
+     pub fn returns_value(self) -> bool {
+         !matches!(
+             self,
+-            Self::ComposeAndAppend | Self::CalculateInverseMatrix | Self::CalculateOobb
++            Self::ComposeAndAppend
++                | Self::CalculateInverseMatrix
++                | Self::CalculateOobb
++                | Self::SetTextureAt
++                | Self::SetVertexBufferAt
+         )
+     }
+ 
+@@ -2174,6 +2184,11 @@ struct DeviceSlots {
+     stage3d: usize,
+     vertex_constants: usize,
+     fragment_constants: usize,
++    /// Теневые наборы текстур и вершинных буферов на `RenderState`.
++    textures: usize,
++    vertex_buffers: usize,
++    vertex_buffers_offsets: usize,
++    vertex_buffers_formats: usize,
+ }
+ 
+ thread_local! {
+@@ -2225,6 +2240,12 @@ fn resolve_device_slots<'gc>(
+         stage3d,
+         vertex_constants: slot_of(activation, state, "vertexConstants", false).ok_or(true)?,
+         fragment_constants: slot_of(activation, state, "fragmentConstants", false).ok_or(true)?,
++        textures: slot_of(activation, state, "textures", false).ok_or(true)?,
++        vertex_buffers: slot_of(activation, state, "vertexBuffers", false).ok_or(true)?,
++        vertex_buffers_offsets: slot_of(activation, state, "vertexBuffersOffsets", false)
++            .ok_or(true)?,
++        vertex_buffers_formats: slot_of(activation, state, "vertexBuffersFormats", false)
++            .ok_or(true)?,
+     })
+ }
+ 
+@@ -2616,7 +2637,9 @@ pub fn snapshot<'gc>(
+         | NativeMethod::VgTransformBound
+         | NativeMethod::VgBound
+         | NativeMethod::ConflictSort
+-        | NativeMethod::CalculateOobb => return None,
++        | NativeMethod::CalculateOobb
++        | NativeMethod::SetTextureAt
++        | NativeMethod::SetVertexBufferAt => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -2684,6 +2707,8 @@ pub fn run<'gc>(
+         NativeMethod::VgBound => vg_struct_walk(activation, method, VgWalk::Bound),
+         NativeMethod::ConflictSort => conflict_sort(activation, method),
+         NativeMethod::CalculateOobb => calculate_oobb(activation, method),
++        NativeMethod::SetTextureAt => set_texture_at(activation),
++        NativeMethod::SetVertexBufferAt => set_vertex_buffer_at(activation),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+@@ -2702,6 +2727,95 @@ pub fn run<'gc>(
+     }
+ }
+ 
++/// Равенство в духе `==` байткода для значений, которые лежат в теневых наборах устройства:
++/// объекты сравниваются по тождеству, null и undefined равны друг другу, числа — по значению,
++/// строки — по содержимому. `None` — сочетание типов, за которое ручаться нельзя: пусть сравнивает
++/// интерпретатор.
++fn shadow_equals<'gc>(mine: Value<'gc>, theirs: Value<'gc>) -> Option<bool> {
++    match (mine, theirs) {
++        (Value::Object(mine), Value::Object(theirs)) => Some(Object::ptr_eq(mine, theirs)),
++        (Value::Null | Value::Undefined, Value::Null | Value::Undefined) => Some(true),
++        (Value::Object(_), Value::Null | Value::Undefined)
++        | (Value::Null | Value::Undefined, Value::Object(_)) => Some(false),
++        (Value::Integer(mine), Value::Integer(theirs)) => Some(mine == theirs),
++        (Value::Number(mine), Value::Number(theirs)) => Some(mine == theirs),
++        (Value::Integer(mine), Value::Number(theirs)) => Some(f64::from(mine) == theirs),
++        (Value::Number(mine), Value::Integer(theirs)) => Some(mine == f64::from(theirs)),
++        (Value::String(mine), Value::String(theirs)) => Some(mine == theirs),
++        (Value::String(_), Value::Null | Value::Undefined)
++        | (Value::Null | Value::Undefined, Value::String(_)) => Some(false),
++        _ => None,
++    }
++}
++
++/// Элемент теневого вектора по номеру сэмплера или потока. `None` — номер вне вектора: байткод
++/// на таком бросил бы RangeError, пусть бросает сам.
++fn shadow_element<'gc>(
++    state: Object<'gc>,
++    slot: usize,
++    index: i32,
++) -> Option<Value<'gc>> {
++    let vector = state.get_slot(slot).as_object()?;
++    let storage = vector.as_vector_storage()?;
++    if index < 0 || index as usize >= storage.length() {
++        return None;
++    }
++    storage.get_optional(index as usize)
++}
++
++/// `Device.setTextureAt` — обёртка движка над Stage3D с теневым состоянием: если сэмплеру уже
++/// назначен тот же ресурс, делать нечего. В бою таких вызовов под восемьдесят тысяч в секунду, и
++/// почти все — попадания в теневой кэш. Здесь нативно распознаётся только попадание; любой промах
++/// уходит байткоду, который заново сравнит и сделает всю работу.
++fn set_texture_at<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let index = match activation.local_register(1) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let resource = activation.local_register(2);
++
++    let slots = device_slots(activation, this)?;
++    let state = this.get_slot(slots.render_state).as_object()?;
++    let element = shadow_element(state, slots.textures, index)?;
++    if shadow_equals(resource, element)? {
++        return Some(Value::Undefined);
++    }
++    None
++}
++
++/// `Device.setVertexBufferAt` — та же обёртка для вершинных потоков: буфер, смещение и формат
++/// сравниваются с теневыми наборами, совпадение всех трёх значит «ничего не делать».
++fn set_vertex_buffer_at<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let index = match activation.local_register(1) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let buffer = activation.local_register(2);
++    let offset = activation.local_register(3);
++    let format = activation.local_register(4);
++
++    let slots = device_slots(activation, this)?;
++    let state = this.get_slot(slots.render_state).as_object()?;
++    let same_buffer = shadow_equals(
++        buffer,
++        shadow_element(state, slots.vertex_buffers, index)?,
++    )?;
++    let same_offset = shadow_equals(
++        offset,
++        shadow_element(state, slots.vertex_buffers_offsets, index)?,
++    )?;
++    let same_format = shadow_equals(
++        format,
++        shadow_element(state, slots.vertex_buffers_formats, index)?,
++    )?;
++    if same_buffer && same_offset && same_format {
++        return Some(Value::Undefined);
++    }
++    None
++}
++
+ /// Ключ кэша — таблица методов класса `Object3D`, а не экземпляра: метод вызывают на наследниках,
+ /// и ключ по экземпляру вымывал бы кэш на каждом чередовании классов. Номера унаследованных слотов
+ /// у всех наследников общие, потому что таблица наследника продолжает таблицу предка.
+-- 
+2.51.1.windows.1
+

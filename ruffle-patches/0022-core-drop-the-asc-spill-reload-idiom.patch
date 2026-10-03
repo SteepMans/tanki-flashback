@@ -1,0 +1,130 @@
+From af4bf222d455fb9108d7cd7b99c8e8fe8ff24edb Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 20:24:36 +0300
+Subject: [PATCH] core: drop the ASC spill-reload idiom around call sites
+
+---
+ core/src/avm2/optimizer/peephole.rs | 96 ++++++++++++++++++++++++++++-
+ 1 file changed, 95 insertions(+), 1 deletion(-)
+
+diff --git a/core/src/avm2/optimizer/peephole.rs b/core/src/avm2/optimizer/peephole.rs
+index 957cdb1d..959c7c1a 100644
+--- a/core/src/avm2/optimizer/peephole.rs
++++ b/core/src/avm2/optimizer/peephole.rs
+@@ -1,7 +1,7 @@
+ use crate::avm2::op::Op;
+ 
+ use std::cell::Cell;
+-use std::collections::HashSet;
++use std::collections::{HashMap, HashSet};
+ 
+ /// A peephole optimizer to run before type-aware optimizations. This should be
+ /// called once on the entire code slice.
+@@ -56,6 +56,10 @@ pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<
+         }
+     }
+ 
++    if crate::avm2::method_stats::fusion_enabled() {
++        remove_spill_reload(ops, jump_targets);
++    }
++
+     // Now actually run the main peephole optimizer.
+     let fusion_enabled = crate::avm2::method_stats::fusion_enabled();
+     let mut last_op: Option<&'a Cell<Op<'_>>> = None;
+@@ -207,3 +211,93 @@ pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<
+         }
+     }
+ }
++
++/// Компилятор ActionScript (ASC) вокруг вызовов оставляет характерный мусор: значения со стека
++/// раскладываются по временным локальным переменным и тут же читаются обратно в том же порядке.
++///
++///     setlocal 21; setlocal 20; setlocal 17; setlocal 19
++///     getlocal 19; getlocal 17; getlocal 20; getlocal 21
++///
++/// Стек после этого ровно такой же, каким был до. Восемь инструкций впустую на каждый такой вызов,
++/// а в коде физики клиента их сотни. Если каждая из этих переменных во всём методе больше нигде не
++/// встречается (одна запись и одно чтение — те самые), пару можно выбросить целиком.
++fn remove_spill_reload(ops: &[Cell<Op<'_>>], jump_targets: &HashSet<usize>) {
++    // Сколько раз каждая локальная переменная читается и пишется во всём методе.
++    let mut reads: HashMap<u32, u32> = HashMap::new();
++    let mut writes: HashMap<u32, u32> = HashMap::new();
++    for op in ops {
++        match op.get() {
++            Op::GetLocal { index } => *reads.entry(index).or_default() += 1,
++            Op::GetLocal2 { first, second } => {
++                *reads.entry(first).or_default() += 1;
++                *reads.entry(second).or_default() += 1;
++            }
++            Op::GetLocalSlot { local_index, .. } | Op::MultiplyLocalSlot { local_index, .. } => {
++                *reads.entry(local_index).or_default() += 1;
++            }
++            Op::SetLocal { index } | Op::StoreLocal { index } | Op::Kill { index } => {
++                *writes.entry(index).or_default() += 1;
++            }
++            Op::IncLocal { index }
++            | Op::IncLocalI { index }
++            | Op::DecLocal { index }
++            | Op::DecLocalI { index } => {
++                *reads.entry(index).or_default() += 1;
++                *writes.entry(index).or_default() += 1;
++            }
++            Op::HasNext2 {
++                object_register,
++                index_register,
++            } => {
++                for index in [object_register, index_register] {
++                    *reads.entry(index).or_default() += 1;
++                    *writes.entry(index).or_default() += 1;
++                }
++            }
++            Op::Debug {
++                is_local_register: true,
++                register,
++                ..
++            } => *reads.entry(register as u32).or_default() += 1,
++            _ => {}
++        }
++    }
++
++    let single_use = |index: u32| {
++        reads.get(&index).copied().unwrap_or(0) == 1 && writes.get(&index).copied().unwrap_or(0) == 1
++    };
++
++    let mut i = 0;
++    while i < ops.len() {
++        // Собираем подряд идущие setlocal, не переступая через цели переходов.
++        let mut stored = Vec::new();
++        let mut j = i;
++        while j < ops.len() && (j == i || !jump_targets.contains(&j)) {
++            match ops[j].get() {
++                Op::SetLocal { index } if single_use(index) && !stored.contains(&index) => {
++                    stored.push(index);
++                    j += 1;
++                }
++                _ => break,
++            }
++        }
++
++        // Дальше должны идти ровно те же переменные в обратном порядке — тогда стек не изменился.
++        let mirrored = stored.len() >= 2
++            && stored.iter().rev().enumerate().all(|(k, index)| {
++                let at = j + k;
++                at < ops.len()
++                    && !jump_targets.contains(&at)
++                    && matches!(ops[at].get(), Op::GetLocal { index: got } if got == *index)
++            });
++
++        if mirrored {
++            for op in ops.iter().take(j + stored.len()).skip(i) {
++                op.set(Op::Nop);
++            }
++            i = j + stored.len();
++        } else {
++            i = if j > i { j } else { i + 1 };
++        }
++    }
++}
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,612 @@
+From 12f2fc0c5dcb42ef1728795da8ecf0e3758df192 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 18:46:00 +0300
+Subject: [PATCH] core: compute the occluder branch of scene culling natively
+
+---
+ core/src/avm2/activation.rs |  10 +-
+ core/src/avm2/fast_paths.rs | 395 +++++++++++++++++++++++-------------
+ 2 files changed, 260 insertions(+), 145 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index adc335a8..09985d1e 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -656,7 +656,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             if crate::avm2::method_stats::validate_native_paths() {
+                 return self.run_actions_validating(method, native);
+             }
+-            if let Some(result) = crate::avm2::fast_paths::run(self, native) {
++            if let Some(result) = crate::avm2::fast_paths::run(self, native, method) {
+                 return Ok(result);
+             }
+         }
+@@ -681,11 +681,11 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+ 
+         // Снимок того, что метод перезапишет: у методов без возвращаемого значения сверять больше
+         // нечего, а байткоду нужен тот же вход, что был у нативного счёта.
+-        let before = crate::avm2::fast_paths::snapshot(self, native);
+-        let Some(result) = crate::avm2::fast_paths::run(self, native) else {
++        let before = crate::avm2::fast_paths::snapshot(self, native, method);
++        let Some(result) = crate::avm2::fast_paths::run(self, native, method) else {
+             return self.run_actions_inner(method, &mut executed_ops);
+         };
+-        let native_wrote = crate::avm2::fast_paths::snapshot(self, native);
++        let native_wrote = crate::avm2::fast_paths::snapshot(self, native, method);
+         if let Some(before) = &before {
+             before.restore(self.gc());
+         }
+@@ -696,7 +696,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         };
+ 
+         if let Some(native_wrote) = &native_wrote {
+-            if let Some(bytecode_wrote) = crate::avm2::fast_paths::snapshot(self, native)
++            if let Some(bytecode_wrote) = crate::avm2::fast_paths::snapshot(self, native, method)
+                 && let Some((at, mine, theirs)) = native_wrote.mismatch(&bytecode_wrote)
+             {
+                 tracing::warn!(
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 96a55df4..03dadaef 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -23,13 +23,14 @@
+ //! Отключается со страницы: `window.ruffleNoNativePaths = true` — так можно сравнить «до/после» на
+ //! одной сборке; `window.ruffleValidateNative = true` считает обоими путями и сверяет ответы.
+ 
+-use std::cell::RefCell;
++use std::cell::{Cell, RefCell};
+ 
+ use gc_arena::Mutation;
+ 
+ use crate::avm2::activation::Activation;
++use crate::avm2::method::Method;
+ use crate::avm2::multiname::Multiname;
+-use crate::avm2::object::{Object, TObject};
++use crate::avm2::object::{ClassObject, Object, TObject};
+ use crate::avm2::property::Property;
+ use crate::avm2::value::Value;
+ use crate::string::AvmString;
+@@ -85,12 +86,16 @@ struct CullingSlots {
+     matrix: [usize; 12],
+     /// Статическое поле класса со списком вершин габаритного ящика.
+     bound_vertex_list: usize,
+-    /// occludedAll, numOccluders на камере
++    /// occludedAll, numOccluders, occluders на камере
+     occluded_all: usize,
+     num_occluders: usize,
++    occluders: usize,
+     /// nearClipping, farClipping на камере
+     near: usize,
+     far: usize,
++    /// culling самого объекта: метод дописывает в него итог, и для вызова из `Camera3D` это
++    /// единственный результат — там `cullingInCamera` вызывают как void.
++    culling: usize,
+     /// x, y, z вершины
+     vertex: [usize; 3],
+     /// cameraX, cameraY, cameraZ вершины
+@@ -100,8 +105,13 @@ struct CullingSlots {
+ }
+ 
+ thread_local! {
+-    /// Разбор слотов делается один раз за сессию: классы движка не меняются на ходу.
+-    static SLOTS: RefCell<Option<Option<CullingSlots>>> = const { RefCell::new(None) };
++    /// Запоминается только удачный разбор, и вместе с таблицей методов класса `Object3D`: если бы
++    /// запоминалась неудача, одна осечка на первом же вызове (статический список вершин ещё не
++    /// создан) выключила бы замену до конца сессии.
++    static SLOTS: RefCell<Option<(u32, CullingSlots)>> = const { RefCell::new(None) };
++    /// Неудача из-за не найденного имени поля — навсегда: имена полей на ходу не появляются, а
++    /// перебирать их заново на каждом вызове дороже самого метода.
++    static SLOTS_HOPELESS: Cell<bool> = const { Cell::new(false) };
+ }
+ 
+ /// Номер слота свойства по имени. `None` — свойства нет или это не слот (например, геттер): тогда
+@@ -133,27 +143,33 @@ fn slot_of<'gc>(
+     }
+ }
+ 
++/// Разбирает номера слотов. `Err(true)` — неудача окончательная (нет такого имени поля),
++/// `Err(false)` — временная (поле объекта ещё не заполнено), её запоминать нельзя.
+ fn resolve_slots<'gc>(
+     activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
+     object: Object<'gc>,
+     camera: Object<'gc>,
+-) -> Option<CullingSlots> {
+-    // Список вершин лежит статическим полем класса, поэтому нужен объект самого класса.
+-    let class_object = object.instance_class().class_object()?;
+-    let vertex_list = class_object.get_slot(slot_of(
+-        activation,
+-        class_object.into(),
+-        "boundVertexList",
+-        true,
+-    )?);
+-    let vertex = vertex_list.as_object()?;
++) -> Result<CullingSlots, bool> {
++    let named = |activation: &mut Activation<'_, 'gc>, object, name, engine| {
++        slot_of(activation, object, name, engine).ok_or(true)
++    };
++
++    // Список вершин лежит статическим полем класса `Object3D`. Именно `Object3D`: статические
++    // поля в таблицу наследника не попадают, а `cullingInCamera` вызывают на наследниках (Mesh,
++    // KDContainer), поэтому объект класса берётся у метода, а не у экземпляра.
++    let bound_vertex_list = named(activation, class_object.into(), "boundVertexList", true)?;
++    let vertex = class_object
++        .get_slot(bound_vertex_list)
++        .as_object()
++        .ok_or(false)?;
+ 
+     let bound_names = [
+         "boundMinX", "boundMinY", "boundMinZ", "boundMaxX", "boundMaxY", "boundMaxZ",
+     ];
+     let mut bound = [0usize; 6];
+     for (at, name) in bound_names.iter().enumerate() {
+-        bound[at] = slot_of(activation, object, name, false)?;
++        bound[at] = named(activation, object, name, false)?;
+     }
+ 
+     let matrix_names = [
+@@ -161,31 +177,65 @@ fn resolve_slots<'gc>(
+     ];
+     let mut matrix = [0usize; 12];
+     for (at, name) in matrix_names.iter().enumerate() {
+-        matrix[at] = slot_of(activation, object, name, true)?;
++        matrix[at] = named(activation, object, name, true)?;
+     }
+ 
+-    Some(CullingSlots {
++    Ok(CullingSlots {
+         bound,
+         matrix,
+-        bound_vertex_list: slot_of(activation, class_object.into(), "boundVertexList", true)?,
+-        occluded_all: slot_of(activation, camera, "occludedAll", true)?,
+-        num_occluders: slot_of(activation, camera, "numOccluders", true)?,
+-        near: slot_of(activation, camera, "nearClipping", false)?,
+-        far: slot_of(activation, camera, "farClipping", false)?,
++        bound_vertex_list,
++        occluded_all: named(activation, camera, "occludedAll", true)?,
++        num_occluders: named(activation, camera, "numOccluders", true)?,
++        occluders: named(activation, camera, "occluders", true)?,
++        near: named(activation, camera, "nearClipping", false)?,
++        far: named(activation, camera, "farClipping", false)?,
++        culling: named(activation, object, "culling", true)?,
+         vertex: [
+-            slot_of(activation, vertex, "x", false)?,
+-            slot_of(activation, vertex, "y", false)?,
+-            slot_of(activation, vertex, "z", false)?,
++            named(activation, vertex, "x", false)?,
++            named(activation, vertex, "y", false)?,
++            named(activation, vertex, "z", false)?,
+         ],
+         vertex_camera: [
+-            slot_of(activation, vertex, "cameraX", true)?,
+-            slot_of(activation, vertex, "cameraY", true)?,
+-            slot_of(activation, vertex, "cameraZ", true)?,
++            named(activation, vertex, "cameraX", true)?,
++            named(activation, vertex, "cameraY", true)?,
++            named(activation, vertex, "cameraZ", true)?,
+         ],
+-        vertex_next: slot_of(activation, vertex, "next", true)?,
++        vertex_next: named(activation, vertex, "next", true)?,
+     })
+ }
+ 
++/// Номера слотов отсечения: разбираются один раз и запоминаются вместе с таблицей методов класса
++/// `Object3D` — если движок окажется загружен вторым экземпляром, номера у него будут свои.
++fn culling_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
++    object: Object<'gc>,
++    camera: Object<'gc>,
++) -> Option<CullingSlots> {
++    let key = class_object.vtable().id();
++    if let Some((known, slots)) = SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if SLOTS_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    match resolve_slots(activation, class_object, object, camera) {
++        Ok(slots) => {
++            SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++            Some(slots)
++        }
++        Err(hopeless) => {
++            if hopeless {
++                SLOTS_HOPELESS.with(|flag| flag.set(true));
++            }
++            None
++        }
++    }
++}
++
+ /// Прочитать числовое поле. `None` — значение не числовое: тогда нативный путь уступает байткоду.
+ fn get<'gc>(_activation: &mut Activation<'_, 'gc>, object: Object<'gc>, slot: usize) -> Option<f64> {
+     object.get_slot(slot).try_as_f64()
+@@ -197,8 +247,11 @@ fn set<'gc>(object: Object<'gc>, slot: usize, value: f64, mc: &Mutation<'gc>) {
+ }
+ 
+ thread_local! {
+-    /// Слоты матричных полей ищутся один раз, как и для отсечения.
+-    static MATRIX_SLOTS: RefCell<Option<Option<MatrixSlots>>> = const { RefCell::new(None) };
++    /// Слоты матричных полей ищутся один раз, как и для отсечения, и запоминается только удача:
++    /// запомненная неудача первого вызова выключила бы замену до конца сессии.
++    static MATRIX_SLOTS: RefCell<Option<(u32, MatrixSlots)>> = const { RefCell::new(None) };
++    /// Не найденное имя поля не появится, поэтому такой разбор больше не повторяется.
++    static MATRIX_HOPELESS: Cell<bool> = const { Cell::new(false) };
+ }
+ 
+ /// Номера слотов матричных полей объекта сцены. Имена полей повторяют имена в движке (`ma`,
+@@ -611,20 +664,21 @@ impl<'gc> Snapshot<'gc> {
+ /// сцены сверяется по возвращённому числу) или слоты не разобрались.
+ pub fn snapshot<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+-    method: NativeMethod,
++    native: NativeMethod,
++    method: Method<'gc>,
+ ) -> Option<Snapshot<'gc>> {
+     // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
+     // делается один раз за сессию и на чужом объекте запомнил бы неудачу навсегда.
+     if !matches!(
+-        method,
++        native,
+         NativeMethod::ComposeAndAppend | NativeMethod::CalculateInverseMatrix
+     ) {
+         return None;
+     }
+ 
+     let object = activation.local_register(0).as_object()?;
+-    let slots = matrix_slots(activation, object)?;
+-    let slots = match method {
++    let slots = matrix_slots(activation, declaring_class(method)?, object)?;
++    let slots = match native {
+         NativeMethod::CullingInCamera
+         | NativeMethod::BoxBoxOverlapOnAxis
+         | NativeMethod::BoxRectOverlapOnAxis => return None,
+@@ -669,30 +723,38 @@ pub fn snapshot<'gc>(
+     })
+ }
+ 
++/// Объект класса, в котором объявлен выполняемый метод. Нужен ради статических полей движка
++/// (`boundVertexList`): в таблицу класса-наследника они не попадают, а метод вызывают как раз на
++/// наследниках, поэтому брать объект класса у экземпляра нельзя.
++fn declaring_class<'gc>(method: Method<'gc>) -> Option<ClassObject<'gc>> {
++    method.bound_class()?.class_object()
++}
++
+ /// Точка входа: считает узнанный метод нативно. `None` — случай не покрыт.
+ pub fn run<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+-    method: NativeMethod,
++    native: NativeMethod,
++    method: Method<'gc>,
+ ) -> Option<Value<'gc>> {
+-    match method {
++    match native {
+         NativeMethod::BoxBoxOverlapOnAxis => {
+             get_overlap_on_axis(activation, 0, 3).ok().map(Value::Number)
+         }
+         NativeMethod::BoxRectOverlapOnAxis => {
+             get_overlap_on_axis(activation, 1, 2).ok().map(Value::Number)
+         }
+-        NativeMethod::CullingInCamera => culling_in_camera(activation),
++        NativeMethod::CullingInCamera => culling_in_camera(activation, declaring_class(method)?),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+-            let slots = matrix_slots(activation, this)?;
++            let slots = matrix_slots(activation, declaring_class(method)?, this)?;
+             let mc = activation.gc();
+             compose_and_append(activation, this, parent, &slots, mc)?;
+             Some(Value::Undefined)
+         }
+         NativeMethod::CalculateInverseMatrix => {
+             let this = activation.local_register(0).as_object()?;
+-            let slots = matrix_slots(activation, this)?;
++            let slots = matrix_slots(activation, declaring_class(method)?, this)?;
+             let mc = activation.gc();
+             calculate_inverse_matrix(activation, this, &slots, mc)?;
+             Some(Value::Undefined)
+@@ -700,17 +762,35 @@ pub fn run<'gc>(
+     }
+ }
+ 
++/// Ключ кэша — таблица методов класса `Object3D`, а не экземпляра: метод вызывают на наследниках,
++/// и ключ по экземпляру вымывал бы кэш на каждом чередовании классов. Номера унаследованных слотов
++/// у всех наследников общие, потому что таблица наследника продолжает таблицу предка.
+ fn matrix_slots<'gc>(
+     activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
+     object: Object<'gc>,
+ ) -> Option<MatrixSlots> {
+-    MATRIX_SLOTS.with(|cache| {
+-        let mut cache = cache.borrow_mut();
+-        if cache.is_none() {
+-            *cache = Some(resolve_matrix_slots(activation, object));
++    let key = class_object.vtable().id();
++    if let Some((known, slots)) = MATRIX_SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if MATRIX_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    match resolve_matrix_slots(activation, object) {
++        Some(slots) => {
++            MATRIX_SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++            Some(slots)
+         }
+-        *cache.as_ref().expect("только что заполнено")
+-    })
++        None => {
++            // Разбор матричных полей опирается только на имена, поэтому неудача окончательна.
++            MATRIX_HOPELESS.with(|flag| flag.set(true));
++            None
++        }
++    }
+ }
+ 
+ /// Один угол габаритного ящика: какие из шести граничных значений брать.
+@@ -725,29 +805,35 @@ const CORNERS: [[usize; 3]; 8] = [
+     [3, 4, 5], // max, max, max
+ ];
+ 
+-/// Проверка одной плоскости по всем вершинам: снаружи ли объект целиком, внутри ли целиком.
+-/// `inside` повторяет сравнение из байткода буквально, включая поведение на NaN: там стоят
+-/// `ifngt`/`ifnlt`, то есть «не больше» и «не меньше», и любое сравнение с NaN уводит в ветку
+-/// «позади плоскости».
+-fn plane_test(vertices: &[(f64, f64, f64)], inside: impl Fn(f64, f64, f64) -> bool) -> (bool, bool) {
+-    let mut in_front = false;
+-    let mut behind = false;
+-    for &(x, y, z) in vertices {
+-        if inside(x, y, z) {
+-            in_front = true;
+-        } else {
+-            behind = true;
+-        }
+-        if in_front && behind {
+-            break;
+-        }
++/// Шесть плоскостей пирамиды видимости: проверяемый бит и маска, которой байткод этот бит гасит.
++/// Маски выписаны числами из байткода (`pushbyte 62` и далее), а не как `!bit`: так итог совпадает
++/// с байткодом даже если во входной маске окажутся биты старше шестого.
++const PLANES: [(i32, i32); 6] = [(1, 62), (2, 61), (4, 59), (8, 55), (16, 47), (32, 31)];
++
++/// Внутри ли вершина относительно плоскости `plane`. Сравнения повторяют байткод буквально,
++/// включая поведение на NaN: там стоят `ifngt`/`ifnlt`, то есть «не больше» и «не меньше», и любое
++/// сравнение с NaN уводит в ветку «позади плоскости».
++#[inline(always)]
++fn inside_plane(plane: usize, x: f64, y: f64, z: f64, near: f64, far: f64) -> bool {
++    match plane {
++        0 => z > near,
++        1 => z < far,
++        2 => -x < z,
++        3 => x < z,
++        4 => -y < z,
++        _ => y < z,
+     }
+-    (in_front, behind)
+ }
+ 
+ /// Нативная замена `Object3D.cullingInCamera`. `None` — случай не покрыт, считать должен
+ /// интерпретатор.
+-pub fn culling_in_camera<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++///
++/// Ветка окклюдеров (в бою на карте с домами она есть всегда) считается здесь же: раньше на
++/// `numOccluders > 0` замена уступала байткоду, то есть в настоящей игре не работала ни разу.
++pub fn culling_in_camera<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
++) -> Option<Value<'gc>> {
+     let object = activation.local_register(0).as_object()?;
+     let camera = activation.local_register(1).as_object()?;
+     let mut culling = match activation.local_register(2) {
+@@ -755,97 +841,126 @@ pub fn culling_in_camera<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Va
+         _ => return None,
+     };
+ 
+-    let slots = SLOTS.with(|cache| {
+-        let mut cache = cache.borrow_mut();
+-        if cache.is_none() {
+-            *cache = Some(resolve_slots(activation, object, camera));
+-        }
+-        *cache.as_ref().expect("только что заполнено")
+-    })?;
++    let slots = culling_slots(activation, class_object, object, camera)?;
+ 
+     // Камера уже сказала, что всё перекрыто.
+     if matches!(camera.get_slot(slots.occluded_all), Value::Bool(true)) {
+         return Some(Value::Integer(-1));
+     }
+ 
+-    // Окклюдеры нативно не считаем — редкий случай, пусть работает байткод.
+-    if camera.get_slot(slots.num_occluders).as_i32() > 0 {
+-        return None;
+-    }
+-
+-    if culling <= 0 {
+-        return Some(Value::Integer(culling));
+-    }
+-
+-    // Габариты и матрица перевода в координаты камеры.
+-    let mut bound = [0.0f64; 6];
+-    for (at, slot) in slots.bound.iter().enumerate() {
+-        bound[at] = object.get_slot(*slot).try_as_f64()?;
+-    }
+-    let mut matrix = [0.0f64; 12];
+-    for (at, slot) in slots.matrix.iter().enumerate() {
+-        matrix[at] = object.get_slot(*slot).try_as_f64()?;
+-    }
+-
+-    let class_object = object.instance_class().class_object()?;
+-    let mut vertex = class_object
+-        .get_slot(slots.bound_vertex_list)
+-        .as_object()?;
++    let num_occluders = match camera.get_slot(slots.num_occluders) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
+ 
+-    // Заливаем восемь углов и сразу переводим их в координаты камеры — ровно как в байткоде,
+-    // включая запись обратно в общий список вершин: движок читает его дальше.
+     let mc: &Mutation<'gc> = activation.gc();
+-    let mut camera_space = Vec::with_capacity(8);
+-    for corner in CORNERS.iter() {
+-        let (x, y, z) = (bound[corner[0]], bound[corner[1]], bound[corner[2]]);
+-        vertex.set_slot_no_coerce(slots.vertex[0], Value::Number(x), mc);
+-        vertex.set_slot_no_coerce(slots.vertex[1], Value::Number(y), mc);
+-        vertex.set_slot_no_coerce(slots.vertex[2], Value::Number(z), mc);
+-
+-        let cx = matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3];
+-        let cy = matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7];
+-        let cz = matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11];
+-        vertex.set_slot_no_coerce(slots.vertex_camera[0], Value::Number(cx), mc);
+-        vertex.set_slot_no_coerce(slots.vertex_camera[1], Value::Number(cy), mc);
+-        vertex.set_slot_no_coerce(slots.vertex_camera[2], Value::Number(cz), mc);
+-        camera_space.push((cx, cy, cz));
+-
+-        match vertex.get_slot(slots.vertex_next).as_object() {
+-            Some(next) => vertex = next,
+-            None => break,
++    let mut camera_space = [(0.0f64, 0.0f64, 0.0f64); CORNERS.len()];
++
++    // Габаритный ящик переводится в координаты камеры, только если он кому-то нужен: пирамиде
++    // видимости или окклюдерам. Так же устроено и в байткоде.
++    if culling > 0 || num_occluders > 0 {
++        let mut bound = [0.0f64; 6];
++        for (at, slot) in slots.bound.iter().enumerate() {
++            bound[at] = object.get_slot(*slot).try_as_f64()?;
++        }
++        let mut matrix = [0.0f64; 12];
++        for (at, slot) in slots.matrix.iter().enumerate() {
++            matrix[at] = object.get_slot(*slot).try_as_f64()?;
+         }
+-    }
+ 
+-    // Список вершин оказался короче восьми — значит это не тот габаритный ящик, что мы ждём.
+-    if camera_space.len() != CORNERS.len() {
+-        return None;
++        let mut vertex = class_object.get_slot(slots.bound_vertex_list).as_object()?;
++
++        // Заливаем восемь углов и сразу переводим их в координаты камеры — ровно как в байткоде,
++        // включая запись обратно в общий список вершин: движок читает его дальше.
++        for (at, corner) in CORNERS.iter().enumerate() {
++            let (x, y, z) = (bound[corner[0]], bound[corner[1]], bound[corner[2]]);
++            vertex.set_slot_no_coerce(slots.vertex[0], Value::Number(x), mc);
++            vertex.set_slot_no_coerce(slots.vertex[1], Value::Number(y), mc);
++            vertex.set_slot_no_coerce(slots.vertex[2], Value::Number(z), mc);
++
++            let cx = matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3];
++            let cy = matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7];
++            let cz = matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11];
++            vertex.set_slot_no_coerce(slots.vertex_camera[0], Value::Number(cx), mc);
++            vertex.set_slot_no_coerce(slots.vertex_camera[1], Value::Number(cy), mc);
++            vertex.set_slot_no_coerce(slots.vertex_camera[2], Value::Number(cz), mc);
++            camera_space[at] = (cx, cy, cz);
++
++            let next = vertex.get_slot(slots.vertex_next);
++            if at + 1 == CORNERS.len() {
++                // Байткод переводит в координаты камеры ВЕСЬ список, а заливает только восемь
++                // углов. Совпадение гарантировано, лишь пока в списке ровно восемь вершин.
++                if next.as_object().is_some() {
++                    return None;
++                }
++            } else {
++                vertex = next.as_object()?;
++            }
++        }
+     }
+ 
+-    let near = camera.get_slot(slots.near).try_as_f64()?;
+-    let far = camera.get_slot(slots.far).try_as_f64()?;
+-
+-    // Шесть плоскостей: ближняя, дальняя и четыре боковых. Маски совпадают с байткодом.
+-    let planes: [(i32, Box<dyn Fn(f64, f64, f64) -> bool>); 6] = [
+-        (1, Box::new(move |_x, _y, z| z > near)),
+-        (2, Box::new(move |_x, _y, z| z < far)),
+-        (4, Box::new(|x, _y, z| -x < z)),
+-        (8, Box::new(|x, _y, z| x < z)),
+-        (16, Box::new(|_x, y, z| -y < z)),
+-        (32, Box::new(|_x, y, z| y < z)),
+-    ];
++    if culling > 0 {
++        let near = camera.get_slot(slots.near).try_as_f64()?;
++        let far = camera.get_slot(slots.far).try_as_f64()?;
+ 
+-    for (bit, inside) in planes.iter() {
+-        if culling & bit == 0 {
+-            continue;
+-        }
+-        let (in_front, behind) = plane_test(&camera_space, inside);
+-        if !in_front {
+-            return Some(Value::Integer(-1));
++        for (plane, (bit, keep)) in PLANES.iter().enumerate() {
++            if culling & bit == 0 {
++                continue;
++            }
++            let mut in_front = false;
++            let mut behind = false;
++            for &(x, y, z) in camera_space.iter() {
++                if inside_plane(plane, x, y, z, near, far) {
++                    in_front = true;
++                } else {
++                    behind = true;
++                }
++                if in_front && behind {
++                    break;
++                }
++            }
++            if !behind {
++                // Ящик целиком внутри плоскости — детей по ней проверять больше незачем.
++                culling &= keep;
++            } else if !in_front {
++                return Some(Value::Integer(-1));
++            }
+         }
+-        if !behind {
+-            culling &= !bit;
++    }
++
++    // Окклюдеры. Каждый окклюдер — список плоскостей (вершина хранит нормаль в координатах
++    // камеры). Объект скрыт этим окклюдером, если ни одна его плоскость не оставила ни одного угла
++    // ящика с неотрицательным скалярным произведением.
++    if num_occluders > 0 {
++        let occluders = camera.get_slot(slots.occluders).as_object()?;
++        for index in 0..num_occluders {
++            let mut plane = occluders
++                .as_vector_storage()?
++                .get_optional(index as usize)?;
++            let mut occluded = true;
++            while let Some(normal) = plane.as_object() {
++                let nx = normal.get_slot(slots.vertex_camera[0]).try_as_f64()?;
++                let ny = normal.get_slot(slots.vertex_camera[1]).try_as_f64()?;
++                let nz = normal.get_slot(slots.vertex_camera[2]).try_as_f64()?;
++
++                // `ifge` в байткоде: на NaN переход не делается, то есть угол считается отсечённым.
++                let visible = camera_space
++                    .iter()
++                    .any(|&(x, y, z)| nx * x + ny * y + nz * z >= 0.0);
++                if visible {
++                    occluded = false;
++                    break;
++                }
++                plane = normal.get_slot(slots.vertex_next);
++            }
++            if occluded {
++                return Some(Value::Integer(-1));
++            }
+         }
+     }
+ 
++    // Итог записывается в поле объекта: из `Camera3D` метод вызывают как void, и для корня сцены
++    // это единственный его результат. Ранние выходы с -1 поле не трогают — так же, как в байткоде.
++    object.set_slot_no_coerce(slots.culling, Value::Integer(culling), mc);
+     Some(Value::Integer(culling))
+ }
+-- 
+2.51.1.windows.1
+

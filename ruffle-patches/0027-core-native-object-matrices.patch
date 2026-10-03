@@ -1,0 +1,632 @@
+From 4d4facf6b7200a46848fb9ffd80f465c4a3398e1 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 14:06:59 +0300
+Subject: [PATCH] core: compute the object matrices natively as well as the
+ culling
+
+---
+ core/src/avm2/activation.rs   |  75 +++++--
+ core/src/avm2/fast_paths.rs   | 357 ++++++++++++++++++++++++++++++++--
+ core/src/avm2/method_stats.rs |  25 +--
+ core/src/avm2/verify.rs       |  43 ++--
+ web/src/lib.rs                |   8 +-
+ 5 files changed, 438 insertions(+), 70 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index a0537422..cc4af9ca 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -646,28 +646,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+     /// методе (вложенные вызовы копят в своих счётчиках). По этим числам видно, какой код игры
+     /// съедает кадр — в профиле браузера весь ActionScript выглядит одной функцией run_actions.
+     pub fn run_actions(&mut self, method: Method<'gc>) -> Result<Value<'gc>, Error<'gc>> {
+-        // Отсечение сцены — четверть всей работы клиента за кадр. Если метод узнан, считаем его
+-        // нативно; на любом непокрытом случае функция вернёт None и отработает интерпретатор.
+-        if method.get_verified_info().native_culling
+-            && crate::avm2::method_stats::native_culling_enabled()
++        // Отсечение сцены и матрицы объектов — треть всей работы клиента за кадр. Если метод
++        // узнан, считаем его нативно; на любом непокрытом случае функция вернёт None и отработает
++        // интерпретатор.
++        if let Some(native) = method.get_verified_info().native_method
++            && crate::avm2::method_stats::native_paths_enabled()
+         {
+-            let native = crate::avm2::fast_paths::culling_in_camera(self);
+-            if let Some(result) = native {
+-                // Режим сверки: считаем и нативно, и байткодом, и сравниваем ответы.
+-                if crate::avm2::method_stats::validate_culling() {
+-                    let mut ops = 0u64;
+-                    let interpreted = self.run_actions_inner(method, &mut ops);
+-                    if let Ok(interpreted) = &interpreted
+-                        && interpreted.as_i32() != result.as_i32()
+-                    {
+-                        tracing::warn!(
+-                            "culling mismatch: нативно {}, байткодом {}",
+-                            result.as_i32(),
+-                            interpreted.as_i32()
+-                        );
+-                    }
+-                    return interpreted;
+-                }
++            if crate::avm2::method_stats::validate_native_paths() {
++                return self.run_actions_validating(method, native);
++            }
++            if let Some(result) = crate::avm2::fast_paths::run(self, native) {
+                 return Ok(result);
+             }
+         }
+@@ -680,6 +668,51 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         result
+     }
+ 
++    /// Режим сверки: метод считается и нативно, и байткодом с одного и того же входа, ответы
++    /// сравниваются, а игре отдаётся ответ байткода. Так совпадение доказывается на живой сцене,
++    /// а не берётся на веру. Медленно — включается только вручную со страницы.
++    fn run_actions_validating(
++        &mut self,
++        method: Method<'gc>,
++        native: crate::avm2::fast_paths::NativeMethod,
++    ) -> Result<Value<'gc>, Error<'gc>> {
++        let mut executed_ops = 0u64;
++
++        // Снимок того, что метод перезапишет: у методов без возвращаемого значения сверять больше
++        // нечего, а байткоду нужен тот же вход, что был у нативного счёта.
++        let before = crate::avm2::fast_paths::snapshot(self, native);
++        let Some(result) = crate::avm2::fast_paths::run(self, native) else {
++            return self.run_actions_inner(method, &mut executed_ops);
++        };
++        let native_wrote = crate::avm2::fast_paths::snapshot(self, native);
++        if let Some(before) = &before {
++            before.restore(self.gc());
++        }
++
++        let interpreted = self.run_actions_inner(method, &mut executed_ops);
++        let Ok(interpreted) = &interpreted else {
++            return interpreted;
++        };
++
++        if let Some(native_wrote) = &native_wrote {
++            if let Some(bytecode_wrote) = crate::avm2::fast_paths::snapshot(self, native)
++                && let Some((at, mine, theirs)) = native_wrote.mismatch(&bytecode_wrote)
++            {
++                tracing::warn!(
++                    "native mismatch: {native:?}, поле {at}: нативно {mine}, байткодом {theirs}"
++                );
++            }
++        } else if interpreted.as_i32() != result.as_i32() {
++            tracing::warn!(
++                "native mismatch: {native:?}, нативно {}, байткодом {}",
++                result.as_i32(),
++                interpreted.as_i32()
++            );
++        }
++
++        Ok(*interpreted)
++    }
++
+     fn run_actions_inner(
+         &mut self,
+         method: Method<'gc>,
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index a148a434..112b3e93 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -1,18 +1,27 @@
+ //! Нативные замены самых горячих методов игры.
+ //!
+-//! Счётчик горячих методов показал, что кадр танкового клиента на четверть состоит из одного
+-//! метода движка Alternativa3D — `Object3D.cullingInCamera`: отсечение объекта по пирамиде
+-//! видимости. Он вызывается для каждого объекта сцены каждый кадр (порядка тысячи раз), а внутри
+-//! это 616 инструкций без единого вызова наружу: заливка восьми углов габаритного ящика, перевод
+-//! их в координаты камеры и шесть проверок плоскостей.
++//! Счётчик горячих методов показал, что кадр танкового клиента на треть состоит из трёх методов
++//! движка Alternativa3D, и все три — прямолинейная арифметика без вызовов наружу, выполняемая для
++//! каждого объекта сцены каждый кадр (порядка тысячи раз):
+ //!
+-//! Здесь тот же алгоритм выполняется нативно. Метод опознаётся по имени класса и метода, а любой
+-//! случай, который не покрыт (есть окклюдеры, поля оказались не слотами, значения не числовые),
+-//! возвращает `None` — и тогда работает обычный интерпретатор. То есть замена не может «почти
+-//! правильно» посчитать: она либо считает ровно то же, либо уступает место байткоду.
++//! * `cullingInCamera` — отсечение по пирамиде видимости: 616 инструкций, заливка восьми углов
++//!   габаритного ящика, перевод их в координаты камеры и шесть проверок плоскостей;
++//! * `composeAndAppend` — сборка матрицы объекта из поворотов, масштаба и положения с умножением
++//!   на матрицу родителя: 357 инструкций;
++//! * `calculateInverseMatrix` — обратная матрица: 374 инструкции.
+ //!
+-//! Отключается со страницы: `window.ruffleNoNativeCulling = true` — так можно сравнить «до/после»
+-//! на одной сборке.
++//! Здесь те же алгоритмы выполняются нативно. Метод опознаётся по имени класса и метода один раз
++//! при верификации, а любой случай, который не покрыт (есть окклюдеры, поля оказались не слотами,
++//! значения не числовые), возвращает `None` — и тогда работает обычный интерпретатор. То есть
++//! замена не может «почти правильно» посчитать: она либо считает ровно то же, либо уступает место
++//! байткоду.
++//!
++//! Тела двух матричных методов переведены из байткода машинно (стек операндов симулируется, из
++//! него собираются выражения), а не переписаны руками: порядок умножений и сложений в плавающей
++//! точке важен до последнего бита, и глазами его не сохранить.
++//!
++//! Отключается со страницы: `window.ruffleNoNativePaths = true` — так можно сравнить «до/после» на
++//! одной сборке; `window.ruffleValidateNative = true` считает обоими путями и сверяет ответы.
+ 
+ use std::cell::RefCell;
+ 
+@@ -28,10 +37,37 @@ use crate::string::AvmString;
+ /// Пространство имён, в котором движок держит свои внутренние поля.
+ const ENGINE_NS: &str = "http://alternativaplatform.com/en/alternativa3d";
+ 
+-/// Имя метода, который заменяем.
+-pub const CULLING_METHOD: &str = "cullingInCamera";
+-/// Имя класса, которому он принадлежит.
+-pub const CULLING_CLASS: &str = "Object3D";
++/// Класс движка, чьи методы заменяем.
++pub const ENGINE_CLASS: &str = "Object3D";
++
++/// Какой из горячих методов узнан. Разбор делается один раз при верификации, чтобы в горячем
++/// цикле осталась одна проверка.
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub enum NativeMethod {
++    /// Отсечение объекта по пирамиде видимости.
++    CullingInCamera,
++    /// Сборка матрицы объекта и умножение на родительскую.
++    ComposeAndAppend,
++    /// Обратная матрица объекта.
++    CalculateInverseMatrix,
++}
++
++impl NativeMethod {
++    /// Узнаёт метод по имени. Класс проверяется отдельно.
++    pub fn from_name(name: &str) -> Option<Self> {
++        match name {
++            "cullingInCamera" => Some(Self::CullingInCamera),
++            "composeAndAppend" => Some(Self::ComposeAndAppend),
++            "calculateInverseMatrix" => Some(Self::CalculateInverseMatrix),
++            _ => None,
++        }
++    }
++
++    /// Возвращает ли метод значение: у void-методов сверять нечего, кроме записанных полей.
++    pub fn returns_value(self) -> bool {
++        matches!(self, Self::CullingInCamera)
++    }
++}
+ 
+ /// Номера слотов, по которым лежат нужные поля. Ищутся один раз: имена одинаковы для всех
+ /// объектов класса, а поиск имени в таблице класса дороже самой арифметики.
+@@ -140,6 +176,297 @@ fn resolve_slots<'gc>(
+     })
+ }
+ 
++/// Прочитать числовое поле. `None` — значение не числовое: тогда нативный путь уступает байткоду.
++fn get<'gc>(_activation: &mut Activation<'_, 'gc>, object: Object<'gc>, slot: usize) -> Option<f64> {
++    object.get_slot(slot).try_as_f64()
++}
++
++/// Записать числовое поле.
++fn set<'gc>(object: Object<'gc>, slot: usize, value: f64, mc: &Mutation<'gc>) {
++    object.set_slot_no_coerce(slot, Value::Number(value), mc);
++}
++
++thread_local! {
++    /// Слоты матричных полей ищутся один раз, как и для отсечения.
++    static MATRIX_SLOTS: RefCell<Option<Option<MatrixSlots>>> = const { RefCell::new(None) };
++}
++
++/// Номера слотов матричных полей объекта сцены. Имена полей повторяют имена в движке (`ma`,
++/// `rotationX`), чтобы переведённый код можно было построчно сверить с байткодом.
++#[derive(Clone, Copy)]
++#[allow(non_snake_case)]
++struct MatrixSlots {
++    e_ima: usize,
++    e_imb: usize,
++    e_imc: usize,
++    e_imd: usize,
++    e_ime: usize,
++    e_imf: usize,
++    e_img: usize,
++    e_imh: usize,
++    e_imi: usize,
++    e_imj: usize,
++    e_imk: usize,
++    e_iml: usize,
++    e_ma: usize,
++    e_mb: usize,
++    e_mc: usize,
++    e_md: usize,
++    e_me: usize,
++    e_mf: usize,
++    e_mg: usize,
++    e_mh: usize,
++    e_mi: usize,
++    e_mj: usize,
++    e_mk: usize,
++    e_ml: usize,
++    p_rotationX: usize,
++    p_rotationY: usize,
++    p_rotationZ: usize,
++    p_scaleX: usize,
++    p_scaleY: usize,
++    p_scaleZ: usize,
++    p_x: usize,
++    p_y: usize,
++    p_z: usize,
++}
++
++fn resolve_matrix_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    object: Object<'gc>,
++) -> Option<MatrixSlots> {
++    Some(MatrixSlots {
++        e_ima: slot_of(activation, object, "ima", true)?,
++        e_imb: slot_of(activation, object, "imb", true)?,
++        e_imc: slot_of(activation, object, "imc", true)?,
++        e_imd: slot_of(activation, object, "imd", true)?,
++        e_ime: slot_of(activation, object, "ime", true)?,
++        e_imf: slot_of(activation, object, "imf", true)?,
++        e_img: slot_of(activation, object, "img", true)?,
++        e_imh: slot_of(activation, object, "imh", true)?,
++        e_imi: slot_of(activation, object, "imi", true)?,
++        e_imj: slot_of(activation, object, "imj", true)?,
++        e_imk: slot_of(activation, object, "imk", true)?,
++        e_iml: slot_of(activation, object, "iml", true)?,
++        e_ma: slot_of(activation, object, "ma", true)?,
++        e_mb: slot_of(activation, object, "mb", true)?,
++        e_mc: slot_of(activation, object, "mc", true)?,
++        e_md: slot_of(activation, object, "md", true)?,
++        e_me: slot_of(activation, object, "me", true)?,
++        e_mf: slot_of(activation, object, "mf", true)?,
++        e_mg: slot_of(activation, object, "mg", true)?,
++        e_mh: slot_of(activation, object, "mh", true)?,
++        e_mi: slot_of(activation, object, "mi", true)?,
++        e_mj: slot_of(activation, object, "mj", true)?,
++        e_mk: slot_of(activation, object, "mk", true)?,
++        e_ml: slot_of(activation, object, "ml", true)?,
++        p_rotationX: slot_of(activation, object, "rotationX", false)?,
++        p_rotationY: slot_of(activation, object, "rotationY", false)?,
++        p_rotationZ: slot_of(activation, object, "rotationZ", false)?,
++        p_scaleX: slot_of(activation, object, "scaleX", false)?,
++        p_scaleY: slot_of(activation, object, "scaleY", false)?,
++        p_scaleZ: slot_of(activation, object, "scaleZ", false)?,
++        p_x: slot_of(activation, object, "x", false)?,
++        p_y: slot_of(activation, object, "y", false)?,
++        p_z: slot_of(activation, object, "z", false)?,
++    })
++}
++
++/// `Object3D.composeAndAppend(parent)` — собрать матрицу объекта из поворотов, масштаба и
++/// положения и домножить на матрицу родителя. Тело переведено из байткода один в один, чтобы
++/// сохранить порядок умножений: в плавающей точке он влияет на последний бит. По той же причине
++/// скобки оставлены как есть, а не «упрощены» до читаемого вида.
++#[allow(unused_parens)]
++fn compose_and_append<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++    parent: Object<'gc>,
++    slots: &MatrixSlots,
++    mc: &Mutation<'gc>,
++) -> Option<()> {
++    let l7 = (get(activation, this, slots.p_rotationX)?).cos();
++    let l4 = (get(activation, this, slots.p_rotationX)?).sin();
++    let l3 = (get(activation, this, slots.p_rotationY)?).cos();
++    let l18 = (get(activation, this, slots.p_rotationY)?).sin();
++    let l8 = (get(activation, this, slots.p_rotationZ)?).cos();
++    let l25 = (get(activation, this, slots.p_rotationZ)?).sin();
++    let l26 = (l8 * l18);
++    let l5 = (l25 * l18);
++    let l6 = (l3 * get(activation, this, slots.p_scaleX)?);
++    let l9 = (l4 * get(activation, this, slots.p_scaleY)?);
++    let l22 = (l7 * get(activation, this, slots.p_scaleY)?);
++    let l24 = (l7 * get(activation, this, slots.p_scaleZ)?);
++    let l2 = (l4 * get(activation, this, slots.p_scaleZ)?);
++    let l10 = (l8 * l6);
++    let l11 = ((l26 * l9) - (l25 * l22));
++    let l12 = ((l26 * l24) + (l25 * l2));
++    let l13 = get(activation, this, slots.p_x)?;
++    let l14 = (l25 * l6);
++    let l15 = ((l5 * l9) + (l8 * l22));
++    let l16 = ((l5 * l24) - (l8 * l2));
++    let l17 = get(activation, this, slots.p_y)?;
++    let l19 = ((-(l18)) * get(activation, this, slots.p_scaleX)?);
++    let l20 = (l3 * l9);
++    let l21 = (l3 * l24);
++    let l23 = get(activation, this, slots.p_z)?;
++    set(this, slots.e_ma, (((get(activation, parent, slots.e_ma)? * l10) + (get(activation, parent, slots.e_mb)? * l14)) + (get(activation, parent, slots.e_mc)? * l19)), mc);
++    set(this, slots.e_mb, (((get(activation, parent, slots.e_ma)? * l11) + (get(activation, parent, slots.e_mb)? * l15)) + (get(activation, parent, slots.e_mc)? * l20)), mc);
++    set(this, slots.e_mc, (((get(activation, parent, slots.e_ma)? * l12) + (get(activation, parent, slots.e_mb)? * l16)) + (get(activation, parent, slots.e_mc)? * l21)), mc);
++    set(this, slots.e_md, ((((get(activation, parent, slots.e_ma)? * l13) + (get(activation, parent, slots.e_mb)? * l17)) + (get(activation, parent, slots.e_mc)? * l23)) + get(activation, parent, slots.e_md)?), mc);
++    set(this, slots.e_me, (((get(activation, parent, slots.e_me)? * l10) + (get(activation, parent, slots.e_mf)? * l14)) + (get(activation, parent, slots.e_mg)? * l19)), mc);
++    set(this, slots.e_mf, (((get(activation, parent, slots.e_me)? * l11) + (get(activation, parent, slots.e_mf)? * l15)) + (get(activation, parent, slots.e_mg)? * l20)), mc);
++    set(this, slots.e_mg, (((get(activation, parent, slots.e_me)? * l12) + (get(activation, parent, slots.e_mf)? * l16)) + (get(activation, parent, slots.e_mg)? * l21)), mc);
++    set(this, slots.e_mh, ((((get(activation, parent, slots.e_me)? * l13) + (get(activation, parent, slots.e_mf)? * l17)) + (get(activation, parent, slots.e_mg)? * l23)) + get(activation, parent, slots.e_mh)?), mc);
++    set(this, slots.e_mi, (((get(activation, parent, slots.e_mi)? * l10) + (get(activation, parent, slots.e_mj)? * l14)) + (get(activation, parent, slots.e_mk)? * l19)), mc);
++    set(this, slots.e_mj, (((get(activation, parent, slots.e_mi)? * l11) + (get(activation, parent, slots.e_mj)? * l15)) + (get(activation, parent, slots.e_mk)? * l20)), mc);
++    set(this, slots.e_mk, (((get(activation, parent, slots.e_mi)? * l12) + (get(activation, parent, slots.e_mj)? * l16)) + (get(activation, parent, slots.e_mk)? * l21)), mc);
++    set(this, slots.e_ml, ((((get(activation, parent, slots.e_mi)? * l13) + (get(activation, parent, slots.e_mj)? * l17)) + (get(activation, parent, slots.e_mk)? * l23)) + get(activation, parent, slots.e_ml)?), mc);
++    Some(())
++}
++
++/// `Object3D.calculateInverseMatrix()` — обратная матрица объекта. Как и выше, порядок действий
++/// и скобки — ровно те, что в байткоде.
++#[allow(unused_parens)]
++fn calculate_inverse_matrix<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++    slots: &MatrixSlots,
++    mc: &Mutation<'gc>,
++) -> Option<()> {
++    let l1 = (1.0 / ((((((((-(get(activation, this, slots.e_mc)?)) * get(activation, this, slots.e_mf)?) * get(activation, this, slots.e_mi)?) + ((get(activation, this, slots.e_mb)? * get(activation, this, slots.e_mg)?) * get(activation, this, slots.e_mi)?)) + ((get(activation, this, slots.e_mc)? * get(activation, this, slots.e_me)?) * get(activation, this, slots.e_mj)?)) - ((get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mg)?) * get(activation, this, slots.e_mj)?)) - ((get(activation, this, slots.e_mb)? * get(activation, this, slots.e_me)?) * get(activation, this, slots.e_mk)?)) + ((get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mf)?) * get(activation, this, slots.e_mk)?)));
++    set(this, slots.e_ima, ((((-(get(activation, this, slots.e_mg)?)) * get(activation, this, slots.e_mj)?) + (get(activation, this, slots.e_mf)? * get(activation, this, slots.e_mk)?)) * l1), mc);
++    set(this, slots.e_imb, (((get(activation, this, slots.e_mc)? * get(activation, this, slots.e_mj)?) - (get(activation, this, slots.e_mb)? * get(activation, this, slots.e_mk)?)) * l1), mc);
++    set(this, slots.e_imc, ((((-(get(activation, this, slots.e_mc)?)) * get(activation, this, slots.e_mf)?) + (get(activation, this, slots.e_mb)? * get(activation, this, slots.e_mg)?)) * l1), mc);
++    set(this, slots.e_imd, ((((((((get(activation, this, slots.e_md)? * get(activation, this, slots.e_mg)?) * get(activation, this, slots.e_mj)?) - ((get(activation, this, slots.e_mc)? * get(activation, this, slots.e_mh)?) * get(activation, this, slots.e_mj)?)) - ((get(activation, this, slots.e_md)? * get(activation, this, slots.e_mf)?) * get(activation, this, slots.e_mk)?)) + ((get(activation, this, slots.e_mb)? * get(activation, this, slots.e_mh)?) * get(activation, this, slots.e_mk)?)) + ((get(activation, this, slots.e_mc)? * get(activation, this, slots.e_mf)?) * get(activation, this, slots.e_ml)?)) - ((get(activation, this, slots.e_mb)? * get(activation, this, slots.e_mg)?) * get(activation, this, slots.e_ml)?)) * l1), mc);
++    set(this, slots.e_ime, (((get(activation, this, slots.e_mg)? * get(activation, this, slots.e_mi)?) - (get(activation, this, slots.e_me)? * get(activation, this, slots.e_mk)?)) * l1), mc);
++    set(this, slots.e_imf, ((((-(get(activation, this, slots.e_mc)?)) * get(activation, this, slots.e_mi)?) + (get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mk)?)) * l1), mc);
++    set(this, slots.e_img, (((get(activation, this, slots.e_mc)? * get(activation, this, slots.e_me)?) - (get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mg)?)) * l1), mc);
++    set(this, slots.e_imh, ((((((((get(activation, this, slots.e_mc)? * get(activation, this, slots.e_mh)?) * get(activation, this, slots.e_mi)?) - ((get(activation, this, slots.e_md)? * get(activation, this, slots.e_mg)?) * get(activation, this, slots.e_mi)?)) + ((get(activation, this, slots.e_md)? * get(activation, this, slots.e_me)?) * get(activation, this, slots.e_mk)?)) - ((get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mh)?) * get(activation, this, slots.e_mk)?)) - ((get(activation, this, slots.e_mc)? * get(activation, this, slots.e_me)?) * get(activation, this, slots.e_ml)?)) + ((get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mg)?) * get(activation, this, slots.e_ml)?)) * l1), mc);
++    set(this, slots.e_imi, ((((-(get(activation, this, slots.e_mf)?)) * get(activation, this, slots.e_mi)?) + (get(activation, this, slots.e_me)? * get(activation, this, slots.e_mj)?)) * l1), mc);
++    set(this, slots.e_imj, (((get(activation, this, slots.e_mb)? * get(activation, this, slots.e_mi)?) - (get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mj)?)) * l1), mc);
++    set(this, slots.e_imk, ((((-(get(activation, this, slots.e_mb)?)) * get(activation, this, slots.e_me)?) + (get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mf)?)) * l1), mc);
++    set(this, slots.e_iml, ((((((((get(activation, this, slots.e_md)? * get(activation, this, slots.e_mf)?) * get(activation, this, slots.e_mi)?) - ((get(activation, this, slots.e_mb)? * get(activation, this, slots.e_mh)?) * get(activation, this, slots.e_mi)?)) - ((get(activation, this, slots.e_md)? * get(activation, this, slots.e_me)?) * get(activation, this, slots.e_mj)?)) + ((get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mh)?) * get(activation, this, slots.e_mj)?)) + ((get(activation, this, slots.e_mb)? * get(activation, this, slots.e_me)?) * get(activation, this, slots.e_ml)?)) - ((get(activation, this, slots.e_ma)? * get(activation, this, slots.e_mf)?) * get(activation, this, slots.e_ml)?)) * l1), mc);
++    Some(())
++}
++
++/// Снимок полей, которые метод перезаписывает. Нужен режиму сверки: метод ничего не возвращает,
++/// поэтому сравнить нативный счёт с байткодом можно только по записанному — а чтобы байткод считал
++/// с того же входа, снимок сначала откатывают.
++pub struct Snapshot<'gc> {
++    object: Object<'gc>,
++    slots: [usize; 12],
++    values: [f64; 12],
++}
++
++impl<'gc> Snapshot<'gc> {
++    /// Вернуть поля в состояние до нативного счёта.
++    pub fn restore(&self, mc: &Mutation<'gc>) {
++        for (slot, value) in self.slots.iter().zip(self.values.iter()) {
++            set(self.object, *slot, *value, mc);
++        }
++    }
++
++    /// Первое расхождение с другим снимком: номер поля и оба значения. Сравнение побитовое по
++    /// значению, но два NaN считаются одинаковыми — в матрице вырожденного объекта они законны.
++    pub fn mismatch(&self, other: &Self) -> Option<(usize, f64, f64)> {
++        for (at, (mine, theirs)) in self.values.iter().zip(other.values.iter()).enumerate() {
++            if mine != theirs && !(mine.is_nan() && theirs.is_nan()) {
++                return Some((at, *mine, *theirs));
++            }
++        }
++        None
++    }
++}
++
++/// Снять состояние полей, которые метод перезапишет. `None` — методу нечего снимать (отсечение
++/// сцены сверяется по возвращённому числу) или слоты не разобрались.
++pub fn snapshot<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: NativeMethod,
++) -> Option<Snapshot<'gc>> {
++    let object = activation.local_register(0).as_object()?;
++    let slots = matrix_slots(activation, object)?;
++    let slots = match method {
++        NativeMethod::CullingInCamera => return None,
++        NativeMethod::ComposeAndAppend => [
++            slots.e_ma,
++            slots.e_mb,
++            slots.e_mc,
++            slots.e_md,
++            slots.e_me,
++            slots.e_mf,
++            slots.e_mg,
++            slots.e_mh,
++            slots.e_mi,
++            slots.e_mj,
++            slots.e_mk,
++            slots.e_ml,
++        ],
++        NativeMethod::CalculateInverseMatrix => [
++            slots.e_ima,
++            slots.e_imb,
++            slots.e_imc,
++            slots.e_imd,
++            slots.e_ime,
++            slots.e_imf,
++            slots.e_img,
++            slots.e_imh,
++            slots.e_imi,
++            slots.e_imj,
++            slots.e_imk,
++            slots.e_iml,
++        ],
++    };
++
++    let mut values = [0.0f64; 12];
++    for (at, slot) in slots.iter().enumerate() {
++        values[at] = object.get_slot(*slot).try_as_f64()?;
++    }
++    Some(Snapshot {
++        object,
++        slots,
++        values,
++    })
++}
++
++/// Точка входа: считает узнанный метод нативно. `None` — случай не покрыт.
++pub fn run<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: NativeMethod,
++) -> Option<Value<'gc>> {
++    match method {
++        NativeMethod::CullingInCamera => culling_in_camera(activation),
++        NativeMethod::ComposeAndAppend => {
++            let this = activation.local_register(0).as_object()?;
++            let parent = activation.local_register(1).as_object()?;
++            let slots = matrix_slots(activation, this)?;
++            let mc = activation.gc();
++            compose_and_append(activation, this, parent, &slots, mc)?;
++            Some(Value::Undefined)
++        }
++        NativeMethod::CalculateInverseMatrix => {
++            let this = activation.local_register(0).as_object()?;
++            let slots = matrix_slots(activation, this)?;
++            let mc = activation.gc();
++            calculate_inverse_matrix(activation, this, &slots, mc)?;
++            Some(Value::Undefined)
++        }
++    }
++}
++
++fn matrix_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    object: Object<'gc>,
++) -> Option<MatrixSlots> {
++    MATRIX_SLOTS.with(|cache| {
++        let mut cache = cache.borrow_mut();
++        if cache.is_none() {
++            *cache = Some(resolve_matrix_slots(activation, object));
++        }
++        *cache.as_ref().expect("только что заполнено")
++    })
++}
++
+ /// Один угол габаритного ящика: какие из шести граничных значений брать.
+ const CORNERS: [[usize; 3]; 8] = [
+     [0, 1, 2], // min, min, min
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 00f81a99..ced36104 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -21,12 +21,13 @@ static OPS_ENABLED: AtomicBool = AtomicBool::new(false);
+ /// Склейка инструкций (peephole). Отключается со страницы `window.ruffleNoFusion = true`, чтобы
+ /// можно было сравнить «до/после» на ОДНОЙ сборке — иначе разброс между сборками съедает разницу.
+ static FUSION_ENABLED: AtomicBool = AtomicBool::new(true);
+-/// Нативная замена отсечения сцены. Отключается со страницы `window.ruffleNoNativeCulling = true`.
+-static NATIVE_CULLING_ENABLED: AtomicBool = AtomicBool::new(true);
++/// Нативные замены горячих методов движка. Отключаются со страницы
++/// `window.ruffleNoNativePaths = true`.
++static NATIVE_PATHS_ENABLED: AtomicBool = AtomicBool::new(true);
+ /// Режим сверки: нативный ответ считается, но метод всё равно выполняется байткодом, и результаты
+-/// сравниваются. Включается со страницы `window.ruffleValidateCulling = true`. Нужен, чтобы
++/// сравниваются. Включается со страницы `window.ruffleValidateNative = true`. Нужен, чтобы
+ /// доказать совпадение на живой сцене, а не надеяться на аккуратность.
+-static VALIDATE_CULLING: AtomicBool = AtomicBool::new(false);
++static VALIDATE_NATIVE_PATHS: AtomicBool = AtomicBool::new(false);
+ 
+ thread_local! {
+     /// Всего выполнено инструкций и вызовов за период. По ним считается пропускная способность
+@@ -65,20 +66,20 @@ pub fn fusion_enabled() -> bool {
+     FUSION_ENABLED.load(Ordering::Relaxed)
+ }
+ 
+-pub fn set_native_culling_enabled(value: bool) {
+-    NATIVE_CULLING_ENABLED.store(value, Ordering::Relaxed);
++pub fn set_native_paths_enabled(value: bool) {
++    NATIVE_PATHS_ENABLED.store(value, Ordering::Relaxed);
+ }
+ 
+-pub fn native_culling_enabled() -> bool {
+-    NATIVE_CULLING_ENABLED.load(Ordering::Relaxed)
++pub fn native_paths_enabled() -> bool {
++    NATIVE_PATHS_ENABLED.load(Ordering::Relaxed)
+ }
+ 
+-pub fn set_validate_culling(value: bool) {
+-    VALIDATE_CULLING.store(value, Ordering::Relaxed);
++pub fn set_validate_native_paths(value: bool) {
++    VALIDATE_NATIVE_PATHS.store(value, Ordering::Relaxed);
+ }
+ 
+-pub fn validate_culling() -> bool {
+-    VALIDATE_CULLING.load(Ordering::Relaxed)
++pub fn validate_native_paths() -> bool {
++    VALIDATE_NATIVE_PATHS.load(Ordering::Relaxed)
+ }
+ 
+ pub fn set_ops_enabled(value: bool) {
+diff --git a/core/src/avm2/verify.rs b/core/src/avm2/verify.rs
+index ede993db..338acad4 100644
+--- a/core/src/avm2/verify.rs
++++ b/core/src/avm2/verify.rs
+@@ -27,9 +27,11 @@ pub struct VerifiedMethodInfo<'gc> {
+ 
+     pub exceptions: Vec<Exception<'gc>>,
+ 
+-    /// Метод узнан как отсечение сцены и может считаться нативно (см. `avm2::fast_paths`).
+-    /// Проверяется один раз здесь, чтобы в горячем цикле осталась одна проверка флага.
+-    pub native_culling: bool,
++    /// Метод узнан как один из горячих методов движка и может считаться нативно
++    /// (см. `avm2::fast_paths`). Разбирается один раз здесь, чтобы в горячем цикле осталась
++    /// одна проверка поля.
++    #[collect(require_static)]
++    pub native_method: Option<crate::avm2::fast_paths::NativeMethod>,
+ }
+ 
+ #[derive(Collect)]
+@@ -523,25 +525,30 @@ pub fn verify_method<'gc>(
+         jump_targets,
+     )?;
+ 
+-    let native_culling = method
+-        .method_name()
+-        .map(|name| name == crate::avm2::fast_paths::CULLING_METHOD)
+-        .unwrap_or(false)
+-        && method
+-            .bound_class()
+-            .map(|class| {
+-                class
+-                    .name()
+-                    .local_name()
+-                    .to_utf8_lossy()
+-                    .eq(crate::avm2::fast_paths::CULLING_CLASS)
+-            })
+-            .unwrap_or(false);
++    // Нативная замена привязана к конкретному классу движка: одноимённый метод чужого класса
++    // считает совсем другое, поэтому имя класса проверяется вместе с именем метода.
++    let in_engine_class = method
++        .bound_class()
++        .map(|class| {
++            class
++                .name()
++                .local_name()
++                .to_utf8_lossy()
++                .eq(crate::avm2::fast_paths::ENGINE_CLASS)
++        })
++        .unwrap_or(false);
++    let native_method = if in_engine_class {
++        method
++            .method_name()
++            .and_then(|name| crate::avm2::fast_paths::NativeMethod::from_name(&name))
++    } else {
++        None
++    };
+ 
+     Ok(VerifiedMethodInfo {
+         parsed_code: verified_code,
+         exceptions: new_exceptions,
+-        native_culling,
++        native_method,
+     })
+ }
+ 
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index f8093475..728fe8c6 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1269,13 +1269,13 @@ impl RuffleHandle {
+             ruffle_core::method_stats::set_enabled(trace_methods_requested(&instance.window));
+             ruffle_core::method_stats::set_ops_enabled(flag_requested(&instance.window, "ruffleTraceOps"));
+             ruffle_core::method_stats::set_fusion_enabled(!flag_requested(&instance.window, "ruffleNoFusion"));
+-            ruffle_core::method_stats::set_native_culling_enabled(!flag_requested(
++            ruffle_core::method_stats::set_native_paths_enabled(!flag_requested(
+                 &instance.window,
+-                "ruffleNoNativeCulling",
++                "ruffleNoNativePaths",
+             ));
+-            ruffle_core::method_stats::set_validate_culling(flag_requested(
++            ruffle_core::method_stats::set_validate_native_paths(flag_requested(
+                 &instance.window,
+-                "ruffleValidateCulling",
++                "ruffleValidateNative",
+             ));
+             let device_pixel_ratio =
+                 instance.window.device_pixel_ratio() * render_scale(&instance.window); // Changes via user zooming.
+-- 
+2.51.1.windows.1
+

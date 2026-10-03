@@ -1,0 +1,407 @@
+import * as LobbyPackets from "@/features/lobby/lobby.packets";
+import * as QuestPackets from "@/features/quests/quests.packets";
+import { LobbyWorkflow } from "@/features/lobby/lobby.workflow";
+import { UpdateCrystals } from "@/features/profile/profile.packets";
+import { IPacket } from "@/packets/packet.interfaces";
+import { GameClient } from "@/server/game.client";
+import { GameServer } from "@/server/game.server";
+import logger from "@/utils/logger";
+import { BattleOutcome, StatsService, createRoundStats, createStatsSnapshot } from "@/features/stats/stats.service";
+import { Battle, BattleMode, BattleRoundState } from "./battle.model";
+import { BattleEvents, BattleEventMap } from "./battle-events";
+import { BonusService } from "./bonus.service";
+import { CtfService } from "./ctf.service";
+import { SpawnService } from "./spawn.service";
+import { SupplyService } from "./supply.service";
+import { crystalBonuses } from "@/shared/models/passes";
+import { ChangeFundPacket, EffectStoppedPacket, FinishBattlePacket, RestartRoundDmPacket, RestartRoundTeamPacket, SetCtfScorePacket, SetRoundTimePacket } from "./battle.packets";
+
+const ROUND_FINISH_PAUSE_MS = 10000; // results screen before a finished round restarts
+const FUND_MULTIPLIER = 5;
+const FUND_PER_KILL = 10 * FUND_MULTIPLIER; // crystals added to the battle fund per kill (matches official ~8-11/kill from captures)
+const FUND_PER_FLAG = 10 * FUND_MULTIPLIER; // crystals added to the battle fund per flag capture
+
+/**
+ * Round lifecycle: the per-round time/score limits, the finish→pause→restart cycle (side switch,
+ * stat reset, flag reset, respawn) and the lobby-preview reactions. Subscribes to the bus (`kill`,
+ * `flagCaptured`) for the score-limit/preview updates so combat and CTF don't call it directly.
+ * Depends on the server, the bus, CTF (flag reset/drop) and Spawn (respawn) — no back-reference to
+ * BattleService. Extracted from BattleService.
+ */
+export class RoundService {
+    constructor(
+        private readonly server: GameServer,
+        private readonly events: BattleEvents,
+        private readonly ctf: CtfService,
+        private readonly spawn: SpawnService,
+        private readonly bonus: BonusService,
+    ) {
+        this.events.on("kill", (p) => this._onKill(p));
+        this.events.on("flagCaptured", (p) => this._onFlagCaptured(p));
+        // Every death (combat kill, self-destruct, void) is a stats flush trigger: persist the delta so a
+        // player who never leaves still has their kills/deaths/mines/etc. saved each life. Delta-based, so
+        // it can't double-count against the later leave / round-finish flush.
+        this.events.on("tankDestroyed", ({ battle, client }) => StatsService.flushDelta(client, battle, this.server));
+    }
+
+    /** (Re)starts the round clock: marks the round RUNNING, tells everyone the time limit and arms
+     *  the time-up finish. */
+    public startRoundTimer(battle: Battle): void {
+        battle.roundState = BattleRoundState.RUNNING;
+        const limit = battle.settings.timeLimitInSec;
+        battle.broadcast(new SetRoundTimePacket(limit));
+        if (limit > 0) {
+            battle.timers.set("round", limit * 1000, () => this.finishRound(battle));
+        } else {
+            battle.timers.clear("round");
+        }
+    }
+
+    /** Staff /time: sets the round's REMAINING time. Re-broadcasts the clock, re-arms the time-up finish
+     *  and re-bases roundStartTime so late joiners compute the same remaining time. */
+    public setTimeLeft(battle: Battle, seconds: number): void {
+        battle.broadcast(new SetRoundTimePacket(seconds));
+        battle.timers.set("round", seconds * 1000, () => this.finishRound(battle));
+        const limit = battle.settings.timeLimitInSec;
+        if (limit > 0) battle.roundStartTime = Date.now() - (limit - seconds) * 1000;
+    }
+
+    /** End the round (time or score limit): broadcast final standings, then restart after the pause. */
+    public finishRound(battle: Battle): void {
+        if (battle.roundState === BattleRoundState.FINISHED) return; // already finishing
+        battle.roundState = BattleRoundState.FINISHED;
+        battle.timers.clear("round");
+
+        // Partida Competitiva: resolve o Elo pelo placar antes de qualquer restart do round.
+        this.server.rankedService?.onRoundFinished(battle);
+
+        // Crystal payout from the battle fund (team-first in team modes, then per player).
+        // Фонд делится на ВСЕХ участников боя, включая ботов: в итоговой таблице игрок должен видеть
+        // обычный бой, где награду получила вся команда, а не он один. Начисляется же она только живым —
+        // у бота нет аккаунта, куда её положить (см. _resolveBattlePlayers).
+        const everyone = this._resolveBattlePlayers(battle, true);
+        const players = everyone.filter((c) => !c.isBot);
+        const rewards = battle.settings.parkourMode
+            ? []
+            : this._computeRewards(battle, everyone).map((r) => ({ ...r, ...crystalBonuses(r.client.user!, r.reward) }));
+        const payouts = rewards.filter((r) => !r.client.isBot);
+
+        // Long-term metrics: fold the fund payout into each player's earned-crystals tally now (so the
+        // record reflects it); the actual stats flush is deferred until AFTER crystals are credited —
+        // _awardCrystals reloads the doc and does a full save(), which would otherwise clobber the stats
+        // write if they raced.
+        const totalByClient = new Map(payouts.map((r) => [r.client, r.reward + r.newbieBonus + r.premiumBonus]));
+        const outcomes = this._computeOutcomes(battle, players);
+        for (const c of players) {
+            if (!c.statsFlushedForRound) c.roundStats.crystalsEarned += totalByClient.get(c) ?? 0;
+        }
+
+        battle.broadcast(new FinishBattlePacket(rewards.map((r) => ({ nickname: r.nickname, reward: r.reward, newbieBonus: r.newbieBonus, premiumBonus: r.premiumBonus })), ROUND_FINISH_PAUSE_MS / 1000));
+        // Lobby preview watchers: the running timer they see should reset.
+        this._sendToWatchers(battle, new LobbyPackets.RoundFinishPacket({ battleId: battle.battleId }));
+
+        // Credit the earned crystals, THEN flush each player's round stats (order avoids the save/updateOne race).
+        void this._awardCrystals(payouts).then(() => {
+            for (const c of players) {
+                if (c.statsFlushedForRound) continue;
+                StatsService.flushRound(c, battle, outcomes.get(c) ?? "none", this.server);
+                c.statsFlushedForRound = true;
+            }
+        });
+
+        // Carried flags fall (CTF).
+        if (battle.settings.battleMode === BattleMode.CTF) {
+            for (const carrier of [battle.flagCarrierRed, battle.flagCarrierBlue]) {
+                if (carrier) this.ctf.dropFlag(carrier, battle, this.server.findClientByUsername(carrier.username)?.battlePosition ?? null);
+            }
+        }
+        // Active supply effects clear on every tank.
+        for (const c of battle.clients) {
+            if (!c.user) continue;
+            for (const e of c.activeEffects) battle.broadcast(new EffectStoppedPacket({ nickname: c.user.username, effectType: e.itemIndex }));
+            c.activeEffects = [];
+            SupplyService.stopHealing(c);
+        }
+
+        logger.info(`Round finished in battle ${battle.battleId}.`);
+
+        battle.timers.set("finish", ROUND_FINISH_PAUSE_MS, () => this.restartRound(battle));
+    }
+
+    /** Restart a finished round: swap sides (team modes), reset scores/flags, respawn everyone, restart timer. */
+    public restartRound(battle: Battle): void {
+        if ([...battle.users, ...battle.usersBlue, ...battle.usersRed].length === 0) return; // emptied during the pause
+        // Server restarting: don't recommence — send everyone back to the battle list instead.
+        if (this.server.isRestartPending()) {
+            void this.server.battleService.evacuateForRestart(battle);
+            return;
+        }
+
+        // Leave the FINISHED freeze up front so the respawn loop below isn't blocked by the freeze
+        // guard (combat/spawn gate on roundState === FINISHED). startRoundTimer re-affirms RUNNING.
+        battle.timers.clear("finish");
+        battle.roundState = BattleRoundState.RUNNING;
+        this.events.emit("roundRestarted", { battle }); // modes (e.g. domination) reset their own state
+
+        // Switch sides (team modes): swap the rosters, then re-send them so the client reassigns each
+        // player's team in the scoreboard (RestartRoundTeamPacket = field0 red, field1 blue).
+        if (battle.isTeamMode()) {
+            const red = battle.usersRed;
+            battle.usersRed = battle.usersBlue;
+            battle.usersBlue = red;
+        }
+
+        battle.scoreRed = 0;
+        battle.scoreBlue = 0;
+        battle.fund = 0;
+        battle.broadcast(new ChangeFundPacket(0));
+        this.bonus.clearAll(battle); // fresh round starts with no leftover drops
+        const active = [...battle.clients].filter((c) => c.user && !c.isSpectator);
+        for (const c of active) { c.kills = 0; c.deaths = 0; c.battleScore = 0; c.roundStats = createRoundStats(); c.statsSnapshot = createStatsSnapshot(); c.statsFlushedForRound = false; }
+
+        // A new round wipes the equipment-change cooldown (re-arm battles) for EVERY participant — the
+        // whole roster, so someone in the reconnect grace window resets too. They may re-arm freely again.
+        for (const u of [...battle.users, ...battle.usersRed, ...battle.usersBlue]) {
+            this.server.garageService.clearEquipCooldowns(u.id);
+        }
+
+        if (battle.settings.battleMode === BattleMode.CTF) {
+            this.ctf.returnFlagToBase(battle, "RED");
+            this.ctf.returnFlagToBase(battle, "BLUE");
+            battle.broadcast(new SetCtfScorePacket({ team: 0, score: 0 }));
+            battle.broadcast(new SetCtfScorePacket({ team: 1, score: 0 }));
+        }
+
+        // Rebuild the scoreboard rosters with reset stats + the new team assignment.
+        if (battle.isTeamMode()) {
+            battle.broadcast(new RestartRoundTeamPacket(battle.usersRed.map((u) => u.username), battle.usersBlue.map((u) => u.username)));
+            // Update the battle-list per-team counts: each player moved to the other team's slot.
+            for (let team = 0; team < 2; team++) {
+                for (const u of (team === 0 ? battle.usersRed : battle.usersBlue)) {
+                    this.server.broadcastToBattleList(new LobbyPackets.OnReleaseSlotTeamPacket({ battleId: battle.battleId, nickname: u.username }));
+                    this.server.broadcastToBattleList(new LobbyPackets.OnReserveSlotTeamPacket({ battleId: battle.battleId, nickname: u.username, team }));
+                }
+            }
+        } else {
+            battle.broadcast(new RestartRoundDmPacket(battle.users.map((u) => u.username)));
+        }
+
+        for (const c of active) {
+            this.spawn.prepareRespawn(c); // -> client replies ReadyToPlace -> normal spawn finishes the placement
+        }
+
+        battle.roundStartTime = Date.now();
+        this.startRoundTimer(battle);
+
+        // Refresh the lobby preview for watchers: hide + re-show the battle details. The per-event
+        // packets don't refresh the preview panel itself, so the reset timer, reset score and the new
+        // team rosters only show up after re-sending BattleDetails (computed from the fresh state).
+        for (const w of this._battleWatchers(battle)) {
+            w.sendPacket(new LobbyPackets.HideBattleInfoPacket({ battleId: battle.battleId }));
+            void LobbyWorkflow.sendBattleDetails(w, this.server, battle);
+        }
+
+        logger.info(`Round restarted in battle ${battle.battleId}.`);
+    }
+
+    /** Kill reactions: lobby-preview score update + the kill-based score limit (DM/team non-CTF). */
+    private _onKill({ battle, killerClient, victimClient }: BattleEventMap["kill"]): void {
+        const killer = killerClient.user;
+        const victim = victimClient.user;
+        if (!killer || !victim) return;
+
+        // Lobby preview watchers: the scorer's individual score, and (team modes) the team score.
+        if (killer.id !== victim.id) {
+            this._sendToWatchers(battle, new LobbyPackets.UpdateUserScorePacket({ battleId: battle.battleId, nickname: killer.username, score: killerClient.battleScore }));
+            this._sendToWatchers(battle, new LobbyPackets.UpdateUserKillsPacket({ battleId: battle.battleId, nickname: killer.username, kills: killerClient.kills }));
+            this._addFund(battle, FUND_PER_KILL);
+        }
+
+        // Kill-based score limit (DM = individual kills; TDM = team's total kills). CTF (flags) and CP
+        // (control-point time) have their own scoring, so kills don't count toward their limit.
+        const limit = battle.settings.scoreLimit;
+        if (killer.id !== victim.id && battle.settings.battleMode !== BattleMode.CTF && battle.settings.battleMode !== BattleMode.CP) {
+            const team = battle.teamOf(killer);
+            const teamKills = battle.isTeamMode()
+                ? [...battle.clients].filter((c) => c.user && battle.teamOf(c.user) === team).reduce((sum, c) => sum + c.kills, 0)
+                : killerClient.kills;
+            if (battle.isTeamMode()) {
+                this._sendToWatchers(battle, new LobbyPackets.UpdateTeamScorePacket({ battleId: battle.battleId, team, score: teamKills }));
+                // Табло В БОЮ тоже держим в курсе: в TDM/AS счёт команды — это сумма фрагов, и без этой
+                // рассылки большие цифры над таблицей так и висели бы на нуле (CTF/CP шлют свой счёт сами).
+                if (team === 0) battle.scoreRed = teamKills; else battle.scoreBlue = teamKills;
+                battle.broadcast(new SetCtfScorePacket({ team, score: teamKills }));
+            }
+            if (limit > 0 && teamKills >= limit) this.finishRound(battle);
+        }
+    }
+
+    /** Flag-capture reactions: lobby-preview team score + the CTF score limit. */
+    private _onFlagCaptured({ battle, capturingTeamId, newScore }: BattleEventMap["flagCaptured"]): void {
+        // Lobby preview watchers see the team score rise.
+        this._sendToWatchers(battle, new LobbyPackets.UpdateTeamScorePacket({ battleId: battle.battleId, team: capturingTeamId, score: newScore }));
+        this._addFund(battle, FUND_PER_FLAG);
+        // Score limit reached -> end the round.
+        if (battle.settings.scoreLimit > 0 && newScore >= battle.settings.scoreLimit) {
+            this.finishRound(battle);
+        }
+    }
+
+    private _resolveBattlePlayers(battle: Battle, includeBots = false): GameClient[] {
+        const participantClients = new Map<string, GameClient>();
+        for (const client of battle.clients) {
+            if (client.user && !client.isSpectator && client.currentBattle?.battleId === battle.battleId) {
+                participantClients.set(client.user.id, client);
+            }
+        }
+
+        const rosterUsers = battle.getAllParticipants().filter((u) => !!u.id);
+        const players: GameClient[] = [];
+        const seenUserIds = new Set<string>();
+        for (const user of rosterUsers) {
+            if (seenUserIds.has(user.id)) continue;
+            seenUserIds.add(user.id);
+
+            const client = participantClients.get(user.id) ?? this.server.findClientByUsername(user.username);
+            if (!client || !client.user || client.isSpectator || client.currentBattle?.battleId !== battle.battleId) {
+                continue;
+            }
+            // Ботам кристаллы девать некуда (аккаунта в базе нет) и статистику писать не на что, поэтому
+            // из НАЧИСЛЕНИЯ они исключены. В дележе фонда и в итоговой таблице они при этом участвуют —
+            // иначе игрок видит бой, где награду получил он один, и сразу понимает, что рядом не игроки.
+            if (client.isBot && !includeBots) continue;
+            players.push(client);
+        }
+
+        return players;
+    }
+
+    /** Adds to the battle fund (crystal pool), broadcasts the new total, and rolls crystal-box drops
+     *  (wiki: 1% per crystal zone per crystal added — see BonusService.onFundAdded). */
+    private _addFund(battle: Battle, amount: number): void {
+        // Parkour battles don't change the crystal fund or trigger fund-based drops.
+        if (battle.settings.parkourMode) return;
+
+        battle.fund += amount;
+        battle.broadcast(new ChangeFundPacket(battle.fund));
+        this.bonus.onFundAdded(battle, amount);
+    }
+
+    /**
+     * Splits the battle fund into per-player crystal rewards. A player who scored nothing in the match
+     * gets nothing, regardless of outcome. DM: proportional to individual score. Team modes
+     * (TDM/CTF/AS/CP): the fund is split BETWEEN the teams first — proportional to the summed player
+     * score of each team — and each team's share is then split among its players by individual score.
+     * An empty team's (or all-zero-score team's) share is simply lost.
+     */
+    private _computeRewards(battle: Battle, players: GameClient[]): { client: GameClient; nickname: string; reward: number }[] {
+        const result = (rewardMap: Map<GameClient, number>) => players.map((c) => ({ client: c, nickname: c.user!.username, reward: rewardMap.get(c) ?? 0 }));
+        const fund = battle.fund;
+        if (fund <= 0 || players.length === 0) return result(new Map());
+
+        // Splits a pot among members proportional to individual score. For single-player battles (or
+        // scoreless rounds), the fund should still go to the participant rather than being dropped.
+        const splitByScore = (members: GameClient[], pot: number): Map<GameClient, number> => {
+            const out = new Map<GameClient, number>();
+            const total = members.reduce((s, c) => s + Math.max(0, c.battleScore), 0);
+            if (pot <= 0) return out;
+            if (members.length === 1) {
+                out.set(members[0], pot);
+                return out;
+            }
+            if (total <= 0) return out;
+            for (const c of members) {
+                if (c.battleScore > 0) out.set(c, Math.floor((pot * c.battleScore) / total));
+            }
+            return out;
+        };
+
+        if (!battle.isTeamMode()) {
+            return result(splitByScore(players, fund));
+        }
+
+        // Team modes: team pot first (by team score), then within the team by individual score.
+        //
+        // «Счёт команды» — это СУММА личных очков её игроков, во всех командных режимах одинаково,
+        // включая CTF. Считать долю CTF по числу флагов было нельзя: команда, проигравшая всухую (1:0
+        // — обычный счёт в захвате), получала пот в НОЛЬ, и вся её половина таблицы уходила с нулевыми
+        // кристаллами, сколько бы её игроки ни настреляли. Доставка флага и так даёт личные очки
+        // (см. deliverFlagShares), поэтому перевес победителя в сумме очков сохраняется.
+        const red = players.filter((c) => battle.teamOf(c.user!) === 0);
+        const blue = players.filter((c) => battle.teamOf(c.user!) === 1);
+        const teamScore = (members: GameClient[]) => members.reduce((s, c) => s + Math.max(0, c.battleScore), 0);
+        const redScore = teamScore(red);
+        const blueScore = teamScore(blue);
+        const totalTeamScore = redScore + blueScore;
+
+        // Team pot is proportional to team score; if neither team scored, the fund is split evenly between
+        // the two teams (each team then still only pays out to players who actually scored).
+        const redPot = totalTeamScore > 0 ? Math.floor((fund * redScore) / totalTeamScore) : Math.floor(fund / 2);
+        const bluePot = totalTeamScore > 0 ? Math.floor((fund * blueScore) / totalTeamScore) : Math.floor(fund / 2);
+
+        return result(new Map<GameClient, number>([...splitByScore(red, redPot), ...splitByScore(blue, bluePot)]));
+    }
+
+    /**
+     * Win/loss per player at round finish. Team modes: the team with the higher score wins (score = flag
+     * captures in CTF, point score in CP, else summed player score); a tie is a draw for everyone. DM:
+     * whoever tops the scoreboard wins, the rest lose; a scoreless round has no winner. Parkour and
+     * single-player rounds count for nobody ("none" leaves streaks untouched).
+     */
+    private _computeOutcomes(battle: Battle, players: GameClient[]): Map<GameClient, BattleOutcome> {
+        const out = new Map<GameClient, BattleOutcome>();
+        const allNone = (): Map<GameClient, BattleOutcome> => {
+            for (const c of players) out.set(c, "none");
+            return out;
+        };
+        if (!StatsService.countsWinLoss(battle) || players.length < 2) return allNone();
+
+        if (battle.isTeamMode()) {
+            const red = players.filter((c) => battle.teamOf(c.user!) === 0);
+            const blue = players.filter((c) => battle.teamOf(c.user!) === 1);
+            if (red.length === 0 || blue.length === 0) return allNone();
+            const useField = battle.settings.battleMode === BattleMode.CTF || battle.settings.battleMode === BattleMode.CP;
+            const strength = (team: GameClient[], teamScore: number) =>
+                useField ? teamScore : team.reduce((s, c) => s + Math.max(0, c.battleScore), 0);
+            const redStrength = strength(red, battle.scoreRed);
+            const blueStrength = strength(blue, battle.scoreBlue);
+            if (redStrength === blueStrength) return allNone();
+            const winners = new Set(redStrength > blueStrength ? red : blue);
+            for (const c of players) out.set(c, winners.has(c) ? "win" : "loss");
+            return out;
+        }
+
+        // DM: top of the scoreboard wins (ties at the top both win); nobody scored → no winner.
+        const maxScore = Math.max(...players.map((c) => c.battleScore));
+        if (maxScore <= 0) return allNone();
+        for (const c of players) out.set(c, c.battleScore === maxScore ? "win" : "loss");
+        return out;
+    }
+
+    /** Persists each player's earned crystals and refreshes their displayed balance. */
+    private async _awardCrystals(rewards: { client: GameClient; reward: number; newbieBonus?: number; premiumBonus?: number }[]): Promise<void> {
+        for (const { client, reward, newbieBonus = 0, premiumBonus = 0 } of rewards) {
+            const total = reward + newbieBonus + premiumBonus; // base do fundo + bônus dos passes
+            if (total <= 0 || !client.user) continue;
+            try {
+                const newTotal = client.user.crystals + total;
+                const updated = await this.server.userService.updateResources(client.user.id, { crystals: newTotal });
+                client.user = updated;
+                client.sendPacket(new UpdateCrystals({ crystals: updated.crystals }));
+                // Fund crystals count toward the "earn crystals" daily quest.
+                const questCompleted = await this.server.questService.applyQuestEvent(updated, { crystals: total });
+                if (questCompleted && !client.isDestroyed) client.sendPacket(new QuestPackets.QuestCompletedNotification());
+            } catch (error: any) {
+                logger.error(`Failed to award ${reward} crystals to ${client.user?.username}`, { error: error.message });
+            }
+        }
+    }
+
+    /** Lobby clients currently watching this battle's preview (battle-details panel). */
+    private _battleWatchers(battle: Battle): GameClient[] {
+        return this.server.getClients().filter((c) => (c.getState() === "chat_lobby" || c.getState() === "battle_lobby") && c.lastViewedBattleId === battle.battleId);
+    }
+    private _sendToWatchers(battle: Battle, packet: IPacket): void {
+        for (const w of this._battleWatchers(battle)) w.sendPacket(packet);
+    }
+}

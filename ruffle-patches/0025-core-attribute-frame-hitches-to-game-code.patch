@@ -1,0 +1,104 @@
+From 1ea2bc7433cff092ea54e380ba604beb457c4485 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 12:05:06 +0300
+Subject: [PATCH] core: name the game code behind every frame hitch
+
+---
+ core/src/avm2/method_stats.rs | 27 +++++++++++++++++++++++++++
+ web/src/lib.rs                | 21 ++++++++++++++++++++-
+ 2 files changed, 47 insertions(+), 1 deletion(-)
+
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 5a5536e6..713df28d 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -28,6 +28,9 @@ thread_local! {
+     static TOTAL: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+     /// Имя метода -> (инструкций, вызовов).
+     static TOTALS: RefCell<HashMap<String, (u64, u64)>> = RefCell::new(HashMap::new());
++    /// То же самое, но копится ровно один кадр: по нему объясняется провал частоты — какой код
++    /// игры съел именно этот кадр. За секунду такая просадка растворяется и не видна.
++    static FRAME: RefCell<HashMap<String, (u64, u64)>> = RefCell::new(HashMap::new());
+     /// Счётчики по видам инструкций. Массив ячеек, а не словарь: считаем на КАЖДОЙ инструкции,
+     /// и словарь со строковым ключом обходился в разы дороже самого интерпретатора.
+     static OPS: [Cell<u64>; OP_KINDS.len()] = const { [const { Cell::new(0) }; OP_KINDS.len()] };
+@@ -78,6 +81,12 @@ fn label(method: Method<'_>) -> String {
+ }
+ 
+ pub fn record(method: Method<'_>, ops: u64) {
++    FRAME.with(|frame| {
++        let mut frame = frame.borrow_mut();
++        let entry = frame.entry(label(method)).or_insert((0, 0));
++        entry.0 += ops;
++        entry.1 += 1;
++    });
+     TOTAL.with(|total| {
+         let (all_ops, all_calls) = total.get();
+         total.set((all_ops + ops, all_calls + 1));
+@@ -187,6 +196,24 @@ pub fn take_ops() -> Vec<(&'static str, u64)> {
+     })
+ }
+ 
++/// Самые дорогие методы ТЕКУЩЕГО кадра и сколько всего инструкций в нём выполнено.
++/// Счётчики кадра обнуляются — их надо снимать каждый кадр.
++pub fn take_frame_top(limit: usize) -> (Vec<(String, u64)>, u64) {
++    FRAME.with(|frame| {
++        let mut frame = frame.borrow_mut();
++        let total: u64 = frame.values().map(|(ops, _)| ops).sum();
++        let mut rows: Vec<_> = frame.drain().map(|(name, (ops, _))| (name, ops)).collect();
++        rows.sort_by(|a, b| b.1.cmp(&a.1));
++        rows.truncate(limit);
++        (rows, total)
++    })
++}
++
++/// Забыть счётчики кадра, ничего не разбирая: кадр уложился в бюджет.
++pub fn reset_frame() {
++    FRAME.with(|frame| frame.borrow_mut().clear());
++}
++
+ /// Всего инструкций и вызовов за период; счётчики обнуляются.
+ pub fn take_total() -> (u64, u64) {
+     TOTAL.with(|total| total.replace((0, 0)))
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index e9ef16db..56ccbd51 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1140,14 +1140,33 @@ impl RuffleHandle {
+             // Каждый провал пишем отдельной строкой с разбором: по ней сразу видно, кто виноват —
+             // код игры, отрисовка или сборка мусора. Иначе провал теряется в среднем за секунду.
+             if frame_ms > 33.0 {
++                // Если включён счётчик методов (F9 в профилировщике), к строке провала
++                // добавляется разбор: какой код игры съел именно этот кадр.
++                let detail = if ruffle_core::method_stats::enabled() {
++                    let (rows, ops) = ruffle_core::method_stats::take_frame_top(4);
++                    let mut text = format!(", {} тыс. инструкций", ops / 1000);
++                    for (name, method_ops) in rows {
++                        text.push_str(&format!(
++                            "; {name} {:.0}%",
++                            100.0 * method_ops as f32 / ops.max(1) as f32
++                        ));
++                    }
++                    text
++                } else {
++                    String::new()
++                };
++
+                 tracing::warn!(
+-                    "hitch {:.1} ms: ActionScript {:.1} ms, render {:.1} ms, gc {:.1} ms{}",
++                    "hitch {:.1} ms: ActionScript {:.1} ms, render {:.1} ms, gc {:.1} ms{}{}",
+                     frame_ms,
+                     tick_time.as_secs_f32() * 1000.0,
+                     render_time.as_secs_f32() * 1000.0,
+                     gc_ms,
+                     if rendered { "" } else { ", кадр не рисовался" },
++                    detail,
+                 );
++            } else if ruffle_core::method_stats::enabled() {
++                ruffle_core::method_stats::reset_frame();
+             }
+             if frame_ms > *worst_ms {
+                 *worst_ms = frame_ms;
+-- 
+2.51.1.windows.1
+

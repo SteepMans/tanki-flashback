@@ -1,0 +1,408 @@
+From 447f115f8cb91013034b9c0b7915f561528002e2 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 02:13:09 +0300
+Subject: [PATCH] core: sort the transparent geometry list natively
+
+---
+ core/src/avm2/fast_paths.rs | 286 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 280 insertions(+), 6 deletions(-)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 28534db8..ce50b1e7 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -66,6 +66,8 @@ pub enum NativeMethod {
+     VgTransformBound,
+     /// Обход структуры граней: расширить габаритный ящик по собственным координатам вершин.
+     VgBound,
++    /// Сортировка списка прозрачной геометрии по габаритам вдоль оси.
++    ConflictSort,
+ }
+ 
+ impl NativeMethod {
+@@ -82,6 +84,7 @@ impl NativeMethod {
+             ("VG", "transformStruct") => Some(Self::VgTransform),
+             ("VG", "b6deb45e") => Some(Self::VgTransformBound),
+             ("VG", "f5407f49") => Some(Self::VgBound),
++            ("ConflictContainer", "f5e49019") => Some(Self::ConflictSort),
+             _ => None,
+         }
+     }
+@@ -1409,6 +1412,234 @@ fn vg_struct_walk<'gc>(
+     Some(Value::Undefined)
+ }
+ 
++/// Номера слотов для сортировки списка прозрачной геометрии по габаритам.
++#[derive(Clone, Copy)]
++struct VgSortSlots {
++    next: usize,
++    bound_min: usize,
++    bound_max: usize,
++    axis_min: [usize; 3],
++    axis_max: [usize; 3],
++    vg_vtable: u32,
++}
++
++thread_local! {
++    static VG_SORT_SLOTS: RefCell<Option<(u32, VgSortSlots)>> = const { RefCell::new(None) };
++    static VG_SORT_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn vg_sort_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
++    list: Object<'gc>,
++) -> Option<VgSortSlots> {
++    let key = class_object.vtable().id();
++    if let Some((known, slots)) = VG_SORT_SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if VG_SORT_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    let engine = |activation: &mut Activation<'_, 'gc>, name| slot_of(activation, list, name, true);
++    let resolved = (|| {
++        Some(VgSortSlots {
++            next: engine(activation, "next")?,
++            bound_min: engine(activation, "boundMin")?,
++            bound_max: engine(activation, "boundMax")?,
++            axis_min: [
++                engine(activation, "boundMinX")?,
++                engine(activation, "boundMinY")?,
++                engine(activation, "boundMinZ")?,
++            ],
++            axis_max: [
++                engine(activation, "boundMaxX")?,
++                engine(activation, "boundMaxY")?,
++                engine(activation, "boundMaxZ")?,
++            ],
++            vg_vtable: list.vtable().id(),
++        })
++    })();
++
++    match resolved {
++        Some(slots) => {
++            VG_SORT_SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++            Some(slots)
++        }
++        None => {
++            // Разбор опирается только на имена полей, поэтому неудача окончательна.
++            VG_SORT_HOPELESS.with(|flag| flag.set(true));
++            None
++        }
++    }
++}
++
++/// Ось, по которой сортируют: движок передаёт её двумя флагами.
++#[inline(always)]
++fn vg_axis(by_x: bool, by_y: bool) -> usize {
++    if by_x {
++        0
++    } else if by_y {
++        1
++    } else {
++        2
++    }
++}
++
++/// Лист рекурсии: у одиночного звена ключ сортировки берётся прямо из габаритов по выбранной оси.
++#[inline(always)]
++fn vg_set_key<'gc>(node: Object<'gc>, axis: usize, slots: &VgSortSlots, mc: &Mutation<'gc>) {
++    // Приведение к Number делает и байткод: `setproperty` в поле типа Number.
++    for (from, to) in [
++        (slots.axis_min[axis], slots.bound_min),
++        (slots.axis_max[axis], slots.bound_max),
++    ] {
++        let value = node.get_slot(from).try_as_f64().unwrap_or(f64::NAN);
++        node.set_slot_no_coerce(to, Value::Number(value), mc);
++    }
++}
++
++#[inline(always)]
++fn vg_key<'gc>(node: Object<'gc>, slots: &VgSortSlots) -> f64 {
++    // Поле объявлено как Number; ни разу не записанное движок тоже видит как NaN, а с NaN
++    // сравнение `lessthan` в байткоде ложно — как и `<` здесь.
++    node.get_slot(slots.bound_min).try_as_f64().unwrap_or(f64::NAN)
++}
++
++/// `ConflictContainer.f5e49019` — сортировка слиянием списка прозрачной геометрии по ближней
++/// границе габаритного ящика вдоль выбранной оси. Ступень AABB, через которую движок прогоняет
++/// прозрачные объекты каждый кадр: на стенде это самый крупный метод кадра.
++///
++/// Перевод из байткода буквальный, включая приём со ссылками: `next` переписывается только в тот
++/// момент, когда слияние переключается с одного списка на другой, — пока идём по одному, ссылки
++/// уже верны.
++fn vg_sort_list<'gc>(
++    list: Object<'gc>,
++    axis: usize,
++    slots: &VgSortSlots,
++    mc: &Mutation<'gc>,
++) -> Object<'gc> {
++    // Середина списка: `slow` идёт на шаг, `fast` — на два.
++    let mut slow = list;
++    let mut fast = list.get_slot(slots.next).as_object();
++    while let Some(node) = fast {
++        if node.get_slot(slots.next).as_object().is_none() {
++            break;
++        }
++        slow = match slow.get_slot(slots.next).as_object() {
++            Some(next) => next,
++            None => break,
++        };
++        fast = node
++            .get_slot(slots.next)
++            .as_object()
++            .and_then(|next| next.get_slot(slots.next).as_object());
++    }
++
++    let mut left = list;
++    let right = slow.get_slot(slots.next);
++    slow.set_slot_no_coerce(slots.next, Value::Null, mc);
++
++    if left.get_slot(slots.next).as_object().is_some() {
++        left = vg_sort_list(left, axis, slots, mc);
++    } else {
++        vg_set_key(left, axis, slots, mc);
++    }
++
++    let right = match right.as_object() {
++        Some(right) => {
++            if right.get_slot(slots.next).as_object().is_some() {
++                vg_sort_list(right, axis, slots, mc)
++            } else {
++                vg_set_key(right, axis, slots, mc);
++                right
++            }
++        }
++        // Список из одного звена: правой половины нет, сливать не с чем.
++        None => return left,
++    };
++
++    // Голова результата и с какой из половин мы сейчас идём.
++    let mut from_left = vg_key(left, slots) < vg_key(right, slots);
++    let head;
++    let mut left_node = Some(left);
++    let mut right_node = Some(right);
++    if from_left {
++        head = left;
++        left_node = left.get_slot(slots.next).as_object();
++    } else {
++        head = right;
++        right_node = right.get_slot(slots.next).as_object();
++    }
++    let mut tail = head;
++
++    loop {
++        let (Some(a), Some(b)) = (left_node, right_node) else {
++            // Один из списков кончился — дописываем хвост второго целиком.
++            let rest = left_node.or(right_node);
++            if let Some(rest) = rest {
++                tail.set_slot_no_coerce(slots.next, Value::Object(rest), mc);
++            } else {
++                tail.set_slot_no_coerce(slots.next, Value::Null, mc);
++            }
++            return head;
++        };
++
++        if from_left {
++            if vg_key(a, slots) < vg_key(b, slots) {
++                // Идём по той же половине: ссылка уже стоит верно.
++                tail = a;
++                left_node = a.get_slot(slots.next).as_object();
++            } else {
++                tail.set_slot_no_coerce(slots.next, Value::Object(b), mc);
++                tail = b;
++                right_node = b.get_slot(slots.next).as_object();
++                from_left = false;
++            }
++        } else if vg_key(b, slots) < vg_key(a, slots) {
++            tail = b;
++            right_node = b.get_slot(slots.next).as_object();
++        } else {
++            tail.set_slot_no_coerce(slots.next, Value::Object(a), mc);
++            tail = a;
++            left_node = a.get_slot(slots.next).as_object();
++            from_left = true;
++        }
++    }
++}
++
++/// Точка входа сортировки: разбирает аргументы и отсеивает случай, на котором байткод бросает
++/// ошибку (список из одного звена — у него нет правой половины), до любых записей.
++fn conflict_sort<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++) -> Option<Value<'gc>> {
++    let list = activation.local_register(1).as_object()?;
++    let by_x = match activation.local_register(2) {
++        Value::Bool(value) => value,
++        _ => return None,
++    };
++    let by_y = match activation.local_register(3) {
++        Value::Bool(value) => value,
++        _ => return None,
++    };
++
++    let slots = vg_sort_slots(activation, declaring_class(method)?, list)?;
++    if list.vtable().id() != slots.vg_vtable {
++        return None;
++    }
++    // На списке из одного звена байткод падает на обращении к правой половине; пусть падает он.
++    if list.get_slot(slots.next).as_object().is_none() {
++        return None;
++    }
++
++    let mc = activation.gc();
++    let sorted = vg_sort_list(list, vg_axis(by_x, by_y), &slots, mc);
++    Some(Value::Object(sorted))
++}
++
+ /// Собирает в снимок всё, что обход структуры граней перезапишет: у каждой вершины три
+ /// координаты и номер преобразования. Порядок обхода тот же, что у самого счёта, поэтому два
+ /// снимка сравнимы поэлементно.
+@@ -1690,6 +1921,10 @@ pub struct Snapshot<'gc> {
+     /// Куда смотреть и что там было. Полей может быть с разных объектов: столкновение эллипсоида
+     /// пишет в два вектора сразу, а загрузка констант — в элементы вектора, а не в слоты.
+     fields: Vec<(Place<'gc>, f64)>,
++    /// Поля-ссылки: их надо возвращать самим объектом, числом это не выразить. Нужны сортировке
++    /// списка — она переставляет `next` у всех звеньев, и без отката байткод считал бы уже не с
++    /// того входа.
++    links: Vec<(Object<'gc>, usize, Value<'gc>)>,
+ }
+ 
+ /// Место, куда пишет заменяемый метод: поле объекта или элемент вектора.
+@@ -1698,18 +1933,25 @@ enum Place<'gc> {
+     Slot(Object<'gc>, usize),
+     /// Целочисленное поле: восстанавливать его дробным нельзя, слот объявлен как `int`.
+     IntSlot(Object<'gc>, usize),
++    /// Только для сравнения: адрес объекта в поле-ссылке. Откатывать такое числом нельзя, откат
++    /// таких полей делается отдельным списком `links`.
++    LinkAddress,
+     Element(Object<'gc>, usize),
+ }
+ 
+ impl<'gc> Snapshot<'gc> {
+     /// Вернуть поля в состояние до нативного счёта.
+     pub fn restore(&self, mc: &Mutation<'gc>) {
++        for (object, slot, value) in self.links.iter() {
++            object.set_slot_no_coerce(*slot, *value, mc);
++        }
+         for (place, value) in self.fields.iter() {
+             match place {
+                 Place::Slot(object, slot) => set(*object, *slot, *value, mc),
+                 Place::IntSlot(object, slot) => {
+                     object.set_slot_no_coerce(*slot, Value::Integer(*value as i32), mc);
+                 }
++                Place::LinkAddress => {}
+                 Place::Element(object, at) => {
+                     if let Some(mut storage) = object.as_vector_storage_mut(mc) {
+                         storage.set_in_range(*at, Value::Number(*value));
+@@ -1734,10 +1976,14 @@ impl<'gc> Snapshot<'gc> {
+ 
+ /// Совпадают ли два ответа метода. Сравнение побитовое: методы столкновений возвращают дробное
+ /// число, и физика решает по нему, есть касание или нет. Два NaN считаются одинаковыми.
+-pub fn values_match(mine: Value<'_>, theirs: Value<'_>) -> bool {
++pub fn values_match<'gc>(mine: Value<'gc>, theirs: Value<'gc>) -> bool {
+     if let (Value::Bool(mine), Value::Bool(theirs)) = (mine, theirs) {
+         return mine == theirs;
+     }
++    // Сортировка возвращает голову списка: сверять её надо по тождеству объекта.
++    if let (Value::Object(mine), Value::Object(theirs)) = (mine, theirs) {
++        return Object::ptr_eq(mine, theirs);
++    }
+     match (mine.try_as_f64(), theirs.try_as_f64()) {
+         (Some(mine), Some(theirs)) => {
+             mine.to_bits() == theirs.to_bits() || (mine.is_nan() && theirs.is_nan())
+@@ -1757,6 +2003,32 @@ pub fn snapshot<'gc>(
+     native: NativeMethod,
+     method: Method<'gc>,
+ ) -> Option<Snapshot<'gc>> {
++    // Сортировка переставляет ссылки во всём списке, поэтому снимок хранит и их: иначе байткод
++    // после нативного счёта пошёл бы уже по переставленному списку и вернул бы другую голову
++    // просто потому, что стартовал не с начала. Сверяется при этом сама голова (её сравнивает
++    // `values_match`): поэлементно сравнить два прохода нельзя — байткод по ходу переставляет и
++    // ячейку с аргументом, так что обход после него начинается с другого звена.
++    if native == NativeMethod::ConflictSort {
++        let list = activation.local_register(1).as_object()?;
++        let slots = vg_sort_slots(activation, declaring_class(method)?, list)?;
++        // Поэлементно сравнивать тут нечего: байткод по ходу переставляет ячейку с аргументом,
++        // и обход после него начинается с другого звена. Сверяется возвращённая голова списка.
++        let fields = Vec::new();
++        let mut links = Vec::new();
++        let mut node = Some(list);
++        // Ограничение на длину — защита от закольцованного списка, а не рабочий случай.
++        for _ in 0..100_000 {
++            let Some(current) = node else { break };
++            if current.vtable().id() != slots.vg_vtable {
++                break;
++            }
++            let next = current.get_slot(slots.next);
++            links.push((current, slots.next, next));
++            node = next.as_object();
++        }
++        return Some(Snapshot { fields, links });
++    }
++
+     // Обходы структуры граней переписывают координаты у всех вершин дерева и габариты у самой
+     // `VG`: сверять их можно только по этим полям, метод ничего не возвращает.
+     if matches!(
+@@ -1771,7 +2043,7 @@ pub fn snapshot<'gc>(
+             fields.push((Place::Slot(this, *slot), this.get_slot(*slot).try_as_f64()?));
+         }
+         vg_collect(face, &slots, &mut fields, 0);
+-        return Some(Snapshot { fields });
++        return Some(Snapshot { fields, links: Vec::new() });
+     }
+ 
+     // Загрузка констант не возвращает ничего, и весь её видимый итог — отрезок теневого набора.
+@@ -1785,7 +2057,7 @@ pub fn snapshot<'gc>(
+                 shadow.get_optional(call.base + at)?.try_as_f64()?,
+             ));
+         }
+-        return Some(Snapshot { fields });
++        return Some(Snapshot { fields, links: Vec::new() });
+     }
+ 
+     // Столкновение эллипсоида пишет в два вектора, и по ним только и видно, совпал ли счёт:
+@@ -1803,7 +2075,7 @@ pub fn snapshot<'gc>(
+                 ));
+             }
+         }
+-        return Some(Snapshot { fields });
++        return Some(Snapshot { fields, links: Vec::new() });
+     }
+ 
+     // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
+@@ -1825,7 +2097,8 @@ pub fn snapshot<'gc>(
+         | NativeMethod::SetProgramConstants
+         | NativeMethod::VgTransform
+         | NativeMethod::VgTransformBound
+-        | NativeMethod::VgBound => return None,
++        | NativeMethod::VgBound
++        | NativeMethod::ConflictSort => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -1860,7 +2133,7 @@ pub fn snapshot<'gc>(
+     for slot in slots.iter() {
+         fields.push((Place::Slot(object, *slot), object.get_slot(*slot).try_as_f64()?));
+     }
+-    Some(Snapshot { fields })
++    Some(Snapshot { fields, links: Vec::new() })
+ }
+ 
+ /// Объект класса, в котором объявлен выполняемый метод. Нужен ради статических полей движка
+@@ -1891,6 +2164,7 @@ pub fn run<'gc>(
+             vg_struct_walk(activation, method, VgWalk::TransformAndBound)
+         }
+         NativeMethod::VgBound => vg_struct_walk(activation, method, VgWalk::Bound),
++        NativeMethod::ConflictSort => conflict_sort(activation, method),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+-- 
+2.51.1.windows.1
+

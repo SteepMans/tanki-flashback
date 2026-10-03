@@ -1,0 +1,78 @@
+From 5f2e19d0fe1383f017aefb75d26107f8166da6e4 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 10:23:27 +0300
+Subject: [PATCH 1/2] core: write off late movie frames instead of executing
+ them unseen
+
+---
+ core/src/avm2/method_stats.rs | 13 +++++++++++++
+ core/src/player.rs            | 10 +++++++++-
+ web/src/lib.rs                |  7 +++++++
+ 3 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 4c97d93e..f29e9afd 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -394,6 +394,19 @@ static SOCKET_PROBE: AtomicBool = AtomicBool::new(false);
+ /// на одной сборке.
+ static SOCKET_WAKE: AtomicBool = AtomicBool::new(true);
+ 
++/// Догон кадров фильма при отставании (до пяти кадров за тик). По умолчанию включён — так ведёт
++/// себя обычный Ruffle и на этом стоят его тесты; браузерная обвязка выключает его для игры,
++/// а страница может вернуть флагом `?catchup=1` для сравнения «до/после».
++static FRAME_CATCHUP: AtomicBool = AtomicBool::new(true);
++
++pub fn set_frame_catchup_enabled(value: bool) {
++    FRAME_CATCHUP.store(value, Ordering::Relaxed);
++}
++
++pub fn frame_catchup_enabled() -> bool {
++    FRAME_CATCHUP.load(Ordering::Relaxed)
++}
++
+ thread_local! {
+     /// Моменты прихода входящих порций из сети, ещё не отданных ActionScript.
+     static SOCKET_IN_ARRIVALS: RefCell<VecDeque<Instant>> = const { RefCell::new(VecDeque::new()) };
+diff --git a/core/src/player.rs b/core/src/player.rs
+index 59673e9a..ed181d47 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -531,7 +531,15 @@ impl Player {
+         self.frame_accumulator += dt;
+         let frame_duration = self.frame_duration();
+ 
+-        let max_frames_per_tick = self.max_frames_per_tick();
++        // Догон кадров фильма отключаем по флагу со страницы: физика игры сама догоняет время
++        // своим шагом от getTimer(), а «упущенные» кадры фильма только исполняют ActionScript,
++        // результат которого никто не увидит, — и заслоняют собой события сокета в очереди
++        // главного потока. Долг сверх одного кадра списывается ниже без исполнения.
++        let max_frames_per_tick = if crate::method_stats::frame_catchup_enabled() {
++            self.max_frames_per_tick()
++        } else {
++            1
++        };
+         let mut frame = 0;
+ 
+         while frame < max_frames_per_tick && self.frame_accumulator >= frame_duration {
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index fdd64f52..61395d76 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1502,6 +1502,13 @@ impl RuffleHandle {
+                 &instance.window,
+                 "ruffleNoSocketWake",
+             ));
++            // Догон кадров фильма в браузере по умолчанию выключен: кадры сверх одного за тик
++            // никто не увидит, а их ActionScript задерживает события сокета. `?catchup=1`
++            // возвращает поведение обычного Ruffle для сравнения.
++            ruffle_core::method_stats::set_frame_catchup_enabled(flag_requested(
++                &instance.window,
++                "ruffleFrameCatchup",
++            ));
+             let device_pixel_ratio =
+                 instance.window.device_pixel_ratio() * render_scale(&instance.window); // Changes via user zooming.
+             if instance.canvas_width != canvas_width
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,410 @@
+From 45ff2f4e49458bda3609b7d9d205e421762f2390 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 12:40:15 +0300
+Subject: [PATCH] core: native transparent triangle batching around
+ drawTransparent
+
+---
+ core/src/avm2/fast_paths.rs | 344 +++++++++++++++++++++++++++++++++++-
+ 1 file changed, 342 insertions(+), 2 deletions(-)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 55eb4670..0a266d83 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -96,6 +96,8 @@ pub enum NativeMethod {
+     KdCollectPlanes,
+     /// Свёртка прозрачности, режима смешивания и цветовой трансформации с родителем.
+     ObjectConcat,
++    /// Батчи прозрачных треугольников: константы пакетами по восемнадцать и отрисовка.
++    CameraTransparentBatch,
+ }
+ 
+ impl NativeMethod {
+@@ -131,6 +133,7 @@ impl NativeMethod {
+             ("Sprite3D", "c7108d08") => Some(Self::SpriteBillboard),
+             ("KDContainer", "d33b25fe") => Some(Self::KdCollectPlanes),
+             ("Object3D", "concat") => Some(Self::ObjectConcat),
++            ("Camera3D", "a2c88d8c") => Some(Self::CameraTransparentBatch),
+             _ => None,
+         }
+     }
+@@ -148,6 +151,7 @@ impl NativeMethod {
+                 | Self::CalculateLight
+                 | Self::KdCollectPlanes
+                 | Self::ObjectConcat
++                | Self::CameraTransparentBatch
+         )
+     }
+ 
+@@ -164,7 +168,10 @@ impl NativeMethod {
+     /// не откатить, — такие замены в режиме сверки не запускаются вовсе; их составные части
+     /// сверяются по отдельности.
+     pub fn comparable(self) -> bool {
+-        !matches!(self, Self::PadTexture | Self::KdCollectPlanes)
++        !matches!(
++            self,
++            Self::PadTexture | Self::KdCollectPlanes | Self::CameraTransparentBatch
++        )
+     }
+ }
+ 
+@@ -5387,6 +5394,335 @@ fn concat_slots<'gc>(
+     }
+ }
+ 
++/// Слоты батчинга прозрачных треугольников (`Camera3D.a2c88d8c`).
++#[derive(Clone, Copy)]
++struct BatchSlots {
++    /// device на камере; статики класса Camera3D: набор констант, два вспомогательных статика,
++    /// передаваемых в drawTransparent, и хранилище владельцев по ключу distance.
++    device: usize,
++    constants: usize,
++    static_first: usize,
++    static_second: usize,
++    owners: usize,
++    /// md, mh, ml на Object3D-владельце; None — владельцев ещё не видели.
++    owner_m: Option<[usize; 3]>,
++}
++
++thread_local! {
++    static BATCH_SLOTS: RefCell<Option<BatchSlots>> = const { RefCell::new(None) };
++    static BATCH_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn batch_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    camera: Object<'gc>,
++    camera_class: Object<'gc>,
++) -> Option<BatchSlots> {
++    if let Some(slots) = BATCH_SLOTS.with(|cache| *cache.borrow()) {
++        return Some(slots);
++    }
++    if BATCH_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Option<BatchSlots> {
++        Some(BatchSlots {
++            device: slot_of(activation, camera, "device", true)?,
++            constants: slot_by_local_name(camera_class, "constants")?,
++            static_first: slot_by_local_name(camera_class, "c1f43c8f")?,
++            static_second: slot_by_local_name(camera_class, "b3903704")?,
++            // Хранилище владельцев — единственное ЭКЗЕМПЛЯРНОЕ из четырёх: его заводит
++            // конструктор камеры, а не cinit класса.
++            owners: slot_by_local_name(camera, "b277285c")?,
++            owner_m: None,
++        })
++    };
++    match resolve(activation) {
++        Some(slots) => {
++            BATCH_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            Some(slots)
++        }
++        None => {
++            BATCH_HOPELESS.with(|flag| flag.set(true));
++            None
++        }
++    }
++}
++
++/// `Camera3D.a2c88d8c` — отправка прозрачной геометрии: треугольники веером из каждой грани,
++/// по восемь констант на вершину, пакетами по восемнадцать треугольников; каждый пакет уходит
++/// в setProgramConstantsFromVector (нативная замена) и drawTransparent материала (байткод).
++/// Стабильные три-девять процентов кадра владельца.
++///
++/// Как и обход KD, замена несравнима: пакет рисуется на устройстве, второй прогон нарисовал бы
++/// его дважды. Проверка — отсутствие метода в интерпретируемом топе и целая картинка.
++fn camera_transparent_batch<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++) -> Result<Option<Value<'gc>>, crate::avm2::Error<'gc>> {
++    let Some(camera) = activation.local_register(0).as_object() else {
++        return Ok(None);
++    };
++    let Some(list) = activation.local_register(1).as_object() else {
++        return Ok(None);
++    };
++    let passthrough = activation.local_register(2);
++    let flag = match activation.local_register(3) {
++        Value::Bool(value) => value,
++        _ => return Ok(None),
++    };
++
++    // Слоты граней и вершин — те же, что у резки конфликтов; камера должна совпасть классом.
++    let Some(slots) = conflict_slots(activation, list, camera) else {
++        return Ok(None);
++    };
++    if camera.vtable().id() != slots.camera_vtable {
++        return Ok(None);
++    }
++    let Some(camera_class_object) = declaring_class(method) else {
++        return Ok(None);
++    };
++    let camera_class: Object<'gc> = camera_class_object.into();
++    let Some(mut batch) = batch_slots(activation, camera, camera_class) else {
++        return Ok(None);
++    };
++
++    // Прескан: цепочка граней, минимум два звена, вершины на месте; в ветке с владельцами —
++    // владелец каждой грани по ключу distance и его матричные слоты.
++    let Some(faces) = conflict_chain(Some(list), &slots) else {
++        return Ok(None);
++    };
++    let owners_value = camera.get_slot(batch.owners);
++    let mut owners: Vec<Object<'gc>> = Vec::new();
++    for face in faces.iter() {
++        let Some(first_wrapper) = face.get_slot(slots.face_wrapper).as_object() else {
++            return Ok(None);
++        };
++        if first_wrapper.vtable().id() != slots.wrapper_vtable {
++            return Ok(None);
++        }
++        let Some(second_wrapper) = first_wrapper.get_slot(slots.wrapper_next).as_object() else {
++            return Ok(None);
++        };
++        let mut link = Some(second_wrapper);
++        while let Some(wrapper) = link {
++            if wrapper.vtable().id() != slots.wrapper_vtable {
++                return Ok(None);
++            }
++            let Some(vertex) = wrapper.get_slot(slots.wrapper_vertex).as_object() else {
++                return Ok(None);
++            };
++            if vertex.vtable().id() != slots.vertex_vtable {
++                return Ok(None);
++            }
++            link = wrapper.get_slot(slots.wrapper_next).as_object();
++        }
++        let Some(first_vertex) = first_wrapper.get_slot(slots.wrapper_vertex).as_object() else {
++            return Ok(None);
++        };
++        if first_vertex.vtable().id() != slots.vertex_vtable {
++            return Ok(None);
++        }
++
++        if flag {
++            let distance = face
++                .get_slot(slots.face_distance)
++                .try_as_f64()
++                .unwrap_or(f64::NAN);
++            let index = crate::ecma_conversions::f64_to_wrapping_i32(distance);
++            let Some(container) = owners_value.as_object() else {
++                return Ok(None);
++            };
++            let Some(storage) = container.as_vector_storage() else {
++                return Ok(None);
++            };
++            if index < 0 || index as usize >= storage.length() {
++                return Ok(None);
++            }
++            let Some(owner) = storage.get_optional(index as usize).and_then(|v| v.as_object())
++            else {
++                return Ok(None);
++            };
++            if batch.owner_m.is_none() {
++                let resolve = |activation: &mut Activation<'_, 'gc>| -> Option<[usize; 3]> {
++                    Some([
++                        slot_of(activation, owner, "md", true)?,
++                        slot_of(activation, owner, "mh", true)?,
++                        slot_of(activation, owner, "ml", true)?,
++                    ])
++                };
++                drop(storage);
++                let Some(owner_m) = resolve(activation) else {
++                    return Ok(None);
++                };
++                batch.owner_m = Some(owner_m);
++                BATCH_SLOTS.with(|cache| *cache.borrow_mut() = Some(batch));
++            }
++            owners.push(owner);
++        }
++    }
++
++    // Материал берётся с первой грани один раз; при нём обязательны устройство и набор констант
++    // достаточной длины (18 треугольников по 24 значения).
++    let material = list.get_slot(slots.face_material);
++    let device = camera.get_slot(batch.device);
++    if material.as_object().is_some() && device.as_object().is_none() {
++        return Ok(None);
++    }
++    let Some(constants) = camera_class.get_slot(batch.constants).as_object() else {
++        return Ok(None);
++    };
++    {
++        let Some(storage) = constants.as_vector_storage() else {
++            return Ok(None);
++        };
++        if storage.length() < 432 {
++            return Ok(None);
++        }
++    }
++
++    // Дальше записи. Имёна вызовов готовим один раз.
++    let vertex_string: Value<'gc> = AvmString::new_utf8(activation.gc(), "vertex").into();
++    let set_constants_name = Multiname::new(
++        activation.avm2().namespaces.public_vm_internal(),
++        AvmString::new_utf8(activation.gc(), "setProgramConstantsFromVector"),
++    );
++    let engine_ns = crate::avm2::namespace::Namespace::package(
++        AvmString::new_utf8(activation.gc(), ENGINE_NS),
++        crate::avm2::api_version::ApiVersion::VM_INTERNAL,
++        activation.strings(),
++    );
++    let draw_name = Multiname::new(
++        engine_ns,
++        AvmString::new_utf8(activation.gc(), "drawTransparent"),
++    );
++
++    let mut triangles = 0i32; // l11
++    let mut cursor = 0usize; // l12
++
++    // Один пакет — на устройство и в отрисовку. Статики читаются на каждом вызове, как getlex.
++    macro_rules! flush {
++        () => {
++            if let Some(material_object) = material.as_object() {
++                let Some(device_object) = device.as_object() else {
++                    return Ok(None);
++                };
++                Value::Object(device_object).call_property(
++                    &set_constants_name,
++                    crate::avm2::function::FunctionArgs::from_slice(&[
++                        vertex_string,
++                        Value::Integer(16),
++                        Value::Object(constants),
++                        Value::Integer(triangles.wrapping_mul(6)),
++                        Value::Bool(false),
++                    ]),
++                    activation,
++                )?;
++                let static_first = camera_class.get_slot(batch.static_first);
++                let static_second = camera_class.get_slot(batch.static_second);
++                Value::Object(material_object).call_property(
++                    &draw_name,
++                    crate::avm2::function::FunctionArgs::from_slice(&[
++                        Value::Object(camera),
++                        static_first,
++                        static_second,
++                        Value::Integer(0),
++                        Value::Integer(triangles),
++                        passthrough,
++                        Value::Bool(true),
++                    ]),
++                    activation,
++                )?;
++            }
++        };
++    }
++
++    let read = |vertex: Object<'gc>, slot: usize| {
++        vertex.get_slot(slot).try_as_f64().unwrap_or(f64::NAN)
++    };
++
++    for (at, face) in faces.iter().enumerate() {
++        let mc = activation.gc();
++        face.set_slot_no_coerce(slots.face_process_next, Value::Null, mc);
++
++        let first_wrapper = face
++            .get_slot(slots.face_wrapper)
++            .as_object()
++            .expect("проверено пресканом");
++        let first_vertex = first_wrapper
++            .get_slot(slots.wrapper_vertex)
++            .as_object()
++            .expect("проверено пресканом");
++        let second_wrapper = first_wrapper
++            .get_slot(slots.wrapper_next)
++            .as_object()
++            .expect("проверено пресканом");
++        let mut previous = second_wrapper
++            .get_slot(slots.wrapper_vertex)
++            .as_object()
++            .expect("проверено пресканом");
++        let owner = owners.get(at).copied();
++
++        let mut link = second_wrapper.get_slot(slots.wrapper_next).as_object();
++        while let Some(wrapper) = link {
++            if triangles == 18 {
++                flush!();
++                triangles = 0;
++                cursor = 0;
++            }
++            let current = wrapper
++                .get_slot(slots.wrapper_vertex)
++                .as_object()
++                .expect("проверено пресканом");
++
++            // Восемь констант на вершину; владелец перечитывается на каждый треугольник,
++            // как это делает байткод.
++            let mut values = [0.0f64; 24];
++            let mut fill = |base: usize, vertex: Object<'gc>| {
++                values[base] = read(vertex, slots.vertex_camera[0]);
++                values[base + 1] = read(vertex, slots.vertex_camera[1]);
++                values[base + 2] = read(vertex, slots.vertex_camera[2]);
++                if flag {
++                    let owner = owner.expect("проверено пресканом");
++                    let owner_m = batch.owner_m.expect("проверено пресканом");
++                    values[base + 3] = -read(owner, owner_m[0]);
++                    values[base + 4] = read(vertex, slots.vertex_uv[0]);
++                    values[base + 5] = read(vertex, slots.vertex_uv[1]);
++                    values[base + 6] = -read(owner, owner_m[1]);
++                    values[base + 7] = -read(owner, owner_m[2]);
++                } else {
++                    values[base + 3] = read(vertex, slots.vertex_normal[0]);
++                    values[base + 4] = read(vertex, slots.vertex_uv[0]);
++                    values[base + 5] = read(vertex, slots.vertex_uv[1]);
++                    values[base + 6] = read(vertex, slots.vertex_normal[1]);
++                    values[base + 7] = read(vertex, slots.vertex_normal[2]);
++                }
++            };
++            fill(0, first_vertex);
++            fill(8, previous);
++            fill(16, current);
++
++            {
++                let mc = activation.gc();
++                let Some(mut storage) = constants.as_vector_storage_mut(mc) else {
++                    return Ok(None);
++                };
++                for (offset, value) in values.iter().enumerate() {
++                    storage.set_in_range(cursor + offset, Value::Number(*value));
++                }
++            }
++            cursor += 24;
++            triangles += 1;
++            previous = current;
++            link = wrapper.get_slot(slots.wrapper_next).as_object();
++        }
++    }
++
++    if triangles > 0 {
++        flush!();
++    }
++    Ok(Some(Value::Undefined))
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -6258,7 +6594,8 @@ pub fn snapshot<'gc>(
+         | NativeMethod::CalculateLight
+         | NativeMethod::SpriteBillboard
+         | NativeMethod::KdCollectPlanes
+-        | NativeMethod::ObjectConcat => return None,
++        | NativeMethod::ObjectConcat
++        | NativeMethod::CameraTransparentBatch => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -6317,6 +6654,9 @@ pub fn run<'gc>(
+     match native {
+         NativeMethod::KdCollectPlanes => return kd_collect_planes(activation),
+         NativeMethod::ObjectConcat => return object_concat(activation),
++        NativeMethod::CameraTransparentBatch => {
++            return camera_transparent_batch(activation, method);
++        }
+         NativeMethod::BoxBoxOverlapOnAxis => {
+             Ok(get_overlap_on_axis(activation, 0, 3).ok().map(Value::Number))
+         }
+-- 
+2.51.1.windows.1
+

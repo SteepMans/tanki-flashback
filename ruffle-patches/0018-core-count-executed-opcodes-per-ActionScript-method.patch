@@ -1,0 +1,327 @@
+From 84032e4585bd546577f7af383de8d4d1818680a2 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 17:38:08 +0300
+Subject: [PATCH] core: count executed opcodes per ActionScript method
+
+---
+ core/src/avm2.rs              |   1 +
+ core/src/avm2/activation.rs   |  23 ++++++
+ core/src/avm2/method_stats.rs | 150 ++++++++++++++++++++++++++++++++++
+ core/src/lib.rs               |   2 +
+ core/src/player.rs            |  22 +++++
+ web/src/lib.rs                |  34 +++++++-
+ 6 files changed, 231 insertions(+), 1 deletion(-)
+ create mode 100644 core/src/avm2/method_stats.rs
+
+diff --git a/core/src/avm2.rs b/core/src/avm2.rs
+index 8937f782..ac918c73 100644
+--- a/core/src/avm2.rs
++++ b/core/src/avm2.rs
+@@ -61,6 +61,7 @@ mod function;
+ pub mod globals;
+ mod metadata;
+ mod method;
++pub mod method_stats;
+ mod multiname;
+ mod namespace;
+ pub mod object;
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index a7b524f0..5ebc6a23 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -642,7 +642,23 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         self.bound_superclass_object
+     }
+ 
++    /// Обёртка вокруг цикла интерпретатора: считает, сколько инструкций выполнено ИМЕННО в этом
++    /// методе (вложенные вызовы копят в своих счётчиках). По этим числам видно, какой код игры
++    /// съедает кадр — в профиле браузера весь ActionScript выглядит одной функцией run_actions.
+     pub fn run_actions(&mut self, method: Method<'gc>) -> Result<Value<'gc>, Error<'gc>> {
++        let mut executed_ops = 0u64;
++        let result = self.run_actions_inner(method, &mut executed_ops);
++        if crate::avm2::method_stats::enabled() {
++            crate::avm2::method_stats::record(method, executed_ops);
++        }
++        result
++    }
++
++    fn run_actions_inner(
++        &mut self,
++        method: Method<'gc>,
++        executed_ops: &mut u64,
++    ) -> Result<Value<'gc>, Error<'gc>> {
+         // The method must be verified at this point
+ 
+         let verified_info = method.get_verified_info();
+@@ -651,10 +667,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         self.timeout_check()?;
+ 
+         let mut ip = 0;
++        // Читаем флаг один раз на метод: ветка по локальной переменной предсказуема и почти
++        // бесплатна, а атомарное чтение на каждую инструкцию заметно бы стоило.
++        let trace_ops = crate::avm2::method_stats::ops_enabled();
+ 
+         loop {
+             let op = &opcodes[ip];
+             ip += 1;
++            *executed_ops += 1;
++            if trace_ops {
++                crate::avm2::method_stats::record_op(crate::avm2::method_stats::op_kind(op));
++            }
+             avm_debug!(self.avm2(), "Opcode: {op:?}");
+ 
+             let result = match op {
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+new file mode 100644
+index 00000000..1d32a404
+--- /dev/null
++++ b/core/src/avm2/method_stats.rs
+@@ -0,0 +1,150 @@
++//! Учёт выполненных инструкций по методам ActionScript.
++//!
++//! Профилировщик браузера видит внутри WASM только цикл интерпретатора (`run_actions`), поэтому по
++//! нему нельзя понять, КАКОЙ код игры съедает кадр. Здесь считается, сколько инструкций выполнено
++//! в каждом методе — собственных, без вложенных вызовов: у каждого вызова свой счётчик, дочерние
++//! вызовы копят в своих. Это прямой аналог self-time и достаточно точен, чтобы найти горячий код.
++//!
++//! Включается со страницы: `window.ruffleTraceMethods = true` (раз в секунду в лог уходит верхушка
++//! списка). Пока выключено, вся цена — один инкремент счётчика на инструкцию.
++
++use std::cell::{Cell, RefCell};
++use std::collections::HashMap;
++use std::sync::atomic::{AtomicBool, Ordering};
++
++use crate::avm2::method::Method;
++
++static ENABLED: AtomicBool = AtomicBool::new(false);
++/// Гистограмма по видам инструкций включается ОТДЕЛЬНО (window.ruffleTraceOps): счёт на каждой
++/// инструкции сам по себе заметно замедляет игру и смазал бы замер горячих методов.
++static OPS_ENABLED: AtomicBool = AtomicBool::new(false);
++
++thread_local! {
++    /// Имя метода -> (инструкций, вызовов).
++    static TOTALS: RefCell<HashMap<String, (u64, u64)>> = RefCell::new(HashMap::new());
++    /// Счётчики по видам инструкций. Массив ячеек, а не словарь: считаем на КАЖДОЙ инструкции,
++    /// и словарь со строковым ключом обходился в разы дороже самого интерпретатора.
++    static OPS: [Cell<u64>; OP_KINDS.len()] = const { [const { Cell::new(0) }; OP_KINDS.len()] };
++}
++
++pub fn set_enabled(value: bool) {
++    let was = ENABLED.swap(value, Ordering::Relaxed);
++    if was && !value {
++        TOTALS.with(|totals| totals.borrow_mut().clear());
++    }
++}
++
++pub fn enabled() -> bool {
++    ENABLED.load(Ordering::Relaxed)
++}
++
++pub fn set_ops_enabled(value: bool) {
++    OPS_ENABLED.store(value, Ordering::Relaxed);
++}
++
++pub fn ops_enabled() -> bool {
++    OPS_ENABLED.load(Ordering::Relaxed)
++}
++
++/// Имя вида `Класс/метод` — по нему код игры узнаётся даже после обфускации.
++fn label(method: Method<'_>) -> String {
++    let name = method
++        .method_name()
++        .map(|name| name.to_string())
++        .unwrap_or_else(|| format!("метод#{}", method.abc_method_index()));
++
++    match method.bound_class() {
++        Some(class) => format!("{}/{}", class.name().local_name(), name),
++        None => name,
++    }
++}
++
++pub fn record(method: Method<'_>, ops: u64) {
++    TOTALS.with(|totals| {
++        let mut totals = totals.borrow_mut();
++        let entry = totals.entry(label(method)).or_insert((0, 0));
++        entry.0 += ops;
++        entry.1 += 1;
++    });
++}
++
++/// Виды инструкций для гистограммы. Отдельно выделены обращения к полям: у Ruffle их несколько
++/// видов, и по соотношению видно, справился ли анализатор — Slot дешёвый, Slow ищет имя в таблице.
++pub const OP_KINDS: [&str; 16] = [
++    "GetSlot", "SetSlot", "GetPropertyStatic", "GetPropertyFast", "GetPropertySlow",
++    "SetProperty", "CallMethod", "CallNative", "CallProperty", "Construct",
++    "Local", "Arithmetic/Compare", "Branch", "Coerce", "Stack/Scope", "прочее",
++];
++
++/// Номер вида инструкции в `OP_KINDS`.
++pub fn op_kind(op: &crate::avm2::op::Op<'_>) -> usize {
++    use crate::avm2::op::Op;
++    match op {
++        Op::GetSlot { .. } => 0,
++        Op::SetSlot { .. } | Op::SetSlotNoCoerce { .. } | Op::SetSlotCoerceI { .. } => 1,
++        Op::GetPropertyStatic { .. } => 2,
++        Op::GetPropertyFast { .. } => 3,
++        Op::GetPropertySlow { .. } => 4,
++        Op::SetPropertyStatic { .. } | Op::SetPropertyFast { .. } | Op::SetPropertySlow { .. }
++        | Op::InitProperty { .. } => 5,
++        Op::CallMethod { .. } => 6,
++        Op::CallNative { .. } => 7,
++        Op::CallProperty { .. } | Op::CallPropVoid { .. } | Op::CallPropLex { .. }
++        | Op::Call { .. } | Op::CallStatic { .. } | Op::CallSuper { .. } => 8,
++        Op::Construct { .. } | Op::ConstructProp { .. } | Op::ConstructSlot { .. }
++        | Op::ConstructSuper { .. } => 9,
++        Op::GetLocal { .. } | Op::SetLocal { .. } | Op::StoreLocal { .. } | Op::Kill { .. } => 10,
++        Op::Add { .. } | Op::AddI | Op::Subtract { .. } | Op::SubtractI | Op::Multiply
++        | Op::MultiplyI | Op::Divide | Op::Modulo | Op::Negate | Op::NegateI
++        | Op::Increment | Op::IncrementI | Op::Decrement | Op::DecrementI
++        | Op::Equals | Op::StrictEquals | Op::LessThan | Op::LessEquals
++        | Op::GreaterThan | Op::GreaterEquals | Op::Not => 11,
++        Op::IfTrue { .. } | Op::IfFalse { .. } | Op::Jump { .. } | Op::PopJump { .. }
++        | Op::LookupSwitch(..) => 12,
++        Op::Coerce { .. } | Op::CoerceA | Op::CoerceB | Op::CoerceD | Op::CoerceI
++        | Op::CoerceO | Op::CoerceS | Op::CoerceU | Op::CoerceSwapPop { .. }
++        | Op::CoerceDSwapPop | Op::CoerceISwapPop | Op::CoerceUSwapPop => 13,
++        Op::PushDouble { .. } | Op::PushInt { .. } | Op::PushUint { .. } | Op::PushTrue
++        | Op::PushFalse | Op::PushNull | Op::PushUndefined | Op::PushString { .. }
++        | Op::Dup | Op::Pop | Op::Swap | Op::FindProperty { .. } | Op::FindPropStrict { .. }
++        | Op::FindDef { .. } | Op::GetScopeObject { .. } | Op::GetOuterScope { .. }
++        | Op::GetScriptGlobals { .. } | Op::PushScope { .. } | Op::PopScope => 14,
++        _ => 15,
++    }
++}
++
++/// Учитывает выполненную инструкцию. Вызывается только при включённом счётчике.
++pub fn record_op(kind: usize) {
++    OPS.with(|ops| {
++        let cell = &ops[kind];
++        cell.set(cell.get() + 1);
++    });
++}
++
++/// Гистограмма по видам инструкций; счётчики обнуляются.
++pub fn take_ops() -> Vec<(&'static str, u64)> {
++    OPS.with(|ops| {
++        let mut rows: Vec<_> = OP_KINDS
++            .iter()
++            .zip(ops.iter())
++            .map(|(name, cell)| (*name, cell.replace(0)))
++            .filter(|(_, count)| *count > 0)
++            .collect();
++        rows.sort_by(|a, b| b.1.cmp(&a.1));
++        rows
++    })
++}
++
++/// Верхушка списка по числу инструкций. Счётчики обнуляются, чтобы каждая выдача была за период.
++pub fn take_top(limit: usize) -> Vec<(String, u64, u64)> {
++    TOTALS.with(|totals| {
++        let mut totals = totals.borrow_mut();
++        let mut rows: Vec<_> = totals
++            .drain()
++            .map(|(name, (ops, calls))| (name, ops, calls))
++            .collect();
++        rows.sort_by(|a, b| b.1.cmp(&a.1));
++        rows.truncate(limit);
++        rows
++    })
++}
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+index 1a7165cf..1cbc81cb 100644
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -15,6 +15,8 @@ extern crate num_derive;
+ #[macro_use]
+ mod avm1;
+ mod avm2;
++/// Счётчик горячих методов ActionScript: включается со страницы, см. `avm2::method_stats`.
++pub use avm2::method_stats;
+ mod avm_rng;
+ mod binary_data;
+ pub mod bitmap;
+diff --git a/core/src/player.rs b/core/src/player.rs
+index d0858ae9..a0965412 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -2387,6 +2387,28 @@ impl Player {
+                 *g / elapsed,
+             );
+ 
++            // window.ruffleTraceMethods = true — раз в секунду печатаем, какие методы игры
++            // выполнили больше всего инструкций. Иначе на что уходит кадр, видно только целиком.
++            if crate::avm2::method_stats::enabled() {
++                let rows = crate::avm2::method_stats::take_top(15);
++                let total: u64 = rows.iter().map(|(_, ops, _)| ops).sum();
++                tracing::info!("hot ActionScript methods, {total} ops/s in top {}:", rows.len());
++                for (name, ops, calls) in rows {
++                    tracing::info!(
++                        "  {:>9} ops/s  {:>7} calls/s  {name}",
++                        (ops as f32 / elapsed) as u64,
++                        (calls as f32 / elapsed) as u64
++                    );
++                }
++                let ops = crate::avm2::method_stats::take_ops();
++                let all: u64 = ops.iter().map(|(_, count)| count).sum();
++                tracing::info!("op mix, {all} counted:");
++                for (name, count) in ops {
++                    tracing::info!("  {:>5.1}%  {:>9}/s  {name}", 100.0 * count as f32 / all as f32,
++                                   (count as f32 / elapsed) as u64);
++                }
++            }
++
+             *started = web_time::Instant::now();
+             *calls = 0;
+             *s = 0.0;
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 35a7ee4d..bd3d5eca 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1192,7 +1192,14 @@ impl RuffleHandle {
+             // Check for canvas resize.
+             let canvas_width = instance.canvas.client_width();
+             let canvas_height = instance.canvas.client_height();
+-            let device_pixel_ratio = instance.window.device_pixel_ratio(); // Changes via user zooming.
++            // Множитель разрешения отрисовки. Текст в игре набран системными шрифтами, которых
++            // у движка нет: он рисует свой запасной без хинтинга, и мелкие подписи выглядят мылом.
++            // Отрисовка в увеличенном разрешении с последующим сжатием браузером сглаживает это,
++            // но стоит производительности, поэтому включается из страницы: window.ruffleRenderScale.
++            ruffle_core::method_stats::set_enabled(trace_methods_requested(&instance.window));
++            ruffle_core::method_stats::set_ops_enabled(flag_requested(&instance.window, "ruffleTraceOps"));
++            let device_pixel_ratio =
++                instance.window.device_pixel_ratio() * render_scale(&instance.window); // Changes via user zooming.
+             if instance.canvas_width != canvas_width
+                 || instance.canvas_height != canvas_height
+                 || (instance.device_pixel_ratio - device_pixel_ratio).abs() >= f64::EPSILON
+@@ -1488,3 +1495,28 @@ fn global_init() {
+ 
+     tracing::info!("Ruffle WASM module has been initialized");
+ }
++
++/// Читает булев флаг со страницы.
++fn flag_requested(window: &Window, name: &str) -> bool {
++    js_sys::Reflect::get(window, &JsValue::from_str(name))
++        .ok()
++        .and_then(|value| value.as_bool())
++        .unwrap_or(false)
++}
++
++/// Читает `window.ruffleTraceMethods` — печатать ли раз в секунду самые горячие методы игры.
++fn trace_methods_requested(window: &Window) -> bool {
++    flag_requested(window, "ruffleTraceMethods")
++}
++
++/// Читает `window.ruffleRenderScale` — во сколько раз рисовать подробнее экрана.
++/// По умолчанию 1; значения ограничены разумными пределами, иначе легко упереться
++/// в ограничение видеокарты на размер текстуры.
++fn render_scale(window: &Window) -> f64 {
++    js_sys::Reflect::get(window, &JsValue::from_str("ruffleRenderScale"))
++        .ok()
++        .and_then(|value| value.as_f64())
++        .filter(|value| value.is_finite())
++        .map(|value| value.clamp(1.0, 3.0))
++        .unwrap_or(1.0)
++}
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,307 @@
+import { CALLBACK } from "@/config/constants";
+import { ConfirmDestructionPacket, SelfDestructScheduledPacket } from "@/features/battle/battle.packets";
+import { BattleWorkflow } from "@/features/battle/battle.workflow";
+import { LoadDependencies } from "@/features/loader/loader.packets";
+import { UnloadBattleListPacket } from "@/features/lobby/lobby.packets";
+import { LobbyWorkflow } from "@/features/lobby/lobby.workflow";
+import { ConfirmLayoutChange, SetLayout } from "@/features/system/system.packets";
+import { GameClient } from "@/server/game.client";
+import { GameServer } from "@/server/game.server";
+import { ResourceId } from "@/generated/resourceTypes";
+import logger from "@/utils/logger";
+import { ResourceManager } from "@/utils/resource.manager";
+import { itemBlueprints, supplyPreviewResources, passPreviewResources } from "./garage.data";
+import * as GaragePackets from "./garage.packets";
+
+export class GarageWorkflow {
+    private static _loadGarageDependencies(client: GameClient): void {
+        const resourceIds: ResourceId[] = ["garage"];
+
+        itemBlueprints.turrets.forEach((turret) => {
+            turret.modifications.forEach((mod) => {
+                resourceIds.push(`turret/${turret.id}/m${mod.modificationID}/model` as ResourceId);
+                resourceIds.push(`turret/${turret.id}/m${mod.modificationID}/preview` as ResourceId);
+            });
+        });
+
+        itemBlueprints.hulls.forEach((hull) => {
+            hull.modifications.forEach((mod) => {
+                resourceIds.push(`hull/${hull.id}/m${mod.modificationID}/model` as ResourceId);
+                resourceIds.push(`hull/${hull.id}/m${mod.modificationID}/preview` as ResourceId);
+            });
+        });
+
+        itemBlueprints.paints.forEach((paint) => {
+            resourceIds.push(`paint/${paint.id}/texture` as ResourceId);
+            resourceIds.push(`paint/${paint.id}/preview` as ResourceId);
+        });
+
+        itemBlueprints.kits?.forEach((kit) => {
+            resourceIds.push(kit.previewResource as ResourceId);
+        });
+
+        // Supply preview icons (served from our own resource server, like every other resource).
+        Object.values(supplyPreviewResources).forEach((resourceId) => resourceIds.push(resourceId));
+        // Subscription-pass preview icons (newbie/up_score/pro_battle).
+        Object.values(passPreviewResources).forEach((resourceId) => resourceIds.push(resourceId));
+
+        const uniqueResourceIds = [...new Set(resourceIds)];
+
+        const dependencies = {
+            resources: ResourceManager.getBulkResources(uniqueResourceIds),
+        };
+        client.sendPacket(new LoadDependencies(dependencies, CALLBACK.GARAGE_DATA));
+
+        logger.info(`User ${client.user!.username} is loading garage resources.`);
+    }
+
+    public static async enterGarage(client: GameClient, server: GameServer): Promise<void> {
+        if (!client.user) {
+            logger.error("Attempted to enter garage without a user authenticated.", { client: client.getRemoteAddress() });
+            return;
+        }
+
+        if (!client.isChatLoaded) {
+            await LobbyWorkflow.sendChatSetup(client.user, client, server);
+        }
+
+        client.setState("chat_garage");
+        client.sendPacket(new SetLayout({ layoutId: 1 }));
+        client.sendPacket(new UnloadBattleListPacket());
+
+        this._loadGarageDependencies(client);
+    }
+
+    /** Fully reloads the garage view if the client currently has it open (lobby or in-battle garage).
+     *  Needed whenever the user's RANK changes with the garage open — the item lists are rank-dependent
+     *  and the client does not rebuild them in place (items end up duplicated). Unloads the garage and
+     *  forces the client to reopen the garage UI so the full list is rebuilt from scratch. No-op outside the garage. */
+    public static reloadGarage(client: GameClient, server: GameServer): void {
+        const state = client.getState();
+        if (state !== "chat_garage" && state !== "battle_garage") return;
+        logger.info(`Reloading garage for ${client.user?.username} (garage refresh requested).`);
+        client.sendPacket(new GaragePackets.UnloadGaragePacket());
+
+        if (state === "chat_garage") {
+            client.setState("chat_garage");
+            client.sendPacket(new SetLayout({ layoutId: 1 }));
+            client.sendPacket(new UnloadBattleListPacket());
+        } else {
+            client.setState("battle_garage");
+            client.sendPacket(new SetLayout({ layoutId: 1 }));
+        }
+
+        this._loadGarageDependencies(client);
+    }
+
+    public static enterBattleGarageView(client: GameClient, server: GameServer): void {
+        client.setState("battle_garage");
+        client.sendPacket(new SetLayout({ layoutId: 1 }));
+        this._loadGarageDependencies(client);
+    }
+
+    public static transitionFromLobbyToGarage(client: GameClient, server: GameServer): void {
+        client.sendPacket(new UnloadBattleListPacket());
+        this.enterBattleGarageView(client, server);
+    }
+
+    private static _triggerSelfDestructForRespawn(client: GameClient, server: GameServer): void {
+        if (client.battleState === "suicide") {
+            return;
+        }
+
+        const selfDestructTime = 3000;
+        client.sendPacket(new SelfDestructScheduledPacket({ time: selfDestructTime }));
+
+        setTimeout(() => {
+            if (client.isDestroyed || !client.currentBattle) {
+                return;
+            }
+
+            if (client.battleState === "suicide") {
+                return;
+            }
+
+            server.battleService.dropFlag(client.user!, client.currentBattle, client.battlePosition);
+
+            client.battleState = "suicide";
+            client.battleIncarnation++;
+
+            // Destroying the tank to respawn with new equipment also counts as a death.
+            server.battleService.registerSuicideDeath(client.currentBattle, client);
+
+            const destructionPacket = new ConfirmDestructionPacket({ nickname: client.user!.username, delaytoSpawn: 3000 });
+            const battle = client.currentBattle;
+            const allPlayers = [...battle.users, ...battle.usersBlue, ...battle.usersRed];
+            allPlayers.forEach((player) => {
+                const playerClient = server.findClientByUsername(player.username);
+                if (playerClient && playerClient.currentBattle?.battleId === battle.battleId) {
+                    playerClient.sendPacket(destructionPacket);
+                }
+            });
+        }, selfDestructTime);
+    }
+
+    public static returnToBattleView(client: GameClient, server: GameServer): void {
+        client.setState("battle");
+        client.sendPacket(new SetLayout({ layoutId: 3 }));
+        client.sendPacket(new GaragePackets.UnloadGaragePacket());
+
+        this.applyEquipmentChange(client, server);
+
+        client.sendPacket(new ConfirmLayoutChange({ fromLayout: 3, toLayout: 3 }));
+    }
+
+    /** Applies a pending equipment change (flagged via client.equipmentChangedInGarage) to the current
+     *  battle: loads the new hull/turret/paint resources on every other client, then respawns this player
+     *  with the new equipment (or defers the held spawn if they were dead). No-op when nothing changed.
+     *  Shared by the garage→battle return flow and by test commands that swap equipment in-battle. */
+    public static applyEquipmentChange(client: GameClient, server: GameServer): void {
+        if (client.equipmentChangedInGarage) {
+            client.equipmentChangedInGarage = false;
+            client.pendingEquipmentRespawn = true;
+
+            // Re-arm battles: now that the player is LEAVING the garage, arm the 15-min cooldown for each
+            // category whose equipped base actually changed vs the garage-open snapshot (swap-and-revert = free).
+            const rearmBattle = client.currentBattle;
+            if (rearmBattle?.settings.reArmorEnabled && client.equipSnapshot && client.user) {
+                const u = client.user, snap = client.equipSnapshot;
+                if (u.equippedHull !== snap.hull) server.garageService.startEquipCooldown(u.id, "armor");
+                if (u.equippedTurret !== snap.turret) server.garageService.startEquipCooldown(u.id, "weapon");
+                if (u.equippedPaint !== snap.paint) server.garageService.startEquipCooldown(u.id, "color");
+            }
+            client.equipSnapshot = null;
+
+            const otherClientsInBattle = server.getClients().filter((c) => c !== client && c.currentBattle?.battleId === client.currentBattle?.battleId);
+
+            if (otherClientsInBattle.length > 0) {
+                const user = client.user!;
+                const hullId = user.equippedHull,
+                    hullMod = user.hulls.get(hullId) ?? 0;
+                const turretId = user.equippedTurret,
+                    turretMod = user.turrets.get(turretId) ?? 0;
+                const paintId = user.equippedPaint;
+
+                const resourcesToLoad: ResourceId[] = [`hull/${hullId}/m${hullMod}/model` as ResourceId, `turret/${turretId}/m${turretMod}/model` as ResourceId, `paint/${paintId}/texture` as ResourceId];
+
+                const acknowledgements = new Set(otherClientsInBattle.map((c) => c.user!.username));
+
+                // Hold this player's spawn until every other client has loaded the new equipment — see
+                // GameClient.equipmentResourcesLoading. A player who is ALREADY dead would otherwise
+                // respawn instantly (before the others load), making the new tank invisible / crashing
+                // them (#1009).
+                client.equipmentResourcesLoading = true;
+
+                let completed = false;
+                const finish = () => {
+                    if (completed) return;
+                    completed = true;
+                    clearTimeout(timeoutId);
+                    server.removeDynamicCallback(callbackId);
+                    client.equipmentResourcesLoading = false;
+
+                    if (client.deferredPlacement) {
+                        // Player changed equipment while dead: the spawn was held back. Now that the
+                        // others have the resources, place the tank with the new equipment in one shot
+                        // (no spurious self-destruct, no double spawn).
+                        client.deferredPlacement = false;
+                        BattleWorkflow.placeTank(client);
+                    } else {
+                        // Player was alive: blow up the current tank so it respawns with the new
+                        // equipment (no-op if they died in the meantime).
+                        this._triggerSelfDestructForRespawn(client, server);
+                    }
+                };
+
+                // Fallback so a client that disconnects mid-load can't leave this player stuck.
+                const timeoutId = setTimeout(finish, 10000);
+
+                const onResourcesLoadedCallback = (acknowledgingClient: GameClient) => {
+                    acknowledgements.delete(acknowledgingClient.user!.username);
+                    if (acknowledgements.size === 0) finish();
+                };
+
+                const callbackId = server.registerDynamicCallback(onResourcesLoadedCallback);
+                const depsPacket = new LoadDependencies({ resources: ResourceManager.getBulkResources(resourcesToLoad) }, callbackId);
+
+                otherClientsInBattle.forEach((otherClient) => {
+                    otherClient.sendPacket(depsPacket);
+                });
+            } else {
+                // No other clients to load resources for — if alive, self-destruct to respawn; if dead,
+                // this no-ops and the pending respawn (pendingEquipmentRespawn) carries the new equipment.
+                this._triggerSelfDestructForRespawn(client, server);
+            }
+        }
+    }
+
+    public static initializeGarage(client: GameClient, server: GameServer): void {
+        if (!client.user) {
+            logger.error(`Cannot initialize garage for unauthenticated client.`);
+            return;
+        }
+
+        logger.info(`Initializing garage for ${client.user.username}.`);
+
+        // Snapshot the loadout on garage OPEN. The re-arm cooldown is armed on garage EXIT only for the
+        // categories that actually changed vs this — so swapping around (and back) inside the garage is free.
+        client.equipSnapshot = {
+            hull: client.user.equippedHull,
+            turret: client.user.equippedTurret,
+            paint: client.user.equippedPaint,
+        };
+
+        const userInventory = {
+            ...Object.fromEntries(client.user.turrets),
+            ...Object.fromEntries(client.user.hulls),
+            paints: client.user.paints,
+            supplies: client.user.supplies,
+            kits: client.user.kits,
+            // Expiração dos passes (para o render de assinaturas no market/depot).
+            newbieExpiresAt: client.user.newbieExpiresAt,
+            upScoreExpiresAt: client.user.upScoreExpiresAt,
+            premiumExpiresAt: client.user.premiumExpiresAt,
+            proBattleExpiresAt: client.user.proBattleExpiresAt,
+            crystalAbonementExpiresAt: client.user.crystalAbonementExpiresAt,
+            // Rank do jogador — para passes com preço que escala por rank (pro_battle).
+            rank: client.user.rank,
+            // Moderator level — for XT item visibility (mods+ see all XT items in shop).
+            chatModeratorLevel: client.user.chatModeratorLevel,
+        };
+
+        const { garageItems, shopItems } = server.garageService.buildGarageData(userInventory);
+
+        const garageData = {
+            items: garageItems,
+            garageBoxId: ResourceManager.getIdlowById("garage"),
+        };
+        client.sendPacket(new GaragePackets.GarageItemsPacket({ jsonData: JSON.stringify(garageData) }));
+
+        // Equipment-change cooldowns (per category) only apply inside a re-arm battle; 0 elsewhere.
+        const inReArm = client.currentBattle?.settings.reArmorEnabled ?? false;
+        const uid = client.user.id;
+        const shopData = {
+            items: shopItems,
+            delayMountArmorInSec: inReArm ? server.garageService.getEquipCooldownSec(uid, "armor") : 0,
+            delayMountWeaponInSec: inReArm ? server.garageService.getEquipCooldownSec(uid, "weapon") : 0,
+            delayMountColorInSec: inReArm ? server.garageService.getEquipCooldownSec(uid, "color") : 0,
+        };
+        client.sendPacket(new GaragePackets.ShopItemsPacket({ jsonData: JSON.stringify(shopData) }));
+
+        const turretId = client.user.equippedTurret;
+        const turretMod = client.user.turrets.get(turretId) ?? 0;
+        const hullId = client.user.equippedHull;
+        const hullMod = client.user.hulls.get(hullId) ?? 0;
+        const paintId = client.user.equippedPaint;
+
+        client.sendPacket(new GaragePackets.MountItemPacket({ itemId: `${hullId}_m${hullMod}`, owned: true }));
+        client.sendPacket(new GaragePackets.MountItemPacket({ itemId: `${turretId}_m${turretMod}`, owned: true }));
+        client.sendPacket(new GaragePackets.MountItemPacket({ itemId: `${paintId}_m0`, owned: true }));
+
+        if (client.getState() === "battle_garage") {
+            client.sendPacket(new ConfirmLayoutChange({ fromLayout: 3, toLayout: 1 }));
+        } else {
+            client.sendPacket(new ConfirmLayoutChange({ fromLayout: 1, toLayout: 1 }));
+        }
+    }
+}

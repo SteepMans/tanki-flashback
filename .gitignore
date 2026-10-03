@@ -1,0 +1,57 @@
+# Game resources, the official AIR client and everything decompiled out of it. Not ours to
+# redistribute — see README, "Чего в репозитории нет". Keep them locally, never commit.
+server/resources/
+server/PT-Client.zip
+client/
+client2/
+client-research/dumps/
+client-research/client-swf/
+client-research/installed-client/
+
+# Upstream Ruffle checkout used to build the browser player (see ruffle-patches/README.md).
+# ruffle/ is an older vendored copy some working trees still carry — not part of the project.
+ruffle-src/
+ruffle/
+
+# RABCDAsm: third-party tool for the client patches, downloaded separately (see README)
+server/tools/rabcdasm/
+server/tools/RABCDAsm*
+
+# Ruffle web builds: ours is built from ruffle-patches/, the others are downloaded
+server/webclient/ruffle-local/
+server/webclient/ruffle/
+server/webclient/ruffle-nightly/
+
+# Build artifacts of the client patches
+server/webclient/library.swf
+server/webclient/sw/hardware.swf
+server/resources/*-patch.swf
+
+# e2e test leftovers
+server/webclient/.e2e-profile/
+server/webclient/.smoke-profile/
+server/webclient/.bots-profile/
+server/webclient/.art-profile/
+server/webclient/.soak-profile/
+server/webclient/*.log
+server/webclient/*.png
+server/webclient/soak-*.csv
+server/webclient/soak-*.json
+server/webclient/websockify.log
+
+# Protocol dump used while researching packets
+server/.defs.json
+
+# Scratch files: one-off probes and throwaway tests
+server/test/tmp-*
+server/webclient/wstest.html
+server/_*.js
+
+__pycache__/
+*.pyc
+
+# Рабочая папка выгрузки картинок (scripts/art.ts) — исходники лежат в resources/
+server/art-export/
+
+# Game art that used to skin the web panel — removed, see README
+server/webpanel/assets/

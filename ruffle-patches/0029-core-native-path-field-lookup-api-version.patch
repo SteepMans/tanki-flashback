@@ -1,0 +1,37 @@
+From 43857af5cfd06fa63bd84054ca7373730c9bd8f6 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 17:47:43 +0300
+Subject: [PATCH] core: look up native path fields with the newest api version
+
+---
+ core/src/avm2/fast_paths.rs | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 112b3e93..8dd9b007 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -107,14 +107,18 @@ fn slot_of<'gc>(
+     engine_namespace: bool,
+ ) -> Option<usize> {
+     let name = AvmString::new_utf8(activation.gc(), name);
++    // Версия пространства имён — самая старшая, а не `AllVersions`. Совпадение считается как
++    // «версия объявления не больше версии запроса» (`Namespace::matches_ns`), а `AllVersions` —
++    // это ноль, то есть самая младшая: с ней не находится НИ ОДНО поле кода игры, объявленное
++    // с версией своего SWF. Из-за этого нативные пути молча не включались вовсе.
+     let namespace = if engine_namespace {
+         crate::avm2::namespace::Namespace::package(
+             AvmString::new_utf8(activation.gc(), ENGINE_NS),
+-            crate::avm2::api_version::ApiVersion::AllVersions,
++            crate::avm2::api_version::ApiVersion::VM_INTERNAL,
+             activation.strings(),
+         )
+     } else {
+-        activation.avm2().namespaces.public_all()
++        activation.avm2().namespaces.public_vm_internal()
+     };
+ 
+     match object.vtable().get_trait(&Multiname::new(namespace, name)) {
+-- 
+2.51.1.windows.1
+

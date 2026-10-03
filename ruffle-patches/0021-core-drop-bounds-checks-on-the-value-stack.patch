@@ -1,0 +1,101 @@
+From b8a5438a48179ebdc24356d378d8cbc7cd757fab Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 19:54:12 +0300
+Subject: [PATCH] core: drop bounds checks on the verified value stack and gate
+ the op counter
+
+---
+ core/src/avm2/activation.rs |  5 ++++-
+ core/src/avm2/stack.rs      | 29 +++++++++++++++++++++--------
+ 2 files changed, 25 insertions(+), 9 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 6d285612..f2b802e6 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -670,12 +670,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         // Читаем флаг один раз на метод: ветка по локальной переменной предсказуема и почти
+         // бесплатна, а атомарное чтение на каждую инструкцию заметно бы стоило.
+         let trace_ops = crate::avm2::method_stats::ops_enabled();
++        let trace_methods = crate::avm2::method_stats::enabled();
+         let mut prev_kind = crate::avm2::method_stats::OP_KINDS.len() - 1;
+ 
+         loop {
+             let op = &opcodes[ip];
+             ip += 1;
+-            *executed_ops += 1;
++            if trace_methods {
++                *executed_ops += 1;
++            }
+             if trace_ops {
+                 let kind = crate::avm2::method_stats::op_kind(op);
+                 crate::avm2::method_stats::record_op(kind, prev_kind);
+diff --git a/core/src/avm2/stack.rs b/core/src/avm2/stack.rs
+index 62ff9a7e..8a46a1fc 100644
+--- a/core/src/avm2/stack.rs
++++ b/core/src/avm2/stack.rs
+@@ -110,40 +110,53 @@ impl<'a, 'gc> StackFrame<'a, 'gc> {
+         }
+     }
+ 
++    // Границы кадра выданы верификатором (num_locals + max_stack), а сам байткод перед
++    // исполнением проверен: выйти за кадр нельзя. Поэтому обращения идут без проверки индекса —
++    // в WebAssembly каждая такая проверка превращается в отдельное сравнение с переходом, а на
++    // этих четырёх методах держится весь горячий путь интерпретатора. В отладочной сборке
++    // проверки остаются.
++    #[inline(always)]
++    fn cell(&self, index: usize) -> &'a Cell<Value<'gc>> {
++        debug_assert!(index < self.data.len(), "стек кадра переполнен");
++        unsafe { self.data.get_unchecked(index) }
++    }
++
+     /// Push a value onto the operand stack.
+     #[inline(always)]
+     pub fn push(&self, value: Value<'gc>) {
+-        self.data[self.stack_pointer.get()].set(value);
+-        self.stack_pointer.set(self.stack_pointer.get() + 1);
++        let pointer = self.stack_pointer.get();
++        self.cell(pointer).set(value);
++        self.stack_pointer.set(pointer + 1);
+     }
+ 
+     /// Retrieve the top-most value on the operand stack.
+     #[inline(always)]
+     pub fn pop(&self) -> Value<'gc> {
+-        self.stack_pointer.set(self.stack_pointer.get() - 1);
++        let pointer = self.stack_pointer.get() - 1;
++        self.stack_pointer.set(pointer);
+ 
+-        self.data[self.stack_pointer.get()].get()
++        self.cell(pointer).get()
+     }
+ 
+     /// Peek the n-th value from the end of the operand stack.
+     #[inline(always)]
+     pub fn peek(&self, index: usize) -> Value<'gc> {
+-        self.data[self.stack_pointer.get() - index - 1].get()
++        self.cell(self.stack_pointer.get() - index - 1).get()
+     }
+ 
+     #[inline(always)]
+     pub fn stack_top(&self) -> &'a Cell<Value<'gc>> {
+-        &self.data[self.stack_pointer.get() - 1]
++        self.cell(self.stack_pointer.get() - 1)
+     }
+ 
+     #[inline(always)]
+     pub fn value_at(&self, index: usize) -> Value<'gc> {
+-        self.data[index].get()
++        self.cell(index).get()
+     }
+ 
+     #[inline(always)]
+     pub fn set_value_at(&self, index: usize, value: Value<'gc>) {
+-        self.data[index].set(value);
++        self.cell(index).set(value);
+     }
+ 
+     #[inline(always)]
+-- 
+2.51.1.windows.1
+

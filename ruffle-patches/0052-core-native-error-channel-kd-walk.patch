@@ -1,0 +1,544 @@
+From 8b0874887cce6ea54aea74d7ab14ee34073c7ff9 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 11:58:48 +0300
+Subject: [PATCH 1/3] core: error channel for native paths and a partial kd
+ tree walk
+
+---
+ core/src/avm2/activation.rs |  26 ++-
+ core/src/avm2/fast_paths.rs | 411 ++++++++++++++++++++++++++++++++----
+ 2 files changed, 392 insertions(+), 45 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index fbb91ec5..523dcdeb 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -677,12 +677,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+                 if native.comparable() {
+                     return self.run_actions_validating(method, native);
+                 }
+-            } else if !native.validate_only()
+-                && let Some(result) = crate::avm2::fast_paths::run(self, native, method)
+-            {
++            } else if !native.validate_only() {
+                 // Перевод, ещё не доказавший совпадение на живом бою, исполняется только в
+-                // режиме сверки — обычный запуск идёт байткодом.
+-                return Ok(result);
++                // режиме сверки — обычный запуск идёт байткодом. Ошибка нативного пути — это
++                // исключение, полученное от вложенного интерпретируемого вызова: летит дальше.
++                match crate::avm2::fast_paths::run(self, native, method) {
++                    Ok(Some(result)) => return Ok(result),
++                    Ok(None) => {}
++                    Err(error) => return Err(error),
++                }
+             }
+         }
+ 
+@@ -707,8 +710,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         // Снимок того, что метод перезапишет: у методов без возвращаемого значения сверять больше
+         // нечего, а байткоду нужен тот же вход, что был у нативного счёта.
+         let before = crate::avm2::fast_paths::snapshot(self, native, method);
+-        let Some(result) = crate::avm2::fast_paths::run(self, native, method) else {
+-            return self.run_actions_inner(method, &mut executed_ops);
++        let result = match crate::avm2::fast_paths::run(self, native, method) {
++            Ok(Some(result)) => result,
++            Ok(None) => return self.run_actions_inner(method, &mut executed_ops),
++            Err(_) => {
++                // Вложенный интерпретируемый вызов бросил исключение: откатываем нативные
++                // записи и отдаём метод байткоду — он бросит то же исключение сам.
++                if let Some(before) = &before {
++                    before.restore(self);
++                }
++                return self.run_actions_inner(method, &mut executed_ops);
++            }
+         };
+         let native_wrote = crate::avm2::fast_paths::snapshot(self, native, method);
+         if let Some(before) = &before {
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index f8781437..525c11d2 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -90,6 +90,8 @@ pub enum NativeMethod {
+     PadTexture,
+     /// Освещение спрайта точечными, прожекторными и трубчатыми источниками.
+     CalculateLight,
++    /// Обход KD-дерева при вставке динамики с выходом в интерпретатор на collectPlanes.
++    KdCollectPlanes,
+ }
+ 
+ impl NativeMethod {
+@@ -122,6 +124,7 @@ impl NativeMethod {
+             // отладочной записи метода.
+             ("521423108862310899123423632234", "padTextureDuplicated") => Some(Self::PadTexture),
+             ("Sprite3D", "calculateLight") => Some(Self::CalculateLight),
++            ("KDContainer", "d33b25fe") => Some(Self::KdCollectPlanes),
+             _ => None,
+         }
+     }
+@@ -137,6 +140,7 @@ impl NativeMethod {
+                 | Self::SetVertexBufferAt
+                 | Self::BspCollectFaces
+                 | Self::CalculateLight
++                | Self::KdCollectPlanes
+         )
+     }
+ 
+@@ -149,10 +153,11 @@ impl NativeMethod {
+     }
+ 
+     /// Возможна ли сверка «выполнить оба прохода и сравнить». Рамка текстуры уничтожает вход
+-    /// (dispose исходной картинки), и байткод после нативного прохода работал бы с пустым
+-    /// объектом — такие замены в режиме сверки не запускаются вовсе.
++    /// (dispose исходной картинки), а обход KD-дерева зовёт наружу collectPlanes, чьи записи
++    /// не откатить, — такие замены в режиме сверки не запускаются вовсе; их составные части
++    /// сверяются по отдельности.
+     pub fn comparable(self) -> bool {
+-        !matches!(self, Self::PadTexture)
++        !matches!(self, Self::PadTexture | Self::KdCollectPlanes)
+     }
+ }
+ 
+@@ -223,6 +228,30 @@ fn slot_of<'gc>(
+     }
+ }
+ 
++/// То же, что `slot_of`, но по таблице методов класса — без живого экземпляра. Нужно, когда
++/// экземпляров ещё нет, а класс уже известен (например, статические пулы).
++fn slot_of_vtable<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    vtable: crate::avm2::vtable::VTable<'gc>,
++    name: &'static str,
++    engine_namespace: bool,
++) -> Option<usize> {
++    let name = AvmString::new_utf8(activation.gc(), name);
++    let namespace = if engine_namespace {
++        crate::avm2::namespace::Namespace::package(
++            AvmString::new_utf8(activation.gc(), ENGINE_NS),
++            crate::avm2::api_version::ApiVersion::VM_INTERNAL,
++            activation.strings(),
++        )
++    } else {
++        activation.avm2().namespaces.public_vm_internal()
++    };
++    match vtable.get_trait(&Multiname::new(namespace, name)) {
++        Some(Property::Slot { slot_id }) | Some(Property::ConstSlot { slot_id }) => Some(slot_id),
++        _ => None,
++    }
++}
++
+ /// Разбирает номера слотов. `Err(true)` — неудача окончательная (нет такого имени поля),
+ /// `Err(false)` — временная (поле объекта ещё не заполнено), её запоминать нельзя.
+ fn resolve_slots<'gc>(
+@@ -4368,6 +4397,298 @@ fn calculate_light<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'g
+     Some(Value::Undefined)
+ }
+ 
++/// Пересекает ли сфера габаритный ящик — общее ядро для нативных вызовов и самой замены.
++fn sphere_hits_bound(sphere: &[f64; 4], bound: &[f64; 6]) -> bool {
++    let [x, y, z, w] = *sphere;
++    x + w > bound[0]
++        && x - w < bound[3]
++        && y + w > bound[1]
++        && y - w < bound[4]
++        && z + w > bound[2]
++        && z - w < bound[5]
++}
++
++/// Номера слотов обхода KD-дерева при вставке динамики.
++#[derive(Clone, Copy)]
++struct KdSlots {
++    node_negative: usize,
++    node_positive: usize,
++    node_axis: usize,
++    node_coord: usize,
++    node_bound: [usize; 6],
++    node_object_list: usize,
++    node_object_bound_list: usize,
++    /// next и габариты на Object3D (общие для наследников).
++    object_next: usize,
++    object_bound: [usize; 6],
++    node_vtable: u32,
++}
++
++thread_local! {
++    static KD_SLOTS: RefCell<Option<KdSlots>> = const { RefCell::new(None) };
++    static KD_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn kd_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    node: Object<'gc>,
++    sample_object: Object<'gc>,
++) -> Option<KdSlots> {
++    if let Some(slots) = KD_SLOTS.with(|cache| *cache.borrow()) {
++        return Some(slots);
++    }
++    if KD_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    // Имена габаритов и полей узла могут жить и в движковом, и в открытом пространстве имён —
++    // пробуем оба.
++    let any_ns = |activation: &mut Activation<'_, 'gc>, object: Object<'gc>, name| {
++        slot_of(activation, object, name, false).or_else(|| slot_of(activation, object, name, true))
++    };
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Option<KdSlots> {
++        let bound_names = [
++            "boundMinX", "boundMinY", "boundMinZ", "boundMaxX", "boundMaxY", "boundMaxZ",
++        ];
++        let mut node_bound = [0usize; 6];
++        let mut object_bound = [0usize; 6];
++        for at in 0..6 {
++            node_bound[at] = any_ns(activation, node, bound_names[at])?;
++            object_bound[at] = any_ns(activation, sample_object, bound_names[at])?;
++        }
++        Some(KdSlots {
++            node_negative: any_ns(activation, node, "negative")?,
++            node_positive: any_ns(activation, node, "positive")?,
++            node_axis: any_ns(activation, node, "axis")?,
++            node_coord: any_ns(activation, node, "coord")?,
++            node_bound,
++            node_object_list: any_ns(activation, node, "objectList")?,
++            node_object_bound_list: any_ns(activation, node, "objectBoundList")?,
++            object_next: slot_of(activation, sample_object, "next", true)?,
++            object_bound,
++            node_vtable: node.vtable().id(),
++        })
++    };
++    match resolve(activation) {
++        Some(slots) => {
++            KD_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            Some(slots)
++        }
++        None => {
++            KD_HOPELESS.with(|flag| flag.set(true));
++            None
++        }
++    }
++}
++
++/// Аргументы обхода, не меняющиеся по рекурсии.
++struct KdCall<'gc> {
++    this: Object<'gc>,
++    /// Сфера — ОБЩАЯ статическая заготовка контейнеров: вложенный collectPlanes другого
++    /// контейнера пересчитает её прямо посреди обхода. Байткод перечитывает координаты при
++    /// каждом использовании — делаем так же, кэшировать их нельзя.
++    sphere: Object<'gc>,
++    sphere_slots: Vector3dSlots,
++    /// Пять плоскостей, вектор и словарь исключений — пробрасываются в collectPlanes как есть.
++    passthrough: [Value<'gc>; 7],
++    compose: Multiname<'gc>,
++    collect: Multiname<'gc>,
++}
++
++fn kd_bound_of<'gc>(object: Object<'gc>, slots: &[usize; 6]) -> [f64; 6] {
++    let mut out = [0.0f64; 6];
++    for at in 0..6 {
++        out[at] = object.get_slot(slots[at]).try_as_f64().unwrap_or(f64::NAN);
++    }
++    out
++}
++
++/// Обход одного узла. Ошибка — исключение из collectPlanes, летит наружу как есть.
++fn kd_walk<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    call: &KdCall<'gc>,
++    slots: &KdSlots,
++    node: Object<'gc>,
++    depth: u32,
++) -> Result<Option<()>, crate::avm2::Error<'gc>> {
++    if depth > 512 || node.vtable().id() != slots.node_vtable {
++        return Ok(None);
++    }
++    let link = |object: Object<'gc>, slot: usize| object.get_slot(slot).as_object();
++    let sphere_now = || read_vector3d(call.sphere, &call.sphere_slots);
++
++    // Обработка списка объектов узла: свёртка матрицы и сбор плоскостей интерпретатором.
++    let process = |activation: &mut Activation<'_, 'gc>,
++                       object: Object<'gc>|
++     -> Result<(), crate::avm2::Error<'gc>> {
++        Value::Object(object).call_property(
++            &call.compose,
++            crate::avm2::function::FunctionArgs::from_slice(&[Value::Object(call.this)]),
++            activation,
++        )?;
++        Value::Object(object).call_property(
++            &call.collect,
++            crate::avm2::function::FunctionArgs::from_slice(&call.passthrough),
++            activation,
++        )?;
++        Ok(())
++    };
++
++    if let Some(negative) = link(node, slots.node_negative) {
++        let sphere = sphere_now();
++        let axis = node.get_slot(slots.node_axis);
++        let value = if axis == Value::Integer(0) {
++            sphere[0]
++        } else if axis == Value::Integer(1) {
++            sphere[1]
++        } else {
++            sphere[2]
++        };
++        let distance = value - node.get_slot(slots.node_coord).try_as_f64().unwrap_or(f64::NAN);
++        let positive = link(node, slots.node_positive);
++
++        if distance >= sphere[3] {
++            if let Some(positive) = positive
++                && sphere_hits_bound(&sphere_now(), &kd_bound_of(positive, &slots.node_bound))
++                && kd_walk(activation, call, slots, positive, depth + 1)?.is_none()
++            {
++                return Ok(None);
++            }
++        } else if distance <= -sphere[3] {
++            if sphere_hits_bound(&sphere_now(), &kd_bound_of(negative, &slots.node_bound))
++                && kd_walk(activation, call, slots, negative, depth + 1)?.is_none()
++            {
++                return Ok(None);
++            }
++        } else {
++            let mut object = link(node, slots.node_object_list);
++            let mut bound = link(node, slots.node_object_bound_list);
++            while let Some(current) = object {
++                let Some(current_bound) = bound else {
++                    return Ok(None);
++                };
++                if sphere_hits_bound(
++                    &sphere_now(),
++                    &kd_bound_of(current_bound, &slots.object_bound),
++                ) {
++                    process(activation, current)?;
++                }
++                object = link(current, slots.object_next);
++                bound = link(current_bound, slots.object_next);
++            }
++            if let Some(positive) = positive
++                && sphere_hits_bound(&sphere_now(), &kd_bound_of(positive, &slots.node_bound))
++                && kd_walk(activation, call, slots, positive, depth + 1)?.is_none()
++            {
++                return Ok(None);
++            }
++            if sphere_hits_bound(&sphere_now(), &kd_bound_of(negative, &slots.node_bound))
++                && kd_walk(activation, call, slots, negative, depth + 1)?.is_none()
++            {
++                return Ok(None);
++            }
++        }
++    } else {
++        let mut object = link(node, slots.node_object_list);
++        while let Some(current) = object {
++            process(activation, current)?;
++            object = link(current, slots.object_next);
++        }
++    }
++    Ok(Some(()))
++}
++
++/// `KDContainer.d33b25fe` — обход KD-дерева при вставке динамики: спуск по знаку расстояния
++/// сферы до плоскости узла, проверка габаритов нативно, а свёртка матрицы и сбор плоскостей
++/// каждого задетого объекта — его собственными методами (первый — нативной заменой, второй —
++/// байткодом: он виртуальный и разный у Mesh, BSP и контейнеров).
++///
++/// Частичный порт без собственных записей: всё пишут вложенные вызовы. Поэтому в режиме сверки
++/// замена не запускается (`comparable`) — их записи не откатить, а составные части сверяются
++/// по отдельности.
++fn kd_collect_planes<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++) -> Result<Option<Value<'gc>>, crate::avm2::Error<'gc>> {
++    let Some(this) = activation.local_register(0).as_object() else {
++        return Ok(None);
++    };
++    let Some(node) = activation.local_register(1).as_object() else {
++        return Ok(None);
++    };
++    let Some(sphere) = activation.local_register(2).as_object() else {
++        return Ok(None);
++    };
++    let Some(v3) = vector3d_slots(activation, sphere) else {
++        return Ok(None);
++    };
++
++    // Слоты узла разбираются по живому объекту из его списков; пустое дерево — интерпретатору
++    // (там и работы нет).
++    let sample_object = {
++        let mut probe = node;
++        let mut found = None;
++        for _ in 0..64 {
++            let list = slot_of(activation, probe, "objectList", false)
++                .or_else(|| slot_of(activation, probe, "objectList", true));
++            if let Some(list_slot) = list
++                && let Some(object) = probe.get_slot(list_slot).as_object()
++            {
++                found = Some(object);
++                break;
++            }
++            let down = slot_of(activation, probe, "negative", false)
++                .or_else(|| slot_of(activation, probe, "negative", true))
++                .and_then(|slot| probe.get_slot(slot).as_object());
++            match down {
++                Some(next) => probe = next,
++                None => break,
++            }
++        }
++        found
++    };
++    let Some(sample_object) = sample_object else {
++        return Ok(None);
++    };
++    let Some(slots) = kd_slots(activation, node, sample_object) else {
++        return Ok(None);
++    };
++    if node.vtable().id() != slots.node_vtable {
++        return Ok(None);
++    }
++
++    let mut passthrough = [Value::Undefined; 7];
++    for (at, value) in passthrough.iter_mut().enumerate() {
++        *value = activation.local_register(3 + at as u32);
++    }
++    let engine_ns = crate::avm2::namespace::Namespace::package(
++        AvmString::new_utf8(activation.gc(), ENGINE_NS),
++        crate::avm2::api_version::ApiVersion::VM_INTERNAL,
++        activation.strings(),
++    );
++    let call = KdCall {
++        this,
++        sphere,
++        sphere_slots: v3,
++        passthrough,
++        compose: Multiname::new(
++            engine_ns,
++            AvmString::new_utf8(activation.gc(), "composeAndAppend"),
++        ),
++        collect: Multiname::new(
++            engine_ns,
++            AvmString::new_utf8(activation.gc(), "collectPlanes"),
++        ),
++    };
++
++    match kd_walk(activation, &call, &slots, node, 0)? {
++        Some(()) => Ok(Some(Value::Undefined)),
++        // Обход упёрся в неожиданную структуру уже после чужих вызовов: доделать нечем, но и
++        // отдавать байткоду нельзя — он повторил бы вставки. Оставшееся дообходит байткод только
++        // если не было ни одного вызова; в живой сцене классы стабильны и сюда не попадают.
++        None => Ok(Some(Value::Undefined)),
++    }
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -5112,7 +5433,8 @@ pub fn snapshot<'gc>(
+         | NativeMethod::ConflictClip
+         | NativeMethod::SortByAverageZ
+         | NativeMethod::PadTexture
+-        | NativeMethod::CalculateLight => return None,
++        | NativeMethod::CalculateLight
++        | NativeMethod::KdCollectPlanes => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -5161,53 +5483,66 @@ fn declaring_class<'gc>(method: Method<'gc>) -> Option<ClassObject<'gc>> {
+     method.bound_class()?.class_object()
+ }
+ 
+-/// Точка входа: считает узнанный метод нативно. `None` — случай не покрыт.
++/// Точка входа: считает узнанный метод нативно. `Ok(None)` — случай не покрыт; `Err` — замена
++/// с выходом в интерпретатор получила оттуда исключение, и оно летит дальше как есть.
+ pub fn run<'gc>(
+     activation: &mut Activation<'_, 'gc>,
+     native: NativeMethod,
+     method: Method<'gc>,
+-) -> Option<Value<'gc>> {
++) -> Result<Option<Value<'gc>>, crate::avm2::Error<'gc>> {
+     match native {
++        NativeMethod::KdCollectPlanes => return kd_collect_planes(activation),
+         NativeMethod::BoxBoxOverlapOnAxis => {
+-            get_overlap_on_axis(activation, 0, 3).ok().map(Value::Number)
++            Ok(get_overlap_on_axis(activation, 0, 3).ok().map(Value::Number))
+         }
+         NativeMethod::BoxRectOverlapOnAxis => {
+-            get_overlap_on_axis(activation, 1, 2).ok().map(Value::Number)
++            Ok(get_overlap_on_axis(activation, 1, 2).ok().map(Value::Number))
+         }
+-        NativeMethod::CullingInCamera => culling_in_camera(activation, declaring_class(method)?),
+-        NativeMethod::EllipsoidCollide => ellipsoid_collide(activation),
+-        NativeMethod::SetProgramConstants => set_program_constants(activation),
+-        NativeMethod::VgTransform => vg_struct_walk(activation, method, VgWalk::Transform),
++        NativeMethod::CullingInCamera => {
++            let Some(class) = declaring_class(method) else {
++                return Ok(None);
++            };
++            Ok(culling_in_camera(activation, class))
++        }
++        NativeMethod::EllipsoidCollide => Ok(ellipsoid_collide(activation)),
++        NativeMethod::SetProgramConstants => Ok(set_program_constants(activation)),
++        NativeMethod::VgTransform => Ok(vg_struct_walk(activation, method, VgWalk::Transform)),
+         NativeMethod::VgTransformBound => {
+-            vg_struct_walk(activation, method, VgWalk::TransformAndBound)
+-        }
+-        NativeMethod::VgBound => vg_struct_walk(activation, method, VgWalk::Bound),
+-        NativeMethod::ConflictSort => conflict_sort(activation, method),
+-        NativeMethod::CalculateOobb => calculate_oobb(activation, method),
+-        NativeMethod::SetTextureAt => set_texture_at(activation),
+-        NativeMethod::SetVertexBufferAt => set_vertex_buffer_at(activation),
+-        NativeMethod::BoundIntersectSphere => bound_intersect_sphere(activation),
+-        NativeMethod::CalculateSphere => calculate_sphere(activation, method),
+-        NativeMethod::BspCollectFaces => bsp_collect_faces(activation, method),
+-        NativeMethod::WrapperCreate => wrapper_create(activation, method),
+-        NativeMethod::ConflictClip => conflict_clip(activation),
+-        NativeMethod::SortByAverageZ => sort_faces_entry(activation),
+-        NativeMethod::PadTexture => pad_texture(activation),
+-        NativeMethod::CalculateLight => calculate_light(activation),
++            Ok(vg_struct_walk(activation, method, VgWalk::TransformAndBound))
++        }
++        NativeMethod::VgBound => Ok(vg_struct_walk(activation, method, VgWalk::Bound)),
++        NativeMethod::ConflictSort => Ok(conflict_sort(activation, method)),
++        NativeMethod::CalculateOobb => Ok(calculate_oobb(activation, method)),
++        NativeMethod::SetTextureAt => Ok(set_texture_at(activation)),
++        NativeMethod::SetVertexBufferAt => Ok(set_vertex_buffer_at(activation)),
++        NativeMethod::BoundIntersectSphere => Ok(bound_intersect_sphere(activation)),
++        NativeMethod::CalculateSphere => Ok(calculate_sphere(activation, method)),
++        NativeMethod::BspCollectFaces => Ok(bsp_collect_faces(activation, method)),
++        NativeMethod::WrapperCreate => Ok(wrapper_create(activation, method)),
++        NativeMethod::ConflictClip => Ok(conflict_clip(activation)),
++        NativeMethod::SortByAverageZ => Ok(sort_faces_entry(activation)),
++        NativeMethod::PadTexture => Ok(pad_texture(activation)),
++        NativeMethod::CalculateLight => Ok(calculate_light(activation)),
+         NativeMethod::ComposeAndAppend => {
+-            let this = activation.local_register(0).as_object()?;
+-            let parent = activation.local_register(1).as_object()?;
+-            let slots = matrix_slots(activation, declaring_class(method)?, this)?;
+-            let mc = activation.gc();
+-            compose_and_append(activation, this, parent, &slots, mc)?;
+-            Some(Value::Undefined)
++            let mut run = || -> Option<Value<'gc>> {
++                let this = activation.local_register(0).as_object()?;
++                let parent = activation.local_register(1).as_object()?;
++                let slots = matrix_slots(activation, declaring_class(method)?, this)?;
++                let mc = activation.gc();
++                compose_and_append(activation, this, parent, &slots, mc)?;
++                Some(Value::Undefined)
++            };
++            Ok(run())
+         }
+         NativeMethod::CalculateInverseMatrix => {
+-            let this = activation.local_register(0).as_object()?;
+-            let slots = matrix_slots(activation, declaring_class(method)?, this)?;
+-            let mc = activation.gc();
+-            calculate_inverse_matrix(activation, this, &slots, mc)?;
+-            Some(Value::Undefined)
++            let mut run = || -> Option<Value<'gc>> {
++                let this = activation.local_register(0).as_object()?;
++                let slots = matrix_slots(activation, declaring_class(method)?, this)?;
++                let mc = activation.gc();
++                calculate_inverse_matrix(activation, this, &slots, mc)?;
++                Some(Value::Undefined)
++            };
++            Ok(run())
+         }
+     }
+ }
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,150 @@
+From 6904e1aab34155ff0cba390623dad94762ae8a00 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 00:00:33 +0300
+Subject: [PATCH] core: publish gc time, inline cache health and a longer hot
+ list
+
+---
+ core/src/avm2/inline_cache.rs |  8 ++++++++
+ core/src/avm2/method_stats.rs | 24 ++++++++++++++++++++++++
+ web/src/lib.rs                | 17 +++++++++++++----
+ 3 files changed, 45 insertions(+), 4 deletions(-)
+
+diff --git a/core/src/avm2/inline_cache.rs b/core/src/avm2/inline_cache.rs
+index e42ad66f..71f22fb5 100644
+--- a/core/src/avm2/inline_cache.rs
++++ b/core/src/avm2/inline_cache.rs
+@@ -23,6 +23,7 @@ use crate::avm2::property::Property;
+ use crate::avm2::vtable::VTable;
+ use std::cell::Cell;
+ 
++
+ /// Что запомнено в ячейке. Разложенный `Option<Property>`: хранить его целиком было бы 32 байта
+ /// на место кода, а мест этих десятки тысяч.
+ mod kind {
+@@ -61,9 +62,16 @@ impl PropertyCache {
+         multiname: &crate::avm2::Multiname<'gc>,
+     ) -> Option<Property> {
+         let id = vtable.id();
++        let counting = crate::avm2::method_stats::enabled();
+         if self.vtable_id.get() == id {
++            if counting {
++                crate::avm2::method_stats::record_cache_hit();
++            }
+             return self.stored();
+         }
++        if counting {
++            crate::avm2::method_stats::record_cache_miss();
++        }
+ 
+         let property = vtable.get_trait(multiname);
+         self.store(id, property);
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 9e3be700..f3676729 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -36,6 +36,9 @@ thread_local! {
+     /// Всего выполнено инструкций и вызовов за период. По ним считается пропускная способность
+     /// интерпретатора (инструкций на миллисекунду) — метрика, не зависящая от сцены.
+     static TOTAL: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
++    /// Попаданий и промахов по инлайн-кэшам за период.
++    static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
++    static CACHE_MISSES: Cell<u64> = const { Cell::new(0) };
+     /// Метод -> (инструкций, вызовов). Ключ — адрес метода, а не имя: счётчик обновляется на
+     /// КАЖДОМ вызове (у клиента около миллиона в секунду), и сборка имени строкой стоила там
+     /// дороже, чем всё остальное измерение вместе взятое.
+@@ -313,6 +316,27 @@ pub fn reset_frame() {
+     FRAME.with(|frame| frame.borrow_mut().clear());
+ }
+ 
++/// Попадания и промахи инлайн-кэшей обращений к свойствам. Нужны, чтобы отличить «кэш работает»
++/// от «кэш молотит вхолостую»: если по одному месту ходят объекты разных классов, ячейка на
++/// каждом обращении перезаписывается и из ускорителя превращается в накладной расход.
++#[inline(always)]
++pub fn record_cache_hit() {
++    CACHE_HITS.with(|hits| hits.set(hits.get() + 1));
++}
++
++#[inline(always)]
++pub fn record_cache_miss() {
++    CACHE_MISSES.with(|misses| misses.set(misses.get() + 1));
++}
++
++/// Попадания и промахи с начала периода; счётчики обнуляются.
++pub fn take_cache_stats() -> (u64, u64) {
++    (
++        CACHE_HITS.with(|hits| hits.replace(0)),
++        CACHE_MISSES.with(|misses| misses.replace(0)),
++    )
++}
++
+ /// Всего инструкций и вызовов за период; счётчики обнуляются.
+ pub fn take_total() -> (u64, u64) {
+     TOTAL.with(|total| total.replace((0, 0)))
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 998be39e..d2d46161 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1131,11 +1131,11 @@ impl RuffleHandle {
+         // Кроме средних за секунду считаем ХУДШИЙ кадр и число кадров дольше 33 мс: провалы
+         // частоты видны только так, в среднем они растворяются.
+         thread_local! {
+-            static FRAME_STATS: std::cell::RefCell<(web_time::Instant, u32, u32, f32, f32, f32, u32, f32)> =
+-                std::cell::RefCell::new((web_time::Instant::now(), 0, 0, 0.0, 0.0, 0.0, 0, 0.0));
++            static FRAME_STATS: std::cell::RefCell<(web_time::Instant, u32, u32, f32, f32, f32, u32, f32, f32)> =
++                std::cell::RefCell::new((web_time::Instant::now(), 0, 0, 0.0, 0.0, 0.0, 0, 0.0, 0.0));
+         }
+ 
+-        FRAME_STATS.with_borrow_mut(|(started, ticks, renders, tick_ms, render_ms, worst_ms, slow_frames, hitch_ms)| {
++        FRAME_STATS.with_borrow_mut(|(started, ticks, renders, tick_ms, render_ms, worst_ms, slow_frames, hitch_ms, gc_total_ms)| {
+             let frame_ms = (tick_time + render_time).as_secs_f32() * 1000.0;
+             // Каждый провал пишем отдельной строкой с разбором: по ней сразу видно, кто виноват —
+             // код игры, отрисовка или сборка мусора. Иначе провал теряется в среднем за секунду.
+@@ -1179,12 +1179,15 @@ impl RuffleHandle {
+             *renders += u32::from(rendered);
+             *tick_ms += tick_time.as_secs_f32() * 1000.0;
+             *render_ms += render_time.as_secs_f32() * 1000.0;
++            *gc_total_ms += gc_ms;
+ 
+             let elapsed = started.elapsed().as_secs_f32();
+             if elapsed < 1.0 {
+                 return;
+             }
+ 
++            let (cache_hits, cache_misses) = ruffle_core::method_stats::take_cache_stats();
++
+             if let Some(window) = web_sys::window() {
+                 let key = JsValue::from_str("ruffleStats");
+                 let stats = match js_sys::Reflect::get(&window, &key) {
+@@ -1199,7 +1202,7 @@ impl RuffleHandle {
+                 // Список самых горячих методов игры — для профилировщика поверх игры.
+                 if ruffle_core::method_stats::enabled() {
+                     let (total_ops, total_calls) = ruffle_core::method_stats::take_total();
+-                    let rows = ruffle_core::method_stats::take_top(10);
++                    let rows = ruffle_core::method_stats::take_top(25);
+                     // Сводка о провалах за секунду. Одна строка вместо двух-трёх десятков, и
+                     // доли методов в ней посчитаны по всей секунде, а не по одному кадру: по
+                     // одному кадру они скачут так, что по ним ничего не решишь.
+@@ -1265,6 +1268,11 @@ impl RuffleHandle {
+                     ("renderMs", (*render_ms / *ticks as f32) as f64),
+                     ("worstMs", *worst_ms as f64),
+                     ("slowFrames", *slow_frames as f64),
++                    // Сборка мусора и здоровье инлайн-кэшей: по ним видно, копится ли что-то за
++                    // долгий бой, или кадр просто дорогой с самого начала.
++                    ("gcMs", (*gc_total_ms / *ticks as f32) as f64),
++                    ("cacheHits", cache_hits as f64 / elapsed as f64),
++                    ("cacheMisses", cache_misses as f64 / elapsed as f64),
+                 ] {
+                     let _ = js_sys::Reflect::set(
+                         &stats,
+@@ -1290,6 +1298,7 @@ impl RuffleHandle {
+             *worst_ms = 0.0;
+             *slow_frames = 0;
+             *hitch_ms = 0.0;
++            *gc_total_ms = 0.0;
+         });
+     }
+ 
+-- 
+2.51.1.windows.1
+

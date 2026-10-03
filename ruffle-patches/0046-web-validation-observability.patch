@@ -1,0 +1,59 @@
+From 9a4eaa49f7672620f3a3693aac392bd963e2a282 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 09:29:41 +0300
+Subject: [PATCH] web: publish the validated list and the validation flag
+ unconditionally
+
+---
+ web/src/lib.rs | 28 +++++++++++++++++-----------
+ 1 file changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index d581ff87..fdd64f52 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1325,14 +1325,6 @@ impl RuffleHandle {
+                         list.push(&row);
+                     }
+                     let _ = js_sys::Reflect::set(&stats, &JsValue::from_str("hotMethods"), &list);
+-                    // Какие замены режим сверки реально сравнил: без этого «ноль расхождений»
+-                    // может означать, что замена ни разу не сработала.
+-                    let validated = js_sys::Array::new();
+-                    for name in ruffle_core::method_stats::validated_methods() {
+-                        validated.push(&JsValue::from_str(&name));
+-                    }
+-                    let _ =
+-                        js_sys::Reflect::set(&stats, &JsValue::from_str("validated"), &validated);
+                     let _ = js_sys::Reflect::set(
+                         &stats,
+                         &JsValue::from_str("opsPerSecond"),
+@@ -1360,9 +1352,23 @@ impl RuffleHandle {
+                     let _ = js_sys::Reflect::set(&stats, &JsValue::from_str("opKinds"), &list);
+                 }
+ 
+-                // Счётчик расхождений режима сверки — всегда, не только при включённом счётчике
+-                // методов: «ноль расхождений» проверяется по нему, и он должен быть виден с
+-                // самого начала сессии.
++                // Сверка: что реально сравнили, сколько расхождений и включён ли сам режим —
++                // всегда, не только при включённом счётчике методов. Без списка «ноль
++                // расхождений» может означать, что замены ни разу не исполнились, а без флага —
++                // что режим вовсе не работал.
++                {
++                    let validated = js_sys::Array::new();
++                    for name in ruffle_core::method_stats::validated_methods() {
++                        validated.push(&JsValue::from_str(&name));
++                    }
++                    let _ =
++                        js_sys::Reflect::set(&stats, &JsValue::from_str("validated"), &validated);
++                    let _ = js_sys::Reflect::set(
++                        &stats,
++                        &JsValue::from_str("validateActive"),
++                        &JsValue::from_bool(ruffle_core::method_stats::validate_native_paths()),
++                    );
++                }
+                 {
+                     let list = js_sys::Array::new();
+                     for (name, count) in ruffle_core::method_stats::native_mismatches() {
+-- 
+2.51.1.windows.1
+

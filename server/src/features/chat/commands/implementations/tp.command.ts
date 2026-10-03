@@ -1,0 +1,36 @@
+import { teleportTank } from "@/features/battle/teleport.util";
+import { CommandContext, ICommand } from "@/features/chat/commands/command.types";
+import { ChatModeratorLevel } from "@/shared/models/enums/chat-moderator-level.enum";
+
+/** Teleports the caller's own tank to (x,y,z) — all three coordinates required. */
+export default class TpCommand implements ICommand {
+    name = "tp";
+    description = "Переносит ваш танк в точку (x, y, z). Использование: /tp <x> <y> <z>.";
+    permissionLevel = ChatModeratorLevel.MODERATOR;
+    usage = "<x> <y> <z>";
+    example = "/tp 100 0 200";
+
+    async execute(context: CommandContext, args: string[]): Promise<void> {
+        const client = context.executor;
+        if (!client.user || !client.currentBattle) {
+            context.reply("Нужно быть в битве.");
+            return;
+        }
+
+        if (args.length < 3) {
+            context.reply("Использование: /tp <x> <y> <z>.");
+            return;
+        }
+
+        const x = Number(args[0]);
+        const y = Number(args[1]);
+        const z = Number(args[2]);
+        if ([x, y, z].some((n) => Number.isNaN(n))) {
+            context.reply("Неверные координаты. Использование: /tp <x> <y> <z>.");
+            return;
+        }
+
+        teleportTank(client, { x, y, z });
+        context.reply(`Переносим в точку (${x}, ${y}, ${z})…`);
+    }
+}

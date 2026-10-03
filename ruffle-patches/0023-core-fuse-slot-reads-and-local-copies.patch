@@ -1,0 +1,156 @@
+From 67ad851d6931b4e3bb10b476d28c2988f8c1235f Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 21:03:10 +0300
+Subject: [PATCH] core: fuse slot reads and local copies into single
+ instructions
+
+---
+ core/src/avm2/activation.rs           | 23 +++++++++++++++++++++++
+ core/src/avm2/method_stats.rs         |  6 ++++--
+ core/src/avm2/op.rs                   | 13 +++++++++++++
+ core/src/avm2/optimizer/peephole.rs   | 20 ++++++++++++++++++++
+ core/src/avm2/optimizer/type_aware.rs |  4 +++-
+ 5 files changed, 63 insertions(+), 3 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index f2b802e6..9373623e 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -704,6 +704,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+                     local_index,
+                     slot_index,
+                 } => self.op_get_local_slot(*local_index, *slot_index),
++                Op::SlotToLocal {
++                    local_index,
++                    slot_index,
++                    dst,
++                } => self.op_slot_to_local(*local_index, *slot_index as usize, *dst),
++                Op::MoveLocal { src, dst } => {
++                    let value = self.local_register(*src);
++                    self.set_local_register(*dst, value);
++                    Ok(())
++                }
+                 Op::MultiplyLocalSlot {
+                     local_index,
+                     slot_index,
+@@ -1084,6 +1094,19 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         Ok(())
+     }
+ 
++    /// `getlocal`+`getslot`+`setlocal` одной инструкцией: значение поля не кладётся на стек.
++    fn op_slot_to_local(&mut self, register_index: u32, index: usize, dst: u32) -> Result<(), Error<'gc>> {
++        let object = self
++            .local_register(register_index)
++            .null_check(self, None)?
++            .as_object()
++            .expect("Cannot get_slot on primitive");
++
++        self.set_local_register(dst, object.get_slot(index));
++
++        Ok(())
++    }
++
+     /// `getlocal`+`getslot`+`multiply` одной инструкцией: поле не проходит через стек.
+     fn op_multiply_local_slot(&mut self, register_index: u32, index: usize) -> Result<(), Error<'gc>> {
+         let object = self
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 32b7ecc5..ff312afa 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -92,12 +92,12 @@ pub fn record(method: Method<'_>, ops: u64) {
+ 
+ /// Виды инструкций для гистограммы. Отдельно выделены обращения к полям: у Ruffle их несколько
+ /// видов, и по соотношению видно, справился ли анализатор — Slot дешёвый, Slow ищет имя в таблице.
+-pub const OP_KINDS: [&str; 19] = [
++pub const OP_KINDS: [&str; 21] = [
+     "GetSlot", "SetSlot", "GetPropertyStatic", "GetPropertyFast", "GetPropertySlow",
+     "SetProperty", "CallMethod", "CallNative", "CallProperty", "Construct",
+     "Local", "Arithmetic/Compare", "Branch", "Coerce", "Stack/Scope", "прочее",
+     "GetLocalSlot(склейка)", "GetLocal2(склейка)",
+-    "MultiplyLocalSlot(склейка)",
++    "MultiplyLocalSlot(склейка)", "SlotToLocal(склейка)", "MoveLocal(склейка)",
+ ];
+ 
+ /// Номер вида инструкции в `OP_KINDS`.
+@@ -106,6 +106,8 @@ pub fn op_kind(op: &crate::avm2::op::Op<'_>) -> usize {
+     match op {
+         Op::GetLocalSlot { .. } => 16,
+         Op::MultiplyLocalSlot { .. } => 18,
++        Op::SlotToLocal { .. } => 19,
++        Op::MoveLocal { .. } => 20,
+         Op::GetLocal2 { .. } => 17,
+         Op::GetSlot { .. } => 0,
+         Op::SetSlot { .. } | Op::SetSlotNoCoerce { .. } | Op::SetSlotCoerceI { .. } => 1,
+diff --git a/core/src/avm2/op.rs b/core/src/avm2/op.rs
+index 78048bf6..6559309f 100644
+--- a/core/src/avm2/op.rs
++++ b/core/src/avm2/op.rs
+@@ -162,6 +162,19 @@ pub enum Op<'gc> {
+         local_index: u32,
+         slot_index: usize,
+     },
++    /// Склейка `getlocal`+`getslot`+`setlocal` — «взять поле объекта и положить в переменную».
++    /// В коде отсечения сцены (Object3D.cullingInCamera, самый горячий метод клиента) таких
++    /// присваиваний под сотню.
++    SlotToLocal {
++        local_index: u32,
++        slot_index: u32,
++        dst: u32,
++    },
++    /// Склейка `getlocal`+`setlocal` — копирование переменной без прохода через стек.
++    MoveLocal {
++        src: u32,
++        dst: u32,
++    },
+     /// Склейка `getlocal`+`getslot`+`multiply`: умножение на поле объекта из локальной
+     /// переменной. Значение поля вообще не попадает на стек.
+     MultiplyLocalSlot {
+diff --git a/core/src/avm2/optimizer/peephole.rs b/core/src/avm2/optimizer/peephole.rs
+index 959c7c1a..e37e5255 100644
+--- a/core/src/avm2/optimizer/peephole.rs
++++ b/core/src/avm2/optimizer/peephole.rs
+@@ -98,6 +98,26 @@ pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<
+                         slot_index,
+                     });
+                 }
++                (
++                    Op::GetLocalSlot {
++                        local_index,
++                        slot_index,
++                    },
++                    Op::SetLocal { index: dst },
++                ) if fusion_enabled && slot_index <= u32::MAX as usize => {
++                    // `x = obj.field` одной инструкцией.
++                    last_op.set(Op::Nop);
++                    current_op.set(Op::SlotToLocal {
++                        local_index,
++                        slot_index: slot_index as u32,
++                        dst,
++                    });
++                }
++                (Op::GetLocal { index: src }, Op::SetLocal { index: dst }) if fusion_enabled => {
++                    // Копирование переменной: значение не проходит через стек.
++                    last_op.set(Op::Nop);
++                    current_op.set(Op::MoveLocal { src, dst });
++                }
+                 (
+                     Op::GetLocalSlot {
+                         local_index,
+diff --git a/core/src/avm2/optimizer/type_aware.rs b/core/src/avm2/optimizer/type_aware.rs
+index d1b9318d..1fe9c801 100644
+--- a/core/src/avm2/optimizer/type_aware.rs
++++ b/core/src/avm2/optimizer/type_aware.rs
+@@ -836,7 +836,9 @@ fn abstract_interpret_ops<'gc>(
+             // быть не может — ветка нужна только для полноты разбора.
+             Op::GetLocal2 { .. }
+             | Op::GetLocalSlot { .. }
+-            | Op::MultiplyLocalSlot { .. } => {
++            | Op::MultiplyLocalSlot { .. }
++            | Op::SlotToLocal { .. }
++            | Op::MoveLocal { .. } => {
+                 unreachable!("fused ops are created after the type-aware pass")
+             }
+             Op::CoerceA => {
+-- 
+2.51.1.windows.1
+

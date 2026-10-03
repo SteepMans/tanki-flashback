@@ -1,0 +1,1169 @@
+From ba04189a119a087e9d26f604760ea41dd49352e8 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 04:49:38 +0300
+Subject: [PATCH 06/17] render: batch Context3D draws into one submission per
+ frame
+
+---
+ Cargo.lock                               |   4 +
+ Cargo.toml                               |   4 +
+ render/wgpu/Cargo.toml                   |   9 +-
+ render/wgpu/src/context3d/mod.rs         | 854 ++++++++++++++++++-----
+ render/wgpu/src/context3d/shader_pair.rs |   7 +-
+ 5 files changed, 706 insertions(+), 172 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 73cfa5be..4f4ae38e 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -4942,6 +4942,7 @@ dependencies = [
+  "futures",
+  "image",
+  "indexmap",
++ "js-sys",
+  "lru",
+  "naga",
+  "naga-agal",
+@@ -4951,7 +4952,9 @@ dependencies = [
+  "smallvec",
+  "swf 0.2.2",
+  "tracing",
++ "wasm-bindgen",
+  "web-sys",
++ "web-time",
+  "wgpu",
+ ]
+ 
+@@ -5098,6 +5101,7 @@ dependencies = [
+  "wasm-bindgen-futures",
+  "wasm-streams",
+  "web-sys",
++ "web-time",
+  "zip",
+ ]
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index 2cd3c619..fb2c5654 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -183,6 +183,10 @@ inherits = "release"
+ 
+ [profile.web-wasm-extensions]
+ inherits = "release"
++# Интерпретатор ActionScript — самая горячая часть браузерной сборки: межмодульная оптимизация
++# и единый codegen-unit дают заметный прирост там, где кадр упирается в код игры.
++lto = "fat"
++codegen-units = 1
+ 
+ [profile.ci]
+ inherits = "release"
+diff --git a/render/wgpu/Cargo.toml b/render/wgpu/Cargo.toml
+index 2e7b1d5b..64bb9e8f 100644
+--- a/render/wgpu/Cargo.toml
++++ b/render/wgpu/Cargo.toml
+@@ -27,6 +27,7 @@ lru = "0.18.2"
+ naga = { workspace = true }
+ indexmap = { workspace = true }
+ smallvec = { workspace = true }
++web-time = "1.1.0"
+ 
+ # desktop
+ [target.'cfg(not(target_family = "wasm"))'.dependencies.futures]
+@@ -35,7 +36,13 @@ workspace = true
+ # wasm
+ [target.'cfg(target_family = "wasm")'.dependencies.web-sys]
+ workspace = true
+-features = ["HtmlCanvasElement"]
++features = ["HtmlCanvasElement", "Window"]
++
++[target.'cfg(target_family = "wasm")'.dependencies.js-sys]
++workspace = true
++
++[target.'cfg(target_family = "wasm")'.dependencies.wasm-bindgen]
++workspace = true
+ 
+ [features]
+ render_debug_labels = []
+diff --git a/render/wgpu/src/context3d/mod.rs b/render/wgpu/src/context3d/mod.rs
+index 761ac238..9abd0bcc 100644
+--- a/render/wgpu/src/context3d/mod.rs
++++ b/render/wgpu/src/context3d/mod.rs
+@@ -7,6 +7,7 @@ use ruffle_render::bitmap::BitmapHandle;
+ use ruffle_render::error::Error;
+ use std::any::Any;
+ use std::cell::{Cell, RefCell};
++use std::collections::HashSet;
+ use swf::{Rectangle, Twips};
+ 
+ use wgpu::util::StagingBelt;
+@@ -18,7 +19,11 @@ use wgpu::{
+ use wgpu::{CommandEncoder, Extent3d, RenderPass};
+ 
+ use crate::Texture;
+-use crate::context3d::current_pipeline::{AGAL_FLOATS_PER_REGISTER, BoundTextureData, IntoWgpu};
++use crate::context3d::current_pipeline::{
++    AGAL_FLOATS_PER_REGISTER, BoundTextureData, FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE,
++    FRAGMENT_UNIFORM_SLOT_SIZE, IntoWgpu, UNIFORM_SLOT_COUNT, VERTEX_SHADER_UNIFORMS_BUFFER_SIZE,
++    VERTEX_UNIFORM_SLOT_SIZE,
++};
+ use crate::descriptors::Descriptors;
+ use crate::utils::supported_sample_count;
+ 
+@@ -88,6 +93,165 @@ pub struct WgpuContext3D {
+     seen_clear_command: bool,
+ 
+     scissor_rectangle: Option<Rectangle<Twips>>,
++
++    /// Открытый проход отрисовки и его кодировщик команд. Раньше на каждый `drawTriangles`
++    /// создавался свой проход и сразу отправлялся видеокарте; теперь вызовы копятся и уходят
++    /// одной посылкой в `present`.
++    render_command_encoder: Option<CommandEncoder>,
++    render_pass: Option<RenderPass<'static>>,
++
++    /// Вершинные и индексные буферы, задействованные в уже записанных, но ещё не отправленных
++    /// вызовах. Если клиент перезаливает такой буфер посреди кадра, записанное надо отправить
++    /// раньше загрузки — иначе новые данные подменят старым вызовам геометрию.
++    pending_buffers: HashSet<usize>,
++    pending_draws: u32,
++    buffer_writes_pending: bool,
++
++    /// Кольцо констант шейдеров: копия текущего набора на стороне процессора и позиция в кольце.
++    vertex_constants: Vec<u8>,
++    fragment_constants: Vec<u8>,
++    constants_dirty: bool,
++    uniform_slot: u64,
++    uniform_offsets: [u32; 2],
++
++    /// Ножницы, уже применённые к открытому проходу (проход переживает много вызовов).
++    applied_scissor: Option<(u32, u32, u32, u32)>,
++
++    /// Рисовал ли клиент после последнего `present`: от этого зависит, в каком из двух буферов
++    /// лежит свежий кадр.
++    drew_since_present: bool,
++
++    /// Печатать ли разбор вызовов отрисовки (включается через `window.ruffleTraceDraws`).
++    trace_draws: bool,
++
++    /// Печатать ли заливки текстур (`window.ruffleTraceUploads`) — их немного, поэтому такой
++    /// разбор можно держать включённым с самого запуска.
++    trace_uploads: bool,
++
++    /// Сколько команд каждого вида пришло за секунду — печатается вместе с разбором вызовов.
++    command_counts: std::collections::HashMap<&'static str, u32>,
++
++    /// Отладочный ограничитель: рисовать не больше стольких вызовов за кадр
++    /// (`window.ruffleDrawLimit`). Помогает понять, какой вызов перекрывает картинку.
++    draw_limit: Option<u32>,
++    frame_draws: u32,
++
++    /// Счётчики для замера производительности: раз в секунду печатаем реальный FPS сцены и
++    /// нагрузку на кадр. Без этого «сколько кадров в секунду» приходится оценивать на глаз —
++    /// requestAnimationFrame в странице тикает 60 раз в секунду независимо от того, успел ли
++    /// движок нарисовать кадр.
++    stats: Stats,
++}
++
++/// Кладёт замеры в `window.ruffleStats`, откуда их читает экранный график в странице-обёртке.
++/// Вне браузера (десктопная сборка) не делает ничего.
++#[cfg(target_family = "wasm")]
++fn publish_stats(values: &[(&str, f64)]) {
++    let Some(window) = web_sys::window() else {
++        return;
++    };
++
++    let key = wasm_bindgen::JsValue::from_str("ruffleStats");
++    let stats = match js_sys::Reflect::get(&window, &key) {
++        Ok(value) if value.is_object() => value,
++        _ => {
++            let object = js_sys::Object::new();
++            let _ = js_sys::Reflect::set(&window, &key, &object);
++            object.into()
++        }
++    };
++
++    for (name, value) in values {
++        let _ = js_sys::Reflect::set(
++            &stats,
++            &wasm_bindgen::JsValue::from_str(name),
++            &wasm_bindgen::JsValue::from_f64(*value),
++        );
++    }
++}
++
++#[cfg(not(target_family = "wasm"))]
++fn publish_stats(_values: &[(&str, f64)]) {}
++
++/// Разбор вызовов отрисовки включается из страницы: `window.ruffleTraceDraws = true`.
++fn trace_draws_requested() -> bool {
++    flag_requested("ruffleTraceDraws")
++}
++
++/// Читает булев флаг из объекта окна страницы.
++#[cfg(target_family = "wasm")]
++fn flag_requested(name: &str) -> bool {
++    web_sys::window()
++        .and_then(|window| js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str(name)).ok())
++        .and_then(|value| value.as_bool())
++        .unwrap_or(false)
++}
++
++#[cfg(not(target_family = "wasm"))]
++fn flag_requested(_name: &str) -> bool {
++    false
++}
++
++/// Ограничитель вызовов отрисовки: `window.ruffleDrawLimit = 3`.
++#[cfg(target_family = "wasm")]
++fn draw_limit_requested() -> Option<u32> {
++    web_sys::window()
++        .and_then(|window| {
++            js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("ruffleDrawLimit")).ok()
++        })
++        .and_then(|value| value.as_f64())
++        .map(|value| value as u32)
++}
++
++#[cfg(not(target_family = "wasm"))]
++fn draw_limit_requested() -> Option<u32> {
++    None
++}
++
++/// Выключатель кешей пайплайнов и bind group: `window.ruffleNoCache = true`.
++#[cfg(target_family = "wasm")]
++fn no_cache_requested() -> bool {
++    web_sys::window()
++        .and_then(|window| {
++            js_sys::Reflect::get(&window, &wasm_bindgen::JsValue::from_str("ruffleNoCache")).ok()
++        })
++        .and_then(|value| value.as_bool())
++        .unwrap_or(false)
++}
++
++#[cfg(not(target_family = "wasm"))]
++fn no_cache_requested() -> bool {
++    false
++}
++
++struct Stats {
++    started: web_time::Instant,
++    frames: u32,
++    draws: u32,
++    submits: u32,
++    /// Время, проведённое внутри отрисовки и загрузки данных на видеокарту. Сравнение с длиной
++    /// кадра показывает, кто виноват в просадке: рендер или сам ActionScript-код клиента.
++    draw_time: std::time::Duration,
++    upload_time: std::time::Duration,
++    /// Суммарное время обработки команд Stage3D: показывает, сколько из «времени ActionScript»
++    /// на самом деле тратится внутри движка, а сколько в коде самой игры.
++    command_time: std::time::Duration,
++    commands: u32,
++}
++
++impl Stats {
++    fn new() -> Self {
++        Self {
++            started: web_time::Instant::now(),
++            frames: 0,
++            draws: 0,
++            submits: 0,
++            draw_time: std::time::Duration::ZERO,
++            upload_time: std::time::Duration::ZERO,
++            command_time: std::time::Duration::ZERO,
++            commands: 0,
++        }
++    }
+ }
+ 
+ impl WgpuContext3D {
+@@ -162,7 +326,90 @@ impl WgpuContext3D {
+             clear_color: None,
+             seen_clear_command: false,
+             scissor_rectangle: None,
++            render_command_encoder: None,
++            render_pass: None,
++            pending_buffers: HashSet::new(),
++            pending_draws: 0,
++            buffer_writes_pending: false,
++            vertex_constants: vec![0; VERTEX_SHADER_UNIFORMS_BUFFER_SIZE as usize],
++            fragment_constants: vec![0; FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE as usize],
++            constants_dirty: true,
++            uniform_slot: 0,
++            uniform_offsets: [0, 0],
++            applied_scissor: None,
++            drew_since_present: false,
++            trace_draws: false,
++            trace_uploads: false,
++            command_counts: std::collections::HashMap::new(),
++            draw_limit: None,
++            frame_draws: 0,
++            stats: Stats::new(),
++        }
++    }
++
++    /// Раз в секунду печатает фактическую частоту кадров сцены и то, чем занят кадр.
++    fn report_stats(&mut self) {
++        self.stats.frames += 1;
++
++        let elapsed = self.stats.started.elapsed().as_secs_f32();
++        if elapsed < 1.0 {
++            return;
+         }
++
++        publish_stats(&[
++            ("fps", self.stats.frames as f64 / elapsed as f64),
++            ("draws", self.stats.draws as f64 / self.stats.frames as f64),
++            (
++                "drawMs",
++                self.stats.draw_time.as_secs_f64() * 1000.0 / self.stats.frames as f64,
++            ),
++            (
++                "uploadMs",
++                self.stats.upload_time.as_secs_f64() * 1000.0 / self.stats.frames as f64,
++            ),
++            ("submits", self.stats.submits as f64 / self.stats.frames as f64),
++            (
++                "commandMs",
++                self.stats.command_time.as_secs_f64() * 1000.0 / self.stats.frames as f64,
++            ),
++            ("commands", self.stats.commands as f64 / self.stats.frames as f64),
++            ("pipelines", self.current_pipeline.created_pipelines.get() as f64),
++            (
++                "bindGroups",
++                self.current_pipeline.created_bind_groups.get() as f64,
++            ),
++        ]);
++
++        tracing::debug!(
++            "stage3d: {:.1} fps, за кадр: draw {:.0} ({:.1} мс), загрузка {:.1} мс, submit {:.0}; создано пайплайнов {}, bind group {}",
++            self.stats.frames as f32 / elapsed,
++            self.stats.draws as f32 / self.stats.frames as f32,
++            self.stats.draw_time.as_secs_f32() * 1000.0 / self.stats.frames as f32,
++            self.stats.upload_time.as_secs_f32() * 1000.0 / self.stats.frames as f32,
++            self.stats.submits as f32 / self.stats.frames as f32,
++            self.current_pipeline.created_pipelines.get(),
++            self.current_pipeline.created_bind_groups.get(),
++        );
++
++        if self.trace_draws && !self.command_counts.is_empty() {
++            let mut counts: Vec<_> = self.command_counts.drain().collect();
++            counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
++            tracing::info!("команды Stage3D за секунду: {:?}", counts);
++        }
++
++        self.trace_draws = trace_draws_requested();
++        self.trace_uploads = flag_requested("ruffleTraceUploads");
++        self.draw_limit = draw_limit_requested();
++        self.current_pipeline.no_cache.set(no_cache_requested());
++
++        self.stats.started = web_time::Instant::now();
++        self.stats.frames = 0;
++        self.stats.draws = 0;
++        self.stats.submits = 0;
++        self.stats.draw_time = std::time::Duration::ZERO;
++        self.stats.upload_time = std::time::Duration::ZERO;
++        self.stats.command_time = std::time::Duration::ZERO;
++        self.stats.commands = 0;
+     }
+ 
+     fn create_depth_texture(&self, width: u32, height: u32, sample_count: u32) -> TextureView {
+@@ -201,13 +448,19 @@ impl WgpuContext3D {
+             .update_target_format(TextureFormat::Rgba8Unorm);
+     }
+ 
+-    fn make_render_pass<'a>(
+-        &'a mut self,
+-        command_encoder: &'a mut CommandEncoder,
+-    ) -> RenderPass<'a> {
+-        // Subsequent draw calls (without an intermediate 'clear()' call)
+-        // will use a clear color of None. This ensures that by itself,
+-        // re-creating the render pass has no effect on the output
++    /// Открывает проход отрисовки. Проход живёт, пока не сменится цель, не придёт `clear`
++    /// или не наступит `present`, — все вызовы за это время пишутся в один кодировщик команд.
++    fn begin_pass(&mut self) {
++        if self.render_command_encoder.is_none() {
++            self.render_command_encoder = Some(self.descriptors.device.create_command_encoder(
++                &wgpu::CommandEncoderDescriptor {
++                    label: create_debug_label!("Render command encoder").as_deref(),
++                },
++            ));
++        }
++
++        // Проход без предшествующего `clear` обязан сохранить то, что уже нарисовано:
++        // пересоздание прохода само по себе картинку менять не должно.
+         let clear_color = self.clear_color.take();
+         let color_load = match clear_color {
+             Some(clear) if clear.mask & COLOR_MASK != 0 => wgpu::LoadOp::Clear(clear.rgb),
+@@ -240,7 +493,7 @@ impl WgpuContext3D {
+             None
+         };
+ 
+-        let mut pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++        let descriptor = wgpu::RenderPassDescriptor {
+             label: Some("Context3D render pass"),
+             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                 view: self.current_texture_view.as_ref().unwrap(),
+@@ -253,54 +506,74 @@ impl WgpuContext3D {
+             })],
+             depth_stencil_attachment,
+             ..Default::default()
+-        });
+-        pass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
+-        pass.set_pipeline(
+-            self.compiled_pipeline
+-                .as_ref()
+-                .expect("Missing compiled pipeline"),
+-        );
+-        if let Some(rect) = &self.scissor_rectangle {
+-            let current_size = self.current_texture_size.unwrap();
+-            if rect.x_min.to_pixels() < 0.0
+-                || rect.y_min.to_pixels() < 0.0
+-                || rect.x_max.to_pixels() as u32 > current_size.width
+-                || rect.y_max.to_pixels() as u32 > current_size.height
+-                || rect.x_min == rect.x_max
+-                || rect.y_min == rect.y_max
+-            {
+-                // FIXME - throw an error when Context3D.enableErrorChecking is set
+-                tracing::error!(
+-                    "Invalid scissor rectangle {:?} for texture size {:?}",
+-                    rect,
+-                    current_size
+-                );
+-                self.scissor_rectangle = None;
+-            } else {
+-                pass.set_scissor_rect(
+-                    rect.x_min.to_pixels() as u32,
+-                    rect.y_min.to_pixels() as u32,
+-                    rect.width().to_pixels() as u32,
+-                    rect.height().to_pixels() as u32,
+-                );
+-            }
++        };
++
++        let encoder = self
++            .render_command_encoder
++            .as_mut()
++            .expect("Missing render command encoder");
++        self.render_pass = Some(encoder.begin_render_pass(&descriptor).forget_lifetime());
++        self.applied_scissor = None;
++    }
++
++    /// Закрывает проход, ничего не отправляя. Следующий проход ляжет в тот же кодировщик —
++    /// это нужно при `clear` и смене цели отрисовки, чтобы кадр по-прежнему уходил одной посылкой.
++    fn end_pass(&mut self) {
++        self.render_pass = None;
++    }
++
++    /// Отправляет видеокарте всё записанное. Дорогая операция, поэтому вызывается только когда
++    /// без неё нельзя: кадр закончен, кольцо констант исчерпано или клиент перезаливает данные,
++    /// которые уже участвуют в записанных вызовах.
++    fn flush(&mut self) {
++        self.end_pass();
++
++        let render_encoder = self.render_command_encoder.take();
++        if render_encoder.is_none() && !self.buffer_writes_pending {
++            return;
+         }
+ 
+-        pass.set_stencil_reference(self.current_pipeline.stencil_ref_value());
++        let mut commands = Vec::with_capacity(2);
+ 
+-        let mut seen = Vec::new();
++        // Загрузки данных должны выполниться раньше вызовов отрисовки, поэтому идут первыми.
++        if self.buffer_writes_pending {
++            self.buffer_staging_belt.finish();
++            let new_encoder =
++                self.descriptors
++                    .device
++                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
++                        label: create_debug_label!("Buffer command encoder").as_deref(),
++                    });
++            commands.push(
++                std::mem::replace(&mut self.buffer_command_encoder, new_encoder).finish(),
++            );
++        }
+ 
+-        // Create a binding for each unique buffer that we encounter.
+-        // TODO - deduplicate this with the similar logic in set_pipelines
+-        let mut i = 0;
+-        for attr in self.vertex_attributes.iter().flatten() {
+-            if !seen.iter().any(|b| Rc::ptr_eq(b, &attr.buffer)) {
+-                pass.set_vertex_buffer(i as u32, attr.buffer.buffer.slice(..));
+-                seen.push(attr.buffer.clone());
+-                i += 1;
+-            }
++        if let Some(encoder) = render_encoder {
++            commands.push(encoder.finish());
++        }
++
++        self.descriptors.queue.submit(commands);
++
++        if self.buffer_writes_pending {
++            self.buffer_staging_belt.recall();
++            self.buffer_writes_pending = false;
++        }
++
++        self.stats.submits += 1;
++        self.pending_buffers.clear();
++        self.pending_draws = 0;
++        // Кольцо переиспользуется с начала: отправленные вызовы уже прочитали свои слоты
++        // (запись в буфер выполняется в порядке очереди команд, то есть после них).
++        self.uniform_slot = 0;
++        self.constants_dirty = true;
++    }
++
++    /// Если буфер участвует в записанных, но не отправленных вызовах, его нельзя перезаписывать.
++    fn flush_if_pending(&mut self, buffer: usize) {
++        if self.pending_buffers.contains(&buffer) {
++            self.flush();
+         }
+-        pass
+     }
+ }
+ 
+@@ -319,7 +592,7 @@ pub struct VertexBufferWrapper {
+ 
+ #[derive(Debug)]
+ pub struct TextureWrapper {
+-    texture: wgpu::Texture,
++    pub(super) texture: wgpu::Texture,
+ }
+ 
+ impl IndexBuffer for IndexBufferWrapper {}
+@@ -351,6 +624,22 @@ impl Context3D for WgpuContext3D {
+     fn bitmap_handle(&self) -> BitmapHandle {
+         self.front_buffer_raw_texture_handle.clone()
+     }
++
++    fn back_buffer_size(&self) -> Option<(u32, u32)> {
++        self.back_buffer_size
++            .map(|size| (size.width, size.height))
++    }
++
++    fn draw_source_handle(&mut self) -> BitmapHandle {
++        // Копия могла быть запрошена посреди кадра, поэтому сначала отправляем накопленное.
++        self.flush();
++
++        if self.drew_since_present {
++            self.back_buffer_raw_texture_handle.clone()
++        } else {
++            self.front_buffer_raw_texture_handle.clone()
++        }
++    }
+     fn should_render(&self) -> bool {
+         // If this is None, we haven't called configureBackBuffer yet.
+         self.current_texture_view.is_some()
+@@ -494,6 +783,115 @@ impl Context3D for WgpuContext3D {
+     }
+ 
+     fn process_command(&mut self, command: Context3DCommand<'_>) {
++        let command_started = web_time::Instant::now();
++
++        if self.trace_draws {
++            let name = match &command {
++                Context3DCommand::Clear { .. } => "Clear",
++                Context3DCommand::ConfigureBackBuffer { .. } => "ConfigureBackBuffer",
++                Context3DCommand::UploadToIndexBuffer { .. } => "UploadToIndexBuffer",
++                Context3DCommand::UploadToVertexBuffer { .. } => "UploadToVertexBuffer",
++                Context3DCommand::SetRenderToTexture { .. } => "SetRenderToTexture",
++                Context3DCommand::SetRenderToBackBuffer => "SetRenderToBackBuffer",
++                Context3DCommand::DrawTriangles { .. } => "DrawTriangles",
++                Context3DCommand::SetVertexBufferAt { .. } => "SetVertexBufferAt",
++                Context3DCommand::SetShaders { .. } => "SetShaders",
++                Context3DCommand::SetProgramConstants { .. } => "SetProgramConstants",
++                Context3DCommand::SetCulling { .. } => "SetCulling",
++                Context3DCommand::CopyBitmapToTexture { .. } => "CopyBitmapToTexture",
++                Context3DCommand::SetTextureAt { .. } => "SetTextureAt",
++                Context3DCommand::SetColorMask { .. } => "SetColorMask",
++                Context3DCommand::SetDepthTest { .. } => "SetDepthTest",
++                Context3DCommand::SetBlendFactors { .. } => "SetBlendFactors",
++                Context3DCommand::SetSamplerStateAt { .. } => "SetSamplerStateAt",
++                Context3DCommand::SetScissorRectangle { .. } => "SetScissorRectangle",
++                Context3DCommand::SetStencilActions { .. } => "SetStencilActions",
++                Context3DCommand::SetStencilReferenceValue { .. } => "SetStencilReferenceValue",
++            };
++            *self.command_counts.entry(name).or_insert(0) += 1;
++        }
++
++        self.process_command_inner(command);
++        self.stats.command_time += command_started.elapsed();
++        self.stats.commands += 1;
++    }
++
++    #[instrument(level = "debug", skip_all)]
++    fn present(&mut self) {
++        // Кадр закончен — отправляем всё записанное видеокарте.
++        self.flush();
++
++        std::mem::swap(
++            &mut self.back_buffer_raw_texture_handle,
++            &mut self.front_buffer_raw_texture_handle,
++        );
++        std::mem::swap(
++            &mut self.back_buffer_texture_view,
++            &mut self.front_buffer_texture_view,
++        );
++        std::mem::swap(
++            &mut self.back_buffer_resolve_texture_view,
++            &mut self.front_buffer_resolve_texture_view,
++        );
++        std::mem::swap(
++            &mut self.back_buffer_depth_texture_view,
++            &mut self.front_buffer_depth_texture_view,
++        );
++
++        self.set_render_to_back_buffer();
++        self.seen_clear_command = false;
++        self.clear_color = None;
++        self.drew_since_present = false;
++        self.frame_draws = 0;
++        self.report_stats();
++    }
++}
++
++#[derive(Copy, Clone)]
++pub struct ClearColor {
++    rgb: wgpu::Color,
++    depth: f32,
++    stencil: u32,
++    mask: u32,
++}
++
++fn convert_texture_format(input: Context3DTextureFormat) -> wgpu::TextureFormat {
++    match input {
++        // Some of these formats are unsupported by wgpu to various degrees:
++        // * Bgra doesn't exist in webgl
++        //
++        // Instead, we just use Rgba8Unorm, which is the closest thing we have.
++        // When we implement Texture.uploadFromByteArray, we'll need to convert
++        // the user-supplied data to Rgba8Unorm.
++        //
++        // The Rgba8Unorm format stores more data for each channel, so this
++        // will result in (hopefully minor) rendering differences.
++        Context3DTextureFormat::Bgra => TextureFormat::Rgba8Unorm,
++        Context3DTextureFormat::BgraPacked => TextureFormat::Rgba8Unorm,
++        // Wgpu doesn't have 'Rgb8Unorm', so we use 'Rgba8Unorm' instead.
++        // Applications *should* use an opaque Bitmap with this format, so the
++        // alpha channel should be set to 1.0 and have no effect.
++        // FIXME: Validate that this is actually the case, and throw an
++        // error if we get an unexpected bitmap from ActionScript
++        Context3DTextureFormat::BgrPacked => TextureFormat::Rgba8Unorm,
++        // Starling claims that this is dxt5, which has an alpha channel
++        Context3DTextureFormat::CompressedAlpha => TextureFormat::Bc3RgbaUnorm,
++        // Starling claims that this is dxt1. It's unclear if there's supposed
++        // to be an alpha channel, so we're relying on SWFS doing "the right thing"
++        // as with BgrPacked
++        Context3DTextureFormat::Compressed => TextureFormat::Rgba8Unorm,
++        Context3DTextureFormat::RgbaHalfFloat => TextureFormat::Rgba16Float,
++    }
++}
++
++// Rounds up 'len' to the nearest multiple of COPY_BUFFER_ALIGNMENT
++fn align_copy_buffer_size(len: usize) -> usize {
++    let align = COPY_BUFFER_ALIGNMENT as usize;
++    (len + align - 1) & !(align - 1)
++}
++
++impl WgpuContext3D {
++    fn process_command_inner(&mut self, command: Context3DCommand<'_>) {
+         match command {
+             Context3DCommand::Clear {
+                 red,
+@@ -516,6 +914,8 @@ impl Context3D for WgpuContext3D {
+                     stencil,
+                 });
+                 self.seen_clear_command = true;
++                // Очистка задаётся при создании прохода, поэтому текущий надо закрыть.
++                self.end_pass();
+             }
+             Context3DCommand::ConfigureBackBuffer {
+                 width,
+@@ -527,6 +927,9 @@ impl Context3D for WgpuContext3D {
+             } => {
+                 let format = wgpu::TextureFormat::Rgba8Unorm;
+ 
++                // Дальше пересоздаются текстуры кадра, поэтому записанное отправляем сейчас.
++                self.flush();
++
+                 let mut sample_count = anti_alias;
+                 if sample_count == 0 {
+                     sample_count = 1;
+@@ -539,6 +942,26 @@ impl Context3D for WgpuContext3D {
+                 sample_count =
+                     supported_sample_count(&self.descriptors.adapter, sample_count, format);
+ 
++                #[cfg(target_family = "wasm")]
++                {
++                    // В WebGL многосэмпловый бэкбуфер не разворачивается в обычную текстуру:
++                    // сцена рисуется, но на экран не попадает (превью танка в гараже клиент
++                    // просит с четырёхкратным сглаживанием и получало пустоту). Для рендера в
++                    // текстуру сглаживание тут отключено и в самом Ruffle — делаем так же.
++                    if sample_count > 1
++                        && matches!(
++                            self.descriptors.adapter.get_info().backend,
++                            wgpu::Backend::Gl
++                        )
++                    {
++                        tracing::warn!(
++                            "Context3D.configureBackBuffer: сглаживание {} не поддерживается в WebGL, отключено",
++                            sample_count
++                        );
++                        sample_count = 1;
++                    }
++                }
++
+                 let texture_label = create_debug_label!("Render target texture");
+ 
+                 let make_it = || {
+@@ -686,6 +1109,12 @@ impl Context3D for WgpuContext3D {
+                 if data.is_empty() {
+                     return;
+                 }
++                let buffer_id = {
++                    let buffer: &IndexBufferWrapper = <dyn Any>::downcast_ref(buffer).unwrap();
++                    buffer as *const IndexBufferWrapper as usize
++                };
++                // Новые данные не должны подменить геометрию уже записанным вызовам.
++                self.flush_if_pending(buffer_id);
+                 let buffer: &mut IndexBufferWrapper = <dyn Any>::downcast_mut(buffer).unwrap();
+ 
+                 // Unfortunately, ActionScript works with 2-byte indices, while wgpu requires
+@@ -714,6 +1143,7 @@ impl Context3D for WgpuContext3D {
+                         &buffer.data
+                             [rounded_down_offset..(rounded_down_offset + rounded_up_length)],
+                     );
++                self.buffer_writes_pending = true;
+             }
+ 
+             Context3DCommand::UploadToVertexBuffer {
+@@ -725,9 +1155,12 @@ impl Context3D for WgpuContext3D {
+                 if data.is_empty() {
+                     return;
+                 }
++                let upload_started = web_time::Instant::now();
+ 
+                 let buffer: Rc<VertexBufferWrapper> =
+                     Rc::<dyn Any>::downcast(buffer.clone()).unwrap();
++                // Новые данные не должны подменить геометрию уже записанным вызовам.
++                self.flush_if_pending(Rc::as_ptr(&buffer) as usize);
+ 
+                 // ActionScript can only work with 32-bit chunks of data, so our `write_buffer`
+                 // offset and size will always be a multiple of `COPY_BUFFER_ALIGNMENT` (4 bytes)
+@@ -740,6 +1173,8 @@ impl Context3D for WgpuContext3D {
+                     &self.descriptors.device,
+                 )[..data.len()]
+                     .copy_from_slice(data);
++                self.buffer_writes_pending = true;
++                self.stats.upload_time += upload_started.elapsed();
+             }
+ 
+             Context3DCommand::SetRenderToTexture {
+@@ -767,6 +1202,8 @@ impl Context3D for WgpuContext3D {
+                     }
+                 }
+ 
++                self.end_pass();
++
+                 let texture_wrapper =
+                     <dyn Any>::downcast_ref::<TextureWrapper>(texture.as_ref()).unwrap();
+                 self.current_texture_size = Some(Extent3d {
+@@ -835,6 +1272,7 @@ impl Context3D for WgpuContext3D {
+             }
+ 
+             Context3DCommand::SetRenderToBackBuffer => {
++                self.end_pass();
+                 self.set_render_to_back_buffer();
+             }
+ 
+@@ -843,6 +1281,12 @@ impl Context3D for WgpuContext3D {
+                 first_index,
+                 num_triangles,
+             } => {
++                let draw_started = web_time::Instant::now();
++                self.frame_draws += 1;
++                if self.draw_limit.is_some_and(|limit| self.frame_draws > limit) {
++                    return;
++                }
++
+                 let index_buffer: &IndexBufferWrapper =
+                     <dyn Any>::downcast_ref(index_buffer).unwrap();
+ 
+@@ -859,44 +1303,140 @@ impl Context3D for WgpuContext3D {
+                     );
+                 }
+ 
+-                self.buffer_staging_belt.finish();
+-                let new_encoder = self.descriptors.device.create_command_encoder(
+-                    &wgpu::CommandEncoderDescriptor {
+-                        label: create_debug_label!("Buffer command encoder").as_deref(),
+-                    },
+-                );
+-                let finished_buffer_command_encoder =
+-                    std::mem::replace(&mut self.buffer_command_encoder, new_encoder);
+-
+-                // Note - we need to unconditionally re-create the render pass, since we had to submit the
+-                // buffer command encoder above.
+-
+                 if let Some((new_pipeline, new_bind_group)) = new_pipeline {
+                     self.compiled_pipeline = Some(new_pipeline);
+                     self.bind_group = Some(new_bind_group);
+                 }
+ 
+-                let mut render_command_encoder = self.descriptors.device.create_command_encoder(
+-                    &wgpu::CommandEncoderDescriptor {
+-                        label: create_debug_label!("Render command encoder").as_deref(),
+-                    },
++                // Константы этого вызова кладём в свободный слот кольца: так следующий вызов
++                // не затрёт значения ещё не отправленному.
++                if self.constants_dirty {
++                    if self.uniform_slot >= UNIFORM_SLOT_COUNT {
++                        self.flush();
++                    }
++
++                    let slot = self.uniform_slot;
++                    self.uniform_slot += 1;
++                    let vertex_offset = slot * VERTEX_UNIFORM_SLOT_SIZE;
++                    let fragment_offset = slot * FRAGMENT_UNIFORM_SLOT_SIZE;
++
++                    self.buffer_staging_belt
++                        .write_buffer(
++                            &mut self.buffer_command_encoder,
++                            &self.current_pipeline.vertex_shader_uniforms,
++                            vertex_offset,
++                            NonZeroU64::new(VERTEX_SHADER_UNIFORMS_BUFFER_SIZE).unwrap(),
++                            &self.descriptors.device,
++                        )
++                        .copy_from_slice(&self.vertex_constants);
++                    self.buffer_staging_belt
++                        .write_buffer(
++                            &mut self.buffer_command_encoder,
++                            &self.current_pipeline.fragment_shader_uniforms,
++                            fragment_offset,
++                            NonZeroU64::new(FRAGMENT_SHADER_UNIFORMS_BUFFER_SIZE).unwrap(),
++                            &self.descriptors.device,
++                        )
++                        .copy_from_slice(&self.fragment_constants);
++
++                    self.buffer_writes_pending = true;
++                    self.uniform_offsets = [vertex_offset as u32, fragment_offset as u32];
++                    self.constants_dirty = false;
++                }
++
++                // Ножницы задаются командой в любой момент, а применяются к проходу.
++                let scissor = self.scissor_rectangle.as_ref().and_then(|rect| {
++                    let current_size = self.current_texture_size.unwrap();
++                    if rect.x_min.to_pixels() < 0.0
++                        || rect.y_min.to_pixels() < 0.0
++                        || rect.x_max.to_pixels() as u32 > current_size.width
++                        || rect.y_max.to_pixels() as u32 > current_size.height
++                        || rect.x_min == rect.x_max
++                        || rect.y_min == rect.y_max
++                    {
++                        // FIXME - throw an error when Context3D.enableErrorChecking is set
++                        tracing::error!(
++                            "Invalid scissor rectangle {:?} for texture size {:?}",
++                            rect,
++                            current_size
++                        );
++                        None
++                    } else {
++                        Some((
++                            rect.x_min.to_pixels() as u32,
++                            rect.y_min.to_pixels() as u32,
++                            rect.width().to_pixels() as u32,
++                            rect.height().to_pixels() as u32,
++                        ))
++                    }
++                });
++                if scissor.is_none() {
++                    self.scissor_rectangle = None;
++                }
++
++                if self.render_pass.is_none() {
++                    self.begin_pass();
++                }
++
++                let full_size = self.current_texture_size.unwrap();
++                let applied_scissor = self.applied_scissor;
++                let stencil_ref = self.current_pipeline.stencil_ref_value();
++                let uniform_offsets = self.uniform_offsets;
++
++                let pass = self.render_pass.as_mut().unwrap();
++                pass.set_pipeline(
++                    self.compiled_pipeline
++                        .as_ref()
++                        .expect("Missing compiled pipeline"),
+                 );
++                pass.set_bind_group(
++                    0,
++                    self.bind_group.as_ref().expect("Missing bind group"),
++                    &uniform_offsets,
++                );
++                pass.set_stencil_reference(stencil_ref);
+ 
+-                let mut render_pass = self.make_render_pass(&mut render_command_encoder);
++                if scissor != applied_scissor {
++                    let (x, y, width, height) =
++                        scissor.unwrap_or((0, 0, full_size.width, full_size.height));
++                    pass.set_scissor_rect(x, y, width, height);
++                }
+ 
+-                render_pass
+-                    .set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
+-                render_pass.draw_indexed(indices, 0, 0..1);
++                let mut seen: Vec<Rc<VertexBufferWrapper>> = Vec::new();
++                let mut i = 0;
++                for attr in self.vertex_attributes.iter().flatten() {
++                    if !seen.iter().any(|b| Rc::ptr_eq(b, &attr.buffer)) {
++                        pass.set_vertex_buffer(i as u32, attr.buffer.buffer.slice(..));
++                        seen.push(attr.buffer.clone());
++                        i += 1;
++                    }
++                }
+ 
+-                // A `RenderPass` needs to hold references to several fields in `self`, so we can't
+-                // easily re-use it across multiple `DrawTriangles` calls.
+-                drop(render_pass);
++                pass.set_index_buffer(index_buffer.buffer.slice(..), wgpu::IndexFormat::Uint16);
++                pass.draw_indexed(indices, 0, 0..1);
++
++                // Диагностика: раз в две секунды печатаем состав кадра — так видно, чем именно
++                // рисуется сцена и почему модель может быть невидимой.
++                if self.trace_draws && self.stats.draws < 12 {
++                    tracing::info!(
++                        "draw #{}: треугольников {}, {}, ножницы {:?}",
++                        self.stats.draws,
++                        num_triangles,
++                        self.current_pipeline.debug_state(),
++                        scissor,
++                    );
++                }
+ 
+-                self.descriptors.queue.submit([
+-                    finished_buffer_command_encoder.finish(),
+-                    render_command_encoder.finish(),
+-                ]);
+-                self.buffer_staging_belt.recall();
++                self.applied_scissor = scissor;
++                self.drew_since_present = true;
++                for buffer in seen {
++                    self.pending_buffers.insert(Rc::as_ptr(&buffer) as usize);
++                }
++                self.pending_buffers
++                    .insert(index_buffer as *const IndexBufferWrapper as usize);
++                self.pending_draws += 1;
++                self.stats.draws += 1;
++                self.stats.draw_time += draw_started.elapsed();
+             }
+ 
+             Context3DCommand::SetVertexBufferAt {
+@@ -917,9 +1457,23 @@ impl Context3D for WgpuContext3D {
+                     None
+                 };
+ 
+-                self.vertex_attributes[index as usize] = info;
+-                self.current_pipeline
+-                    .update_vertex_buffer_at(index as usize);
++                // Клиент перед каждой моделью заново привязывает буферы. Если привязка та же,
++                // пересобирать пайплайн не нужно — раскладка вершин не изменилась.
++                let unchanged = match (&self.vertex_attributes[index as usize], &info) {
++                    (None, None) => true,
++                    (Some(old), Some(new)) => {
++                        old.offset_in_32bit_units == new.offset_in_32bit_units
++                            && old.format == new.format
++                            && Rc::ptr_eq(&old.buffer, &new.buffer)
++                    }
++                    _ => false,
++                };
++
++                if !unchanged {
++                    self.vertex_attributes[index as usize] = info;
++                    self.current_pipeline
++                        .update_vertex_buffer_at(index as usize);
++                }
+             }
+ 
+             Context3DCommand::SetShaders { module } => {
+@@ -935,28 +1489,28 @@ impl Context3D for WgpuContext3D {
+                 if matrix_raw_data_column_major.is_empty() {
+                     return;
+                 }
+-                let buffer = match program_type {
+-                    ProgramType::Vertex => &self.current_pipeline.vertex_shader_uniforms,
+-                    ProgramType::Fragment => &self.current_pipeline.fragment_shader_uniforms,
++
++                // Константы копятся в теневом наборе на стороне процессора; на видеокарту он
++                // уходит целиком при отрисовке — в свой слот кольца.
++                let constants = match program_type {
++                    ProgramType::Vertex => &mut self.vertex_constants,
++                    ProgramType::Fragment => &mut self.fragment_constants,
+                 };
+ 
+-                let offset = first_register as u64
++                let offset = (first_register as u64
+                     * AGAL_FLOATS_PER_REGISTER
+-                    * std::mem::size_of::<f32>() as u64;
+-
+-                let mut buffer_view = self.buffer_staging_belt.write_buffer(
+-                    &mut self.buffer_command_encoder,
+-                    buffer,
+-                    offset,
+-                    NonZeroU64::new(std::mem::size_of_val(matrix_raw_data_column_major) as u64)
+-                        .unwrap(),
+-                    &self.descriptors.device,
+-                );
+-                // Despite what the docs claim, we copy in *column* major order, rather than *row* major order.
+-                // See this code in OpenFL: https://github.com/openfl/openfl/blob/971a4c9e43b5472fd84d73920a2b7c1b3d8d9257/src/openfl/display3D/Context3D.hx#L1532-L1550
+-                // When the 'transposedMatrix' flag is false, it copies data *directly* from matrix.rawData,
+-                // which is stored in column-major order
+-                buffer_view.copy_from_slice(matrix_raw_data_column_major.as_flattened());
++                    * std::mem::size_of::<f32>() as u64) as usize;
++
++                // Данные копируются по столбцам, а не по строкам, что бы ни утверждала
++                // документация. См. OpenFL:
++                // https://github.com/openfl/openfl/blob/971a4c9e43b5472fd84d73920a2b7c1b3d8d9257/src/openfl/display3D/Context3D.hx#L1532-L1550
++                let source: &[u8] =
++                    bytemuck::cast_slice(matrix_raw_data_column_major.as_flattened());
++                let end = (offset + source.len()).min(constants.len());
++                if end > offset {
++                    constants[offset..end].copy_from_slice(&source[..end - offset]);
++                    self.constants_dirty = true;
++                }
+             }
+             Context3DCommand::SetCulling { face } => {
+                 self.current_pipeline.set_culling(face);
+@@ -968,8 +1522,36 @@ impl Context3D for WgpuContext3D {
+                 dest,
+                 layer,
+             } => {
++                // Текстура могла попасть в уже записанные вызовы, поэтому их надо отправить
++                // до заливки новых пикселей.
++                if self.pending_draws > 0 {
++                    self.flush();
++                }
++
+                 let dest = Rc::<dyn Any>::downcast::<TextureWrapper>(dest).unwrap();
+ 
++                if self.trace_uploads {
++                    // Средний цвет и прозрачность источника: показывают, приехала ли картинка
++                    // вообще (пустая текстура рисуется чёрным).
++                    let pixels = source.len() / 4;
++                    if pixels > 0 {
++                        let mut sum = [0u64; 4];
++                        for chunk in source.chunks_exact(4) {
++                            for (i, value) in chunk.iter().enumerate() {
++                                sum[i] += *value as u64;
++                            }
++                        }
++                        tracing::info!(
++                            "заливка текстуры {:?} {}x{} (слой {}): средний цвет {:?}",
++                            Rc::as_ptr(&dest) as *const () as usize,
++                            source_width,
++                            source_height,
++                            layer,
++                            sum.map(|v| (v / pixels as u64) as u8),
++                        );
++                    }
++                }
++
+                 // Unfortunately, we need to copy from the CPU data, rather than using the GPU texture.
+                 // The GPU side of a BitmapData can be updated at any time from non-Stage3D code.
+                 // If we were to use `self.buffer_command_encoder.copy_texture_to_texture`, the
+@@ -1196,70 +1778,4 @@ impl Context3D for WgpuContext3D {
+         }
+     }
+ 
+-    #[instrument(level = "debug", skip_all)]
+-    fn present(&mut self) {
+-        std::mem::swap(
+-            &mut self.back_buffer_raw_texture_handle,
+-            &mut self.front_buffer_raw_texture_handle,
+-        );
+-        std::mem::swap(
+-            &mut self.back_buffer_texture_view,
+-            &mut self.front_buffer_texture_view,
+-        );
+-        std::mem::swap(
+-            &mut self.back_buffer_resolve_texture_view,
+-            &mut self.front_buffer_resolve_texture_view,
+-        );
+-        std::mem::swap(
+-            &mut self.back_buffer_depth_texture_view,
+-            &mut self.front_buffer_depth_texture_view,
+-        );
+-
+-        self.set_render_to_back_buffer();
+-        self.seen_clear_command = false;
+-        self.clear_color = None;
+-    }
+-}
+-
+-#[derive(Copy, Clone)]
+-pub struct ClearColor {
+-    rgb: wgpu::Color,
+-    depth: f32,
+-    stencil: u32,
+-    mask: u32,
+-}
+-
+-fn convert_texture_format(input: Context3DTextureFormat) -> wgpu::TextureFormat {
+-    match input {
+-        // Some of these formats are unsupported by wgpu to various degrees:
+-        // * Bgra doesn't exist in webgl
+-        //
+-        // Instead, we just use Rgba8Unorm, which is the closest thing we have.
+-        // When we implement Texture.uploadFromByteArray, we'll need to convert
+-        // the user-supplied data to Rgba8Unorm.
+-        //
+-        // The Rgba8Unorm format stores more data for each channel, so this
+-        // will result in (hopefully minor) rendering differences.
+-        Context3DTextureFormat::Bgra => TextureFormat::Rgba8Unorm,
+-        Context3DTextureFormat::BgraPacked => TextureFormat::Rgba8Unorm,
+-        // Wgpu doesn't have 'Rgb8Unorm', so we use 'Rgba8Unorm' instead.
+-        // Applications *should* use an opaque Bitmap with this format, so the
+-        // alpha channel should be set to 1.0 and have no effect.
+-        // FIXME: Validate that this is actually the case, and throw an
+-        // error if we get an unexpected bitmap from ActionScript
+-        Context3DTextureFormat::BgrPacked => TextureFormat::Rgba8Unorm,
+-        // Starling claims that this is dxt5, which has an alpha channel
+-        Context3DTextureFormat::CompressedAlpha => TextureFormat::Bc3RgbaUnorm,
+-        // Starling claims that this is dxt1. It's unclear if there's supposed
+-        // to be an alpha channel, so we're relying on SWFS doing "the right thing"
+-        // as with BgrPacked
+-        Context3DTextureFormat::Compressed => TextureFormat::Rgba8Unorm,
+-        Context3DTextureFormat::RgbaHalfFloat => TextureFormat::Rgba16Float,
+-    }
+-}
+-
+-// Rounds up 'len' to the nearest multiple of COPY_BUFFER_ALIGNMENT
+-fn align_copy_buffer_size(len: usize) -> usize {
+-    let align = COPY_BUFFER_ALIGNMENT as usize;
+-    (len + align - 1) & !(align - 1)
+ }
+diff --git a/render/wgpu/src/context3d/shader_pair.rs b/render/wgpu/src/context3d/shader_pair.rs
+index 761aea03..c64c0318 100644
+--- a/render/wgpu/src/context3d/shader_pair.rs
++++ b/render/wgpu/src/context3d/shader_pair.rs
+@@ -85,7 +85,10 @@ impl ShaderPairAgal {
+                         visibility: wgpu::ShaderStages::VERTEX,
+                         ty: wgpu::BindingType::Buffer {
+                             ty: wgpu::BufferBindingType::Uniform,
+-                            has_dynamic_offset: false,
++                            // Константы каждого вызова отрисовки лежат в своём куске общего
++                            // буфера, а нужный кусок выбирается смещением при привязке. Это
++                            // позволяет собрать все вызовы кадра в один проход.
++                            has_dynamic_offset: true,
+                             min_binding_size: None,
+                         },
+                         count: None,
+@@ -96,7 +99,7 @@ impl ShaderPairAgal {
+                         visibility: wgpu::ShaderStages::FRAGMENT,
+                         ty: wgpu::BindingType::Buffer {
+                             ty: wgpu::BufferBindingType::Uniform,
+-                            has_dynamic_offset: false,
++                            has_dynamic_offset: true,
+                             min_binding_size: None,
+                         },
+                         count: None,
+-- 
+2.51.1.windows.1
+

@@ -1,0 +1,79 @@
+From 1f0f2abc4f82534c93d70f02c0c74feb2d0683a4 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 12:24:42 +0300
+Subject: [PATCH 17/17] web: free space in local storage instead of failing
+ SharedObject flush
+
+---
+ web/src/storage.rs | 48 +++++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 45 insertions(+), 3 deletions(-)
+
+diff --git a/web/src/storage.rs b/web/src/storage.rs
+index 76de527f..2700de2c 100644
+--- a/web/src/storage.rs
++++ b/web/src/storage.rs
+@@ -11,6 +11,28 @@ impl LocalStorageBackend {
+     pub(crate) fn new(storage: Storage) -> Self {
+         LocalStorageBackend { storage }
+     }
++
++    /// Самая объёмная запись, кроме указанной: её и приносим в жертву, когда места не хватает.
++    fn largest_other_key(&self, keep: &str) -> Option<String> {
++        let length = self.storage.length().ok()?;
++        let mut largest: Option<(String, usize)> = None;
++
++        for index in 0..length {
++            let Ok(Some(key)) = self.storage.key(index) else {
++                continue;
++            };
++            if key == keep {
++                continue;
++            }
++
++            let size = self.storage.get(&key).ok().flatten().map_or(0, |v| v.len());
++            if largest.as_ref().is_none_or(|(_, best)| size > *best) {
++                largest = Some((key, size));
++            }
++        }
++
++        largest.map(|(key, _)| key)
++    }
+ }
+ 
+ impl StorageBackend for LocalStorageBackend {
+@@ -25,9 +47,29 @@ impl StorageBackend for LocalStorageBackend {
+     }
+ 
+     fn put(&mut self, name: &str, value: &[u8]) -> bool {
+-        self.storage
+-            .set(name, &BASE64_STANDARD.encode(value))
+-            .is_ok()
++        let encoded = BASE64_STANDARD.encode(value);
++        if self.storage.set(name, &encoded).is_ok() {
++            return true;
++        }
++
++        // Место в хранилище браузера кончилось (обычно 5 МБ на сайт, а данные ещё и кодируются
++        // в base64). Содержимое в этот момент получает ошибку 2130 и теряет настройки, поэтому
++        // освобождаем место само: выбрасываем самые крупные посторонние записи и пробуем снова.
++        while let Some(victim) = self.largest_other_key(name) {
++            tracing::warn!(
++                "Local storage is full, dropping \"{}\" to make room for \"{}\"",
++                victim,
++                name
++            );
++            let _ = self.storage.delete(&victim);
++
++            if self.storage.set(name, &encoded).is_ok() {
++                return true;
++            }
++        }
++
++        tracing::error!("Failed to save \"{}\": local storage is full", name);
++        false
+     }
+ 
+     fn remove_key(&mut self, name: &str) {
+-- 
+2.51.1.windows.1
+

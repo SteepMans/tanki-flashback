@@ -1,0 +1,124 @@
+From b836584bbea418cf9257052275bd8d515761294b Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 04:50:03 +0300
+Subject: [PATCH 09/17] web: report frame and Stage3D statistics to the page
+
+---
+ web/Cargo.toml |  1 +
+ web/src/lib.rs | 77 ++++++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 76 insertions(+), 2 deletions(-)
+
+diff --git a/web/Cargo.toml b/web/Cargo.toml
+index 1dcd9d65..4cfa0cd0 100644
+--- a/web/Cargo.toml
++++ b/web/Cargo.toml
+@@ -37,6 +37,7 @@ js-sys = { workspace = true }
+ tracing = { workspace = true, features = ["log"] }
+ tracing-subscriber = { version = "0.3.23", default-features = false, features = ["registry"] }
+ tracing-log = "0.2.0"
++web-time = "1.1.0"
+ tracing-wasm = { workspace = true }
+ ruffle_render_canvas = { path = "../render/canvas", optional = true }
+ ruffle_web_common = { path = "common" }
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index e8ce6b07..7a73c252 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1119,6 +1119,71 @@ impl RuffleHandle {
+         ret
+     }
+ 
++    /// Раз в секунду печатает, из чего складывается кадр: `tick` — это выполнение
++    /// ActionScript и обновление списка отображения, `render` — отрисовка. Нужно, чтобы
++    /// не гадать, кто виноват в просадке частоты кадров.
++    fn report_frame_time(
++        tick_time: std::time::Duration,
++        render_time: std::time::Duration,
++        rendered: bool,
++    ) {
++        thread_local! {
++            static FRAME_STATS: std::cell::RefCell<(web_time::Instant, u32, u32, f32, f32)> =
++                std::cell::RefCell::new((web_time::Instant::now(), 0, 0, 0.0, 0.0));
++        }
++
++        FRAME_STATS.with_borrow_mut(|(started, ticks, renders, tick_ms, render_ms)| {
++            *ticks += 1;
++            *renders += u32::from(rendered);
++            *tick_ms += tick_time.as_secs_f32() * 1000.0;
++            *render_ms += render_time.as_secs_f32() * 1000.0;
++
++            let elapsed = started.elapsed().as_secs_f32();
++            if elapsed < 1.0 {
++                return;
++            }
++
++            if let Some(window) = web_sys::window() {
++                let key = JsValue::from_str("ruffleStats");
++                let stats = match js_sys::Reflect::get(&window, &key) {
++                    Ok(value) if value.is_object() => value,
++                    _ => {
++                        let object = js_sys::Object::new();
++                        let _ = js_sys::Reflect::set(&window, &key, &object);
++                        object.into()
++                    }
++                };
++
++                for (name, value) in [
++                    ("ticks", *ticks as f64 / elapsed as f64),
++                    ("renders", *renders as f64 / elapsed as f64),
++                    ("asMs", (*tick_ms / *ticks as f32) as f64),
++                    ("renderMs", (*render_ms / *ticks as f32) as f64),
++                ] {
++                    let _ = js_sys::Reflect::set(
++                        &stats,
++                        &JsValue::from_str(name),
++                        &JsValue::from_f64(value),
++                    );
++                }
++            }
++
++            tracing::debug!(
++                "кадр: {:.1} тиков/с, отрисовок {:.1}/с; ActionScript {:.1} мс, отрисовка {:.1} мс на тик",
++                *ticks as f32 / elapsed,
++                *renders as f32 / elapsed,
++                *tick_ms / *ticks as f32,
++                *render_ms / *ticks as f32,
++            );
++
++            *started = web_time::Instant::now();
++            *ticks = 0;
++            *renders = 0;
++            *tick_ms = 0.0;
++            *render_ms = 0.0;
++        });
++    }
++
+     fn tick(self, timestamp: f64) {
+         let mut dt = 0.0;
+         let mut new_dimensions = None;
+@@ -1243,12 +1308,20 @@ impl RuffleHandle {
+                 });
+             }
+ 
++            let tick_started = web_time::Instant::now();
+             core.tick(FloatDuration::from_millis(dt));
++            let tick_time = tick_started.elapsed();
+ 
+             // Render if the core signals a new frame, or if we resized.
+-            if core.needs_render() || new_dimensions.is_some() {
++            let render_started = web_time::Instant::now();
++            let rendered = if core.needs_render() || new_dimensions.is_some() {
+                 core.render();
+-            }
++                true
++            } else {
++                false
++            };
++
++            Self::report_frame_time(tick_time, render_started.elapsed(), rendered);
+         });
+     }
+ 
+-- 
+2.51.1.windows.1
+

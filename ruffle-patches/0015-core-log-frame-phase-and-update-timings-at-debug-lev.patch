@@ -1,0 +1,263 @@
+From 21cfed2d140a83c2379d8c44a2960160e8edf95b Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 11:30:40 +0300
+Subject: [PATCH 15/17] core: log frame phase and update timings at debug level
+
+---
+ core/src/frame_lifecycle.rs                   | 54 +++++++++++++++++++
+ core/src/player.rs                            | 44 +++++++++++++++
+ render/wgpu/src/context3d/current_pipeline.rs |  2 +-
+ render/wgpu/src/context3d/mod.rs              | 10 ++--
+ web/src/lib.rs                                |  2 +-
+ 5 files changed, 105 insertions(+), 7 deletions(-)
+
+diff --git a/core/src/frame_lifecycle.rs b/core/src/frame_lifecycle.rs
+index 91bdb52d..a8a1ab92 100644
+--- a/core/src/frame_lifecycle.rs
++++ b/core/src/frame_lifecycle.rs
+@@ -64,6 +64,48 @@ pub enum FramePhase {
+     Idle,
+ }
+ 
++/// Раз в секунду печатает, сколько занимает каждая фаза кадра. По ней видно, что дороже:
++/// обработчики enterFrame в коде игры, построение кадра или рассылка событий по списку отображения.
++fn report_phase_timings(
++    enter: std::time::Duration,
++    construct: std::time::Duration,
++    scripts: std::time::Duration,
++    exit: std::time::Duration,
++) {
++    thread_local! {
++        static TIMINGS: std::cell::RefCell<(web_time::Instant, u32, f32, f32, f32, f32)> =
++            std::cell::RefCell::new((web_time::Instant::now(), 0, 0.0, 0.0, 0.0, 0.0));
++    }
++
++    TIMINGS.with_borrow_mut(|(started, frames, e, c, s, x)| {
++        *frames += 1;
++        *e += enter.as_secs_f32() * 1000.0;
++        *c += construct.as_secs_f32() * 1000.0;
++        *s += scripts.as_secs_f32() * 1000.0;
++        *x += exit.as_secs_f32() * 1000.0;
++
++        let elapsed = started.elapsed().as_secs_f32();
++        if elapsed < 1.0 {
++            return;
++        }
++
++        tracing::debug!(
++            "frame phases per frame: enterFrame {:.2} ms, construct {:.2} ms, frame scripts {:.2} ms, exit {:.2} ms",
++            *e / *frames as f32,
++            *c / *frames as f32,
++            *s / *frames as f32,
++            *x / *frames as f32,
++        );
++
++        *started = web_time::Instant::now();
++        *frames = 0;
++        *e = 0.0;
++        *c = 0.0;
++        *s = 0.0;
++        *x = 0.0;
++    });
++}
++
+ /// Run one frame according to AVM2 frame order.
+ /// NOTE: The `each_orphan_movie` calls are in really odd places,
+ /// but this is needed to match Flash Player's output. There may
+@@ -77,12 +119,16 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
+         return;
+     }
+ 
++    let started = web_time::Instant::now();
++
+     *context.frame_phase = FramePhase::Enter;
+     OrphanManager::each_orphan_obj(context, |orphan, context| {
+         orphan.enter_frame(context);
+     });
+     stage.enter_frame(context);
++    let enter = started.elapsed();
+ 
++    let started = web_time::Instant::now();
+     *context.frame_phase = FramePhase::Construct;
+     OrphanManager::each_orphan_obj(context, |orphan, context| {
+         orphan.construct_frame(context);
+@@ -90,15 +136,23 @@ pub fn run_all_phases_avm2(context: &mut UpdateContext<'_>) {
+     stage.construct_frame(context);
+     broadcast_frame_constructed(context);
+ 
++    let construct = started.elapsed();
++
++    let started = web_time::Instant::now();
+     *context.frame_phase = FramePhase::FrameScripts;
+     OrphanManager::each_orphan_obj(context, |orphan, context| {
+         orphan.run_frame_scripts(context);
+     });
+     stage.run_frame_scripts(context);
+     run_frame_script_cleanup(context);
++    let scripts = started.elapsed();
+ 
++    let started = web_time::Instant::now();
+     *context.frame_phase = FramePhase::Exit;
+     broadcast_frame_exited(context);
++    let exit = started.elapsed();
++
++    report_phase_timings(enter, construct, scripts, exit);
+ 
+     // The correct time to run context3DCreated events seems to be here
+     stage.check_requested_context3ds(context);
+diff --git a/core/src/player.rs b/core/src/player.rs
+index b6951175..d0858ae9 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -2359,6 +2359,42 @@ impl Player {
+         self.debug_ui.borrow_mut()
+     }
+ 
++    /// Раз в секунду печатает, на что уходит время внутри обновления состояния: код игры,
++    /// проверка мыши по списку отображения и сборка мусора. Нужно, чтобы отличать медленный
++    /// ActionScript от накладных расходов самого движка.
++    fn report_update_timings(scripts: Duration, mouse: Duration, gc: Duration) {
++        thread_local! {
++            static TIMINGS: std::cell::RefCell<(web_time::Instant, u32, f32, f32, f32)> =
++                std::cell::RefCell::new((web_time::Instant::now(), 0, 0.0, 0.0, 0.0));
++        }
++
++        TIMINGS.with_borrow_mut(|(started, calls, s, m, g)| {
++            *calls += 1;
++            *s += scripts.as_secs_f32() * 1000.0;
++            *m += mouse.as_secs_f32() * 1000.0;
++            *g += gc.as_secs_f32() * 1000.0;
++
++            let elapsed = started.elapsed().as_secs_f32();
++            if elapsed < 1.0 {
++                return;
++            }
++
++            tracing::debug!(
++                "player update: {:.0} calls/s, scripts {:.1} ms/s, mouse {:.1} ms/s, gc {:.1} ms/s",
++                *calls as f32 / elapsed,
++                *s / elapsed,
++                *m / elapsed,
++                *g / elapsed,
++            );
++
++            *started = web_time::Instant::now();
++            *calls = 0;
++            *s = 0.0;
++            *m = 0.0;
++            *g = 0.0;
++        });
++    }
++
+     /// Update the current state of the player.
+     ///
+     /// The given function will be called with the current stage root, current
+@@ -2371,6 +2407,7 @@ impl Player {
+     where
+         F: for<'gc> FnOnce(&mut UpdateContext<'gc>) -> R,
+     {
++        let started = web_time::Instant::now();
+         let rval = self.mutate_with_update_context(|context| {
+             let rval = func(context);
+ 
+@@ -2378,15 +2415,22 @@ impl Player {
+ 
+             rval
+         });
++        let scripts = started.elapsed();
+ 
+         // Update mouse state (check for new hovered button, etc.)
++        let started = web_time::Instant::now();
+         self.mutate_with_update_context(|context| {
+             Self::update_drag(context);
+         });
+         self.update_mouse_state(EnumSet::empty(), false, &mut false);
++        let mouse = started.elapsed();
+ 
+         // GC
++        let started = web_time::Instant::now();
+         self.gc_arena.borrow_mut().collect_debt();
++        let gc = started.elapsed();
++
++        Self::report_update_timings(scripts, mouse, gc);
+ 
+         rval
+     }
+diff --git a/render/wgpu/src/context3d/current_pipeline.rs b/render/wgpu/src/context3d/current_pipeline.rs
+index b2bbfd65..e2e9b132 100644
+--- a/render/wgpu/src/context3d/current_pipeline.rs
++++ b/render/wgpu/src/context3d/current_pipeline.rs
+@@ -288,7 +288,7 @@ impl CurrentPipeline {
+             .collect();
+ 
+         format!(
+-            "глубина {:?} (запись {}), грани {:?}, смешивание {:?}/{:?}, маска цвета {:?},              сэмплов {}, формат {:?}, текстуры {:?}",
++            "depth {:?} (write {}), cull {:?}, blend {:?}/{:?}, colour mask {:?},              samples {}, format {:?}, textures {:?}",
+             self.pass_compare_mode,
+             self.depth_mask,
+             self.culling,
+diff --git a/render/wgpu/src/context3d/mod.rs b/render/wgpu/src/context3d/mod.rs
+index f1cea3b0..28b0e423 100644
+--- a/render/wgpu/src/context3d/mod.rs
++++ b/render/wgpu/src/context3d/mod.rs
+@@ -390,7 +390,7 @@ impl WgpuContext3D {
+         ]);
+ 
+         tracing::debug!(
+-            "stage3d: {:.1} fps, за кадр: draw {:.0} ({:.1} мс), загрузка {:.1} мс, submit {:.0}; создано пайплайнов {}, bind group {}",
++            "stage3d: {:.1} fps, per frame: draws {:.0} ({:.1} ms), uploads {:.1} ms, submits {:.0}; pipelines created {}, bind groups {}",
+             self.stats.frames as f32 / elapsed,
+             self.stats.draws as f32 / self.stats.frames as f32,
+             self.stats.draw_time.as_secs_f32() * 1000.0 / self.stats.frames as f32,
+@@ -403,7 +403,7 @@ impl WgpuContext3D {
+         if self.trace_draws && !self.command_counts.is_empty() {
+             let mut counts: Vec<_> = self.command_counts.drain().collect();
+             counts.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+-            tracing::info!("команды Stage3D за секунду: {:?}", counts);
++            tracing::info!("stage3d commands per second: {:?}", counts);
+         }
+ 
+         self.trace_draws = trace_draws_requested();
+@@ -964,7 +964,7 @@ impl WgpuContext3D {
+                         )
+                     {
+                         tracing::warn!(
+-                            "Context3D.configureBackBuffer: сглаживание {} не поддерживается в WebGL, отключено",
++                            "Context3D.configureBackBuffer: {}x anti-aliasing is not supported on WebGL, disabled",
+                             sample_count
+                         );
+                         sample_count = 1;
+@@ -1428,7 +1428,7 @@ impl WgpuContext3D {
+                 // рисуется сцена и почему модель может быть невидимой.
+                 if self.trace_draws && self.stats.draws < 12 {
+                     tracing::info!(
+-                        "draw #{}: треугольников {}, {}, ножницы {:?}",
++                        "draw #{}: triangles {}, {}, scissor {:?}",
+                         self.stats.draws,
+                         num_triangles,
+                         self.current_pipeline.debug_state(),
+@@ -1551,7 +1551,7 @@ impl WgpuContext3D {
+                             }
+                         }
+                         tracing::info!(
+-                            "заливка текстуры {:?} {}x{} (слой {}): средний цвет {:?}",
++                            "texture upload {:?} {}x{} (layer {}): average colour {:?}",
+                             Rc::as_ptr(&dest) as *const () as usize,
+                             source_width,
+                             source_height,
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 7a73c252..35a7ee4d 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1169,7 +1169,7 @@ impl RuffleHandle {
+             }
+ 
+             tracing::debug!(
+-                "кадр: {:.1} тиков/с, отрисовок {:.1}/с; ActionScript {:.1} мс, отрисовка {:.1} мс на тик",
++                "frame: {:.1} ticks/s, {:.1} renders/s; ActionScript {:.1} ms, render {:.1} ms per tick",
+                 *ticks as f32 / elapsed,
+                 *renders as f32 / elapsed,
+                 *tick_ms / *ticks as f32,
+-- 
+2.51.1.windows.1
+

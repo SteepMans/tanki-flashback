@@ -1,0 +1,111 @@
+From c3dc3d543af73d096c3c108a656cfd10cd2b7587 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 04:50:03 +0300
+Subject: [PATCH 07/17] core: render the Stage3D layer through erase holes
+
+---
+ core/src/display_object.rs | 80 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 73 insertions(+), 7 deletions(-)
+
+diff --git a/core/src/display_object.rs b/core/src/display_object.rs
+index baa70b8e..c3c701d2 100644
+--- a/core/src/display_object.rs
++++ b/core/src/display_object.rs
+@@ -1150,14 +1150,14 @@ pub fn render_base<'gc>(
+             } else {
+                 RenderBlendMode::Builtin(blend_mode.try_into().unwrap())
+             };
+-            // Erase punches a hole through the layer it sits in — that is how Flash content cuts a
+-            // window in the UI for the Stage3D layer underneath (ProTanki does this for the garage
+-            // tank preview). Ruffle's layer tracking does not reach the erase through the
+-            // intermediate containers this content uses, so the rect was composited as an opaque
+-            // fill and covered the 3D view. Dropping it leaves the hole, which is what the content
+-            // expects; erasing already-drawn pixels of the same layer is not supported either way.
+             if matches!(blend_mode, ExtendedBlendMode::Erase) {
+-                // nothing to draw: the hole is the effect
++                // Стирание вырезает окно в интерфейсе — так контент показывает слой Stage3D,
++                // который лежит под списком отображения (в ProTanki так сделано превью танка в
++                // гараже). Стереть уже нарисованные пиксели кадра Ruffle не может, поэтому вместо
++                // этого рисуем слой Stage3D заново, ограничив его формой стирающего объекта.
++                // Если под окном никакого слоя нет, стирание просто пропускается: раньше оно
++                // складывалось как непрозрачная заливка и закрывало картинку.
++                show_stage3d_through_hole(this, context);
+             } else {
+                 context.commands.blend(sub_commands, render_blend_mode);
+             }
+@@ -1169,6 +1169,72 @@ pub fn render_base<'gc>(
+     }
+ }
+ 
++/// Показывает слой Stage3D в «окне», вырезанном стирающим объектом.
++///
++/// Flash рисует слои Stage3D под списком отображения, поэтому непрозрачная панель интерфейса
++/// закрывает их. Контент вырезает в панели окно объектом с режимом наложения «стирание»; Ruffle
++/// стирать уже нарисованное не умеет, зато может нарисовать слой ещё раз поверх — по маске окна
++/// результат тот же.
++fn show_stage3d_through_hole<'gc>(this: DisplayObject<'gc>, context: &mut RenderContext<'_, 'gc>) {
++    let hole = this.world_bounds(BoundsMode::Engine);
++    if hole.is_valid() {
++        // Слой рисуется в координатах вьюпорта, а не в координатах текущего объекта.
++        let viewport = context.stage.view_matrix();
++        let stage3ds: Vec<_> = context.stage.stage3ds().iter().copied().collect();
++
++        for stage3d in stage3ds {
++            if !stage3d.visible() {
++                continue;
++            }
++
++            let Some(context3d) = stage3d.context3d() else {
++                continue;
++            };
++
++            let layer_image = context3d.with_context_3d(|ctx| {
++                ctx.should_render()
++                    .then(|| ctx.back_buffer_size().map(|size| (ctx.bitmap_handle(), size)))
++                    .flatten()
++            });
++
++            let Some((handle, size)) = layer_image else {
++                continue;
++            };
++
++            let layer = Rectangle {
++                x_min: Twips::from_pixels(stage3d.x()),
++                y_min: Twips::from_pixels(stage3d.y()),
++                x_max: Twips::from_pixels(stage3d.x() + size.0 as f64),
++                y_max: Twips::from_pixels(stage3d.y() + size.1 as f64),
++            };
++
++            // Окно должно приходиться на этот слой, иначе это стирание не про Stage3D.
++            if !hole.intersects(&layer) {
++                continue;
++            }
++
++            let transform = Transform {
++                matrix: viewport
++                    * Matrix::translate(
++                        Twips::from_pixels(stage3d.x()),
++                        Twips::from_pixels(stage3d.y()),
++                    ),
++                ..Default::default()
++            };
++
++            let mask = Matrix::create_box_from_rectangle(&(viewport * hole));
++
++            context.commands.push_mask();
++            context.commands.draw_rect(Color::WHITE, mask);
++            context.commands.activate_mask();
++            context.commands.render_stage3d(handle, transform);
++            context.commands.deactivate_mask();
++            context.commands.draw_rect(Color::WHITE, mask);
++            context.commands.pop_mask();
++        }
++    }
++}
++
+ /// This applies the **standard** method of `mask` and `scrollRect`.
+ ///
+ /// It uses the stencil buffer so that any pixel drawn in the mask will allow the inner contents to show.
+-- 
+2.51.1.windows.1
+

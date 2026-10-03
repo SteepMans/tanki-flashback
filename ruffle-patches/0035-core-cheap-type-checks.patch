@@ -1,0 +1,134 @@
+From 98b387c7c62618b23467088ba5fb814aa9907dfd Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Mon, 17 Aug 2026 22:57:53 +0300
+Subject: [PATCH] core: stop walking the class chain on every call and every
+ interface check
+
+---
+ core/src/avm2/activation.rs   | 17 +++++++++++++++--
+ core/src/avm2/class.rs        | 31 ++++++++++++++++++++++---------
+ core/src/avm2/method_stats.rs | 14 ++++++++++++++
+ web/src/lib.rs                |  4 ++++
+ 4 files changed, 55 insertions(+), 11 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 936a802b..56d087ad 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -349,9 +349,22 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         let num_locals = body.num_locals as usize;
+         let has_rest_or_args = method.is_variadic();
+ 
+-        if let Some(bound_class) = method.bound_class() {
+-            assert!(this.is_of_type(bound_class));
++        // Проверка «получатель того же класса, что и метод» — это проверка самого интерпретатора,
++        // а не игры: сюда нельзя попасть иначе как через таблицу методов этого же класса. Стоит
++        // она обхода цепочки наследования, и платить за неё в каждом вызове (у клиента их около
++        // миллиона в секунду) не за что. В отладочной сборке она остаётся.
++        if !crate::avm2::method_stats::fast_type_checks() {
++            assert!(
++                method
++                    .bound_class()
++                    .is_none_or(|bound_class| this.is_of_type(bound_class))
++            );
+         }
++        debug_assert!(
++            method
++                .bound_class()
++                .is_none_or(|bound_class| this.is_of_type(bound_class))
++        );
+ 
+         self.num_locals = num_locals;
+         self.outer = outer;
+diff --git a/core/src/avm2/class.rs b/core/src/avm2/class.rs
+index 27daaf6b..9a4054ef 100644
+--- a/core/src/avm2/class.rs
++++ b/core/src/avm2/class.rs
+@@ -972,7 +972,23 @@ impl<'gc> Class<'gc> {
+     ///
+     /// To test if a class *instance* is of a given type, see `Object::is_of_type`.
+     pub fn has_class_in_chain(self, test_class: Class<'gc>) -> bool {
+-        let mut my_class = Some(self);
++        if self == test_class {
++            return true;
++        }
++
++        // Список интерфейсов класс держит уже развёрнутым, вместе с интерфейсами предков. Поэтому
++        // для проверки на интерфейс он и есть ответ, а обход цепочки наследования до него —
++        // потерянное время: надклассом интерфейс не бывает. Проверка типа параметра делается на
++        // каждом вызове метода, и у горячих методов игры интерфейсы стоят как раз в параметрах.
++        let interface_test = test_class.is_interface();
++        if interface_test && crate::avm2::method_stats::fast_type_checks() {
++            return self
++                .all_interfaces()
++                .iter()
++                .any(|interface| *interface == test_class);
++        }
++
++        let mut my_class = self.super_class();
+ 
+         while let Some(class) = my_class {
+             if class == test_class {
+@@ -982,14 +998,11 @@ impl<'gc> Class<'gc> {
+             my_class = class.super_class()
+         }
+ 
+-        // A `Class` stores all of the interfaces it implements, including
+-        // those from superinterfaces and superclasses (recursively).
+-        if test_class.is_interface() {
+-            for interface in self.all_interfaces() {
+-                if *interface == test_class {
+-                    return true;
+-                }
+-            }
++        if interface_test {
++            return self
++                .all_interfaces()
++                .iter()
++                .any(|interface| *interface == test_class);
+         }
+ 
+         false
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 250c7bef..91b0389b 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -77,6 +77,20 @@ pub fn inline_caches_enabled() -> bool {
+     INLINE_CACHES_ENABLED.load(Ordering::Relaxed)
+ }
+ 
++/// Дешёвые проверки типов: сверка получателя вызова убрана из релиза, а проверка на интерфейс
++/// не обходит цепочку наследования (см. `Class::has_class_in_chain`). Отключается со страницы
++/// `window.ruffleNoFastTypeChecks = true` — чтобы сравнить «до/после» на одной сборке.
++static FAST_TYPE_CHECKS: AtomicBool = AtomicBool::new(true);
++
++pub fn set_fast_type_checks(value: bool) {
++    FAST_TYPE_CHECKS.store(value, Ordering::Relaxed);
++}
++
++#[inline(always)]
++pub fn fast_type_checks() -> bool {
++    FAST_TYPE_CHECKS.load(Ordering::Relaxed)
++}
++
+ pub fn set_native_paths_enabled(value: bool) {
+     NATIVE_PATHS_ENABLED.store(value, Ordering::Relaxed);
+ }
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index 2e7b7ca6..3d73e036 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1292,6 +1292,10 @@ impl RuffleHandle {
+                 &instance.window,
+                 "ruffleNoInlineCaches",
+             ));
++            ruffle_core::method_stats::set_fast_type_checks(!flag_requested(
++                &instance.window,
++                "ruffleNoFastTypeChecks",
++            ));
+             ruffle_core::method_stats::set_validate_native_paths(flag_requested(
+                 &instance.window,
+                 "ruffleValidateNative",
+-- 
+2.51.1.windows.1
+

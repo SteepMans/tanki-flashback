@@ -1,0 +1,421 @@
+From d4fceafeb1f7c05d98efcca49968cc003903e8ea Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Sun, 16 Aug 2026 18:24:23 +0300
+Subject: [PATCH] core: fuse getlocal+getslot and add number fast paths to
+ multiply/divide
+
+---
+ core/src/avm2/activation.rs           | 84 ++++++++++++++++++++++++++-
+ core/src/avm2/method_stats.rs         | 60 ++++++++++++++++++-
+ core/src/avm2/op.rs                   | 18 ++++++
+ core/src/avm2/optimizer/peephole.rs   | 40 +++++++++++++
+ core/src/avm2/optimizer/type_aware.rs |  7 +++
+ core/src/player.rs                    | 12 ++++
+ web/src/lib.rs                        |  1 +
+ 7 files changed, 216 insertions(+), 6 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 5ebc6a23..6d285612 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -670,13 +670,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         // Читаем флаг один раз на метод: ветка по локальной переменной предсказуема и почти
+         // бесплатна, а атомарное чтение на каждую инструкцию заметно бы стоило.
+         let trace_ops = crate::avm2::method_stats::ops_enabled();
++        let mut prev_kind = crate::avm2::method_stats::OP_KINDS.len() - 1;
+ 
+         loop {
+             let op = &opcodes[ip];
+             ip += 1;
+             *executed_ops += 1;
+             if trace_ops {
+-                crate::avm2::method_stats::record_op(crate::avm2::method_stats::op_kind(op));
++                let kind = crate::avm2::method_stats::op_kind(op);
++                crate::avm2::method_stats::record_op(kind, prev_kind);
++                prev_kind = kind;
+             }
+             avm_debug!(self.avm2(), "Opcode: {op:?}");
+ 
+@@ -693,6 +696,15 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+                 Op::Pop => self.op_pop(),
+                 Op::Dup => self.op_dup(),
+                 Op::GetLocal { index } => self.op_get_local(*index),
++                Op::GetLocal2 { first, second } => self.op_get_local2(*first, *second),
++                Op::GetLocalSlot {
++                    local_index,
++                    slot_index,
++                } => self.op_get_local_slot(*local_index, *slot_index),
++                Op::MultiplyLocalSlot {
++                    local_index,
++                    slot_index,
++                } => self.op_multiply_local_slot(*local_index, *slot_index),
+                 Op::SetLocal { index } => self.op_set_local(*index),
+                 Op::StoreLocal { index } => self.op_store_local(*index),
+                 Op::Kill { index } => self.op_kill(*index),
+@@ -1046,6 +1058,57 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         Ok(())
+     }
+ 
++    /// `getlocal`+`getlocal` одной инструкцией.
++    fn op_get_local2(&mut self, first: u32, second: u32) -> Result<(), Error<'gc>> {
++        let first = self.local_register(first);
++        let second = self.local_register(second);
++        self.push_stack(first);
++        self.push_stack(second);
++
++        Ok(())
++    }
++
++    /// `getlocal`+`getslot` одной инструкцией: значение не проходит через стек лишний раз.
++    fn op_get_local_slot(&mut self, register_index: u32, index: usize) -> Result<(), Error<'gc>> {
++        let object = self
++            .local_register(register_index)
++            .null_check(self, None)?
++            .as_object()
++            .expect("Cannot get_slot on primitive");
++
++        self.push_stack(object.get_slot(index));
++
++        Ok(())
++    }
++
++    /// `getlocal`+`getslot`+`multiply` одной инструкцией: поле не проходит через стек.
++    fn op_multiply_local_slot(&mut self, register_index: u32, index: usize) -> Result<(), Error<'gc>> {
++        let object = self
++            .local_register(register_index)
++            .null_check(self, None)?
++            .as_object()
++            .expect("Cannot get_slot on primitive");
++        let value2 = object.get_slot(index);
++        let value1 = self.pop_stack();
++
++        if let (Value::Number(n1), Value::Number(n2)) = (value1, value2) {
++            self.push_stack(n1 * n2);
++            return Ok(());
++        }
++        if let (Value::Integer(n1), Value::Integer(n2)) = (value1, value2)
++            && let Some(result) = n1.checked_mul(n2)
++        {
++            self.push_stack(result);
++            return Ok(());
++        }
++
++        let value2 = value2.coerce_to_number(self)?;
++        let value1 = value1.coerce_to_number(self)?;
++        self.push_stack(value1 * value2);
++
++        Ok(())
++    }
++
+     fn op_set_local(&mut self, register_index: u32) -> Result<(), Error<'gc>> {
+         let value = self.pop_stack();
+ 
+@@ -2185,8 +2248,17 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+     }
+ 
+     fn op_divide(&mut self) -> Result<(), Error<'gc>> {
+-        let value2 = self.pop_stack().coerce_to_number(self)?;
+-        let value1 = self.pop_stack().coerce_to_number(self)?;
++        let raw2 = self.pop_stack();
++        let raw1 = self.pop_stack();
++
++        // Тот же быстрый путь, что и в умножении.
++        if let (Value::Number(n1), Value::Number(n2)) = (raw1, raw2) {
++            self.push_stack(Value::from(n1 / n2).try_promote_number());
++            return Ok(());
++        }
++
++        let value2 = raw2.coerce_to_number(self)?;
++        let value1 = raw1.coerce_to_number(self)?;
+         let result = Value::from(value1 / value2);
+ 
+         self.push_stack(result.try_promote_number());
+@@ -2259,6 +2331,12 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             self.push_stack(result);
+             return Ok(());
+         }
++        // Два дробных числа — самый частый случай в математике движка: считаем сразу, минуя
++        // общее приведение (оно принимает &mut self и не встраивается).
++        if let (Value::Number(n1), Value::Number(n2)) = (value1, value2) {
++            self.push_stack(n1 * n2);
++            return Ok(());
++        }
+         let value2 = value2.coerce_to_number(self)?;
+         let value1 = value1.coerce_to_number(self)?;
+         self.push_stack(value1 * value2);
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index 1d32a404..32b7ecc5 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -18,13 +18,23 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
+ /// Гистограмма по видам инструкций включается ОТДЕЛЬНО (window.ruffleTraceOps): счёт на каждой
+ /// инструкции сам по себе заметно замедляет игру и смазал бы замер горячих методов.
+ static OPS_ENABLED: AtomicBool = AtomicBool::new(false);
++/// Склейка инструкций (peephole). Отключается со страницы `window.ruffleNoFusion = true`, чтобы
++/// можно было сравнить «до/после» на ОДНОЙ сборке — иначе разброс между сборками съедает разницу.
++static FUSION_ENABLED: AtomicBool = AtomicBool::new(true);
+ 
+ thread_local! {
++    /// Всего выполнено инструкций и вызовов за период. По ним считается пропускная способность
++    /// интерпретатора (инструкций на миллисекунду) — метрика, не зависящая от сцены.
++    static TOTAL: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+     /// Имя метода -> (инструкций, вызовов).
+     static TOTALS: RefCell<HashMap<String, (u64, u64)>> = RefCell::new(HashMap::new());
+     /// Счётчики по видам инструкций. Массив ячеек, а не словарь: считаем на КАЖДОЙ инструкции,
+     /// и словарь со строковым ключом обходился в разы дороже самого интерпретатора.
+     static OPS: [Cell<u64>; OP_KINDS.len()] = const { [const { Cell::new(0) }; OP_KINDS.len()] };
++    /// Пары подряд идущих инструкций: по ним видно, какие связки стоит склеивать в одну
++    /// (каждая склейка убирает диспетчеризацию и лишний проход через стек).
++    static PAIRS: [Cell<u64>; OP_KINDS.len() * OP_KINDS.len()] =
++        const { [const { Cell::new(0) }; OP_KINDS.len() * OP_KINDS.len()] };
+ }
+ 
+ pub fn set_enabled(value: bool) {
+@@ -38,6 +48,14 @@ pub fn enabled() -> bool {
+     ENABLED.load(Ordering::Relaxed)
+ }
+ 
++pub fn set_fusion_enabled(value: bool) {
++    FUSION_ENABLED.store(value, Ordering::Relaxed);
++}
++
++pub fn fusion_enabled() -> bool {
++    FUSION_ENABLED.load(Ordering::Relaxed)
++}
++
+ pub fn set_ops_enabled(value: bool) {
+     OPS_ENABLED.store(value, Ordering::Relaxed);
+ }
+@@ -60,6 +78,10 @@ fn label(method: Method<'_>) -> String {
+ }
+ 
+ pub fn record(method: Method<'_>, ops: u64) {
++    TOTAL.with(|total| {
++        let (all_ops, all_calls) = total.get();
++        total.set((all_ops + ops, all_calls + 1));
++    });
+     TOTALS.with(|totals| {
+         let mut totals = totals.borrow_mut();
+         let entry = totals.entry(label(method)).or_insert((0, 0));
+@@ -70,16 +92,21 @@ pub fn record(method: Method<'_>, ops: u64) {
+ 
+ /// Виды инструкций для гистограммы. Отдельно выделены обращения к полям: у Ruffle их несколько
+ /// видов, и по соотношению видно, справился ли анализатор — Slot дешёвый, Slow ищет имя в таблице.
+-pub const OP_KINDS: [&str; 16] = [
++pub const OP_KINDS: [&str; 19] = [
+     "GetSlot", "SetSlot", "GetPropertyStatic", "GetPropertyFast", "GetPropertySlow",
+     "SetProperty", "CallMethod", "CallNative", "CallProperty", "Construct",
+     "Local", "Arithmetic/Compare", "Branch", "Coerce", "Stack/Scope", "прочее",
++    "GetLocalSlot(склейка)", "GetLocal2(склейка)",
++    "MultiplyLocalSlot(склейка)",
+ ];
+ 
+ /// Номер вида инструкции в `OP_KINDS`.
+ pub fn op_kind(op: &crate::avm2::op::Op<'_>) -> usize {
+     use crate::avm2::op::Op;
+     match op {
++        Op::GetLocalSlot { .. } => 16,
++        Op::MultiplyLocalSlot { .. } => 18,
++        Op::GetLocal2 { .. } => 17,
+         Op::GetSlot { .. } => 0,
+         Op::SetSlot { .. } | Op::SetSlotNoCoerce { .. } | Op::SetSlotCoerceI { .. } => 1,
+         Op::GetPropertyStatic { .. } => 2,
+@@ -113,12 +140,34 @@ pub fn op_kind(op: &crate::avm2::op::Op<'_>) -> usize {
+     }
+ }
+ 
+-/// Учитывает выполненную инструкцию. Вызывается только при включённом счётчике.
+-pub fn record_op(kind: usize) {
++/// Учитывает выполненную инструкцию и пару «предыдущая-текущая».
++pub fn record_op(kind: usize, prev: usize) {
+     OPS.with(|ops| {
+         let cell = &ops[kind];
+         cell.set(cell.get() + 1);
+     });
++    PAIRS.with(|pairs| {
++        let cell = &pairs[prev * OP_KINDS.len() + kind];
++        cell.set(cell.get() + 1);
++    });
++}
++
++/// Верхушка по парам инструкций; счётчики обнуляются.
++pub fn take_pairs(limit: usize) -> Vec<(String, u64)> {
++    PAIRS.with(|pairs| {
++        let mut rows: Vec<_> = pairs
++            .iter()
++            .enumerate()
++            .map(|(i, cell)| (i, cell.replace(0)))
++            .filter(|(_, count)| *count > 0)
++            .map(|(i, count)| {
++                (format!("{} -> {}", OP_KINDS[i / OP_KINDS.len()], OP_KINDS[i % OP_KINDS.len()]), count)
++            })
++            .collect();
++        rows.sort_by(|a, b| b.1.cmp(&a.1));
++        rows.truncate(limit);
++        rows
++    })
+ }
+ 
+ /// Гистограмма по видам инструкций; счётчики обнуляются.
+@@ -135,6 +184,11 @@ pub fn take_ops() -> Vec<(&'static str, u64)> {
+     })
+ }
+ 
++/// Всего инструкций и вызовов за период; счётчики обнуляются.
++pub fn take_total() -> (u64, u64) {
++    TOTAL.with(|total| total.replace((0, 0)))
++}
++
+ /// Верхушка списка по числу инструкций. Счётчики обнуляются, чтобы каждая выдача была за период.
+ pub fn take_top(limit: usize) -> Vec<(String, u64, u64)> {
+     TOTALS.with(|totals| {
+diff --git a/core/src/avm2/op.rs b/core/src/avm2/op.rs
+index c8c5f6cc..78048bf6 100644
+--- a/core/src/avm2/op.rs
++++ b/core/src/avm2/op.rs
+@@ -150,6 +150,24 @@ pub enum Op<'gc> {
+     GetLocal {
+         index: u32,
+     },
++    /// Склейка `getlocal`+`getlocal`: две самые частые инструкции подряд. Одна диспетчеризация
++    /// вместо двух (см. peephole).
++    GetLocal2 {
++        first: u32,
++        second: u32,
++    },
++    /// Склейка `getlocal`+`getslot` — чтение поля объекта, лежащего в локальной переменной.
++    /// В коде физики клиента это каждая пятая выполненная инструкция.
++    GetLocalSlot {
++        local_index: u32,
++        slot_index: usize,
++    },
++    /// Склейка `getlocal`+`getslot`+`multiply`: умножение на поле объекта из локальной
++    /// переменной. Значение поля вообще не попадает на стек.
++    MultiplyLocalSlot {
++        local_index: u32,
++        slot_index: usize,
++    },
+     GetOuterScope {
+         index: usize,
+     },
+diff --git a/core/src/avm2/optimizer/peephole.rs b/core/src/avm2/optimizer/peephole.rs
+index ca7b7bc0..957cdb1d 100644
+--- a/core/src/avm2/optimizer/peephole.rs
++++ b/core/src/avm2/optimizer/peephole.rs
+@@ -57,6 +57,7 @@ pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<
+     }
+ 
+     // Now actually run the main peephole optimizer.
++    let fusion_enabled = crate::avm2::method_stats::fusion_enabled();
+     let mut last_op: Option<&'a Cell<Op<'_>>> = None;
+ 
+     for (i, current_op) in ops.iter().enumerate() {
+@@ -82,6 +83,45 @@ pub fn postprocess_peephole<'a>(ops: &'a [Cell<Op<'_>>], jump_targets: &HashSet<
+                     // Remove CoerceB before IfTrue, IfFalse, and Not
+                     last_op.set(Op::Nop);
+                 }
++                (Op::GetLocal2 { first, second }, Op::GetSlot { index: slot_index })
++                    if fusion_enabled =>
++                {
++                    // `getlocal a; getlocal b; getslot i`: выгоднее склеить второй getlocal со
++                    // слотом — тогда значение не проходит через стек лишний раз.
++                    last_op.set(Op::GetLocal { index: first });
++                    current_op.set(Op::GetLocalSlot {
++                        local_index: second,
++                        slot_index,
++                    });
++                }
++                (
++                    Op::GetLocalSlot {
++                        local_index,
++                        slot_index,
++                    },
++                    Op::Multiply,
++                ) if fusion_enabled => {
++                    // `a.x * b.x`: второй множитель читается прямо из объекта.
++                    last_op.set(Op::Nop);
++                    current_op.set(Op::MultiplyLocalSlot {
++                        local_index,
++                        slot_index,
++                    });
++                }
++                (Op::GetLocal { index }, Op::GetSlot { index: slot_index }) if fusion_enabled => {
++                    // Чтение поля объекта из локальной переменной — самая частая пара инструкций
++                    // в коде физики: склеиваем в одну.
++                    last_op.set(Op::Nop);
++                    current_op.set(Op::GetLocalSlot {
++                        local_index: index,
++                        slot_index,
++                    });
++                }
++                (Op::GetLocal { index: first }, Op::GetLocal { index: second }) if fusion_enabled => {
++                    // Вторая по частоте пара.
++                    last_op.set(Op::Nop);
++                    current_op.set(Op::GetLocal2 { first, second });
++                }
+                 (Op::Dup, Op::SetLocal { index }) => {
+                     // Dup+SetLocal becomes Nop+StoreLocal
+                     last_op.set(Op::Nop);
+diff --git a/core/src/avm2/optimizer/type_aware.rs b/core/src/avm2/optimizer/type_aware.rs
+index 3a07c440..d1b9318d 100644
+--- a/core/src/avm2/optimizer/type_aware.rs
++++ b/core/src/avm2/optimizer/type_aware.rs
+@@ -832,6 +832,13 @@ fn abstract_interpret_ops<'gc>(
+         }
+ 
+         match op.get() {
++            // Склейки инструкций рождаются в peephole ПОСЛЕ этого прохода, поэтому здесь их
++            // быть не может — ветка нужна только для полноты разбора.
++            Op::GetLocal2 { .. }
++            | Op::GetLocalSlot { .. }
++            | Op::MultiplyLocalSlot { .. } => {
++                unreachable!("fused ops are created after the type-aware pass")
++            }
+             Op::CoerceA => {
+                 // This does actually inhibit optimizations in FP
+                 stack.pop(activation)?;
+diff --git a/core/src/player.rs b/core/src/player.rs
+index a0965412..c25706cf 100644
+--- a/core/src/player.rs
++++ b/core/src/player.rs
+@@ -2390,6 +2390,13 @@ impl Player {
+             // window.ruffleTraceMethods = true — раз в секунду печатаем, какие методы игры
+             // выполнили больше всего инструкций. Иначе на что уходит кадр, видно только целиком.
+             if crate::avm2::method_stats::enabled() {
++                let (total_ops, total_calls) = crate::avm2::method_stats::take_total();
++                tracing::info!(
++                    "AVM2 throughput: {:.0} ops/s, {:.0} calls/s, {:.0} ops per ms of script time",
++                    total_ops as f32 / elapsed,
++                    total_calls as f32 / elapsed,
++                    if *s > 0.0 { total_ops as f32 / *s } else { 0.0 },
++                );
+                 let rows = crate::avm2::method_stats::take_top(15);
+                 let total: u64 = rows.iter().map(|(_, ops, _)| ops).sum();
+                 tracing::info!("hot ActionScript methods, {total} ops/s in top {}:", rows.len());
+@@ -2407,6 +2414,11 @@ impl Player {
+                     tracing::info!("  {:>5.1}%  {:>9}/s  {name}", 100.0 * count as f32 / all as f32,
+                                    (count as f32 / elapsed) as u64);
+                 }
++                tracing::info!("op pairs:");
++                for (name, count) in crate::avm2::method_stats::take_pairs(12) {
++                    tracing::info!("  {:>5.1}%  {:>9}/s  {name}", 100.0 * count as f32 / all as f32,
++                                   (count as f32 / elapsed) as u64);
++                }
+             }
+ 
+             *started = web_time::Instant::now();
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index bd3d5eca..d44e3cde 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1198,6 +1198,7 @@ impl RuffleHandle {
+             // но стоит производительности, поэтому включается из страницы: window.ruffleRenderScale.
+             ruffle_core::method_stats::set_enabled(trace_methods_requested(&instance.window));
+             ruffle_core::method_stats::set_ops_enabled(flag_requested(&instance.window, "ruffleTraceOps"));
++            ruffle_core::method_stats::set_fusion_enabled(!flag_requested(&instance.window, "ruffleNoFusion"));
+             let device_pixel_ratio =
+                 instance.window.device_pixel_ratio() * render_scale(&instance.window); // Changes via user zooming.
+             if instance.canvas_width != canvas_width
+-- 
+2.51.1.windows.1
+

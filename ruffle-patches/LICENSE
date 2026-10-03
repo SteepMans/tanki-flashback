@@ -1,0 +1,14 @@
+The patches in this directory are changes to Ruffle (https://ruffle.rs) and are
+offered under the same terms as Ruffle itself:
+
+    MIT OR Apache-2.0
+
+at your option. Full texts:
+
+    https://github.com/ruffle-rs/ruffle/blob/master/LICENSE.md
+
+They are deliberately NOT under the project's PolyForm Noncommercial license (see
+../LICENSE): a patch is a derivative work of Ruffle, and a noncommercial license
+would make it impossible to offer these changes upstream.
+
+Copyright 2026 Konstantin (https://github.com/SteepMans)

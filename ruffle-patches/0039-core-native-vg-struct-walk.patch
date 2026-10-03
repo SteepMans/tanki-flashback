@@ -1,0 +1,549 @@
+From f80b6776645cf2f085a6747e57e25f534639a640 Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 00:40:24 +0300
+Subject: [PATCH] core: walk the transparent geometry struct natively
+
+---
+ core/src/avm2/activation.rs   |   1 +
+ core/src/avm2/fast_paths.rs   | 408 +++++++++++++++++++++++++++++++++-
+ core/src/avm2/method_stats.rs |  17 ++
+ web/src/lib.rs                |   8 +
+ 4 files changed, 433 insertions(+), 1 deletion(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 56d087ad..11720bfc 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -723,6 +723,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+                 "native mismatch: {native:?}, поле {at}: нативно {mine}, байткодом {theirs}"
+             );
+         }
++        crate::avm2::method_stats::record_validated(&format!("{native:?}"));
+         if !crate::avm2::fast_paths::values_match(result, *interpreted) {
+             tracing::warn!("native mismatch: {native:?}, нативно {result:?}, байткодом {interpreted:?}");
+         }
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 94ef5f08..28534db8 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -60,6 +60,12 @@ pub enum NativeMethod {
+     EllipsoidCollide,
+     /// Загрузка констант шейдера через теневой набор движка.
+     SetProgramConstants,
++    /// Обход структуры граней: перевести вершины матрицей.
++    VgTransform,
++    /// Обход структуры граней: перевести матрицей и расширить габаритный ящик.
++    VgTransformBound,
++    /// Обход структуры граней: расширить габаритный ящик по собственным координатам вершин.
++    VgBound,
+ }
+ 
+ impl NativeMethod {
+@@ -73,6 +79,9 @@ impl NativeMethod {
+             ("BoxRectCollider", "getOverlapOnAxis") => Some(Self::BoxRectOverlapOnAxis),
+             ("EllipsoidCollider", "ecfa5c3") => Some(Self::EllipsoidCollide),
+             ("Device", "setProgramConstantsFromVector") => Some(Self::SetProgramConstants),
++            ("VG", "transformStruct") => Some(Self::VgTransform),
++            ("VG", "b6deb45e") => Some(Self::VgTransformBound),
++            ("VG", "f5407f49") => Some(Self::VgBound),
+             _ => None,
+         }
+     }
+@@ -1086,6 +1095,373 @@ fn ellipsoid_collide<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<
+     Some(Value::Bool(l7 < 1.0))
+ }
+ 
++/// Номера слотов для обхода структуры граней `VG`.
++#[derive(Clone, Copy)]
++struct VgSlots {
++    /// boundMinX..boundMaxZ на самой `VG`.
++    bound: [usize; 6],
++    /// wrapper, processNext, processNegative, processPositive у грани.
++    face_wrapper: usize,
++    face_next: usize,
++    face_negative: usize,
++    face_positive: usize,
++    /// vertex, next у звена.
++    wrapper_vertex: usize,
++    wrapper_next: usize,
++    /// cameraX/Y/Z, x/y/z и transformId у вершины.
++    vertex_camera: [usize; 3],
++    vertex_local: [usize; 3],
++    vertex_transform_id: usize,
++    /// Таблицы методов, на которых слоты разобраны.
++    face_vtable: u32,
++    wrapper_vtable: u32,
++    vertex_vtable: u32,
++}
++
++thread_local! {
++    static VG_SLOTS: RefCell<Option<(u32, VgSlots)>> = const { RefCell::new(None) };
++    static VG_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn vg_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
++    this: Object<'gc>,
++    face: Object<'gc>,
++) -> Option<VgSlots> {
++    let key = class_object.vtable().id();
++    if let Some((known, slots)) = VG_SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if VG_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    match resolve_vg_slots(activation, this, face) {
++        Ok(slots) => {
++            VG_SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++            Some(slots)
++        }
++        Err(hopeless) => {
++            if hopeless {
++                VG_HOPELESS.with(|flag| flag.set(true));
++            }
++            None
++        }
++    }
++}
++
++fn resolve_vg_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    this: Object<'gc>,
++    face: Object<'gc>,
++) -> Result<VgSlots, bool> {
++    let engine = |activation: &mut Activation<'_, 'gc>, object, name| {
++        slot_of(activation, object, name, true).ok_or(true)
++    };
++
++    // Классы звена и вершины видны только по живой грани: имена полей известны, а на каком
++    // классе их искать — нет.
++    let face_wrapper = engine(activation, face, "wrapper")?;
++    let wrapper = face
++        .get_slot(face_wrapper)
++        .as_object()
++        .ok_or(("звено не заполнено", false).1)?;
++    let wrapper_vertex = engine(activation, wrapper, "vertex")?;
++    let vertex = wrapper
++        .get_slot(wrapper_vertex)
++        .as_object()
++        .ok_or(("вершина не заполнена", false).1)?;
++
++    let bound_names = [
++        "boundMinX", "boundMinY", "boundMinZ", "boundMaxX", "boundMaxY", "boundMaxZ",
++    ];
++    let mut bound = [0usize; 6];
++    for (at, name) in bound_names.iter().enumerate() {
++        bound[at] = engine(activation, this, name)?;
++    }
++
++    Ok(VgSlots {
++        bound,
++        face_wrapper,
++        face_next: engine(activation, face, "processNext")?,
++        face_negative: engine(activation, face, "processNegative")?,
++        face_positive: engine(activation, face, "processPositive")?,
++        wrapper_vertex,
++        wrapper_next: engine(activation, wrapper, "next")?,
++        vertex_camera: [
++            engine(activation, vertex, "cameraX")?,
++            engine(activation, vertex, "cameraY")?,
++            engine(activation, vertex, "cameraZ")?,
++        ],
++        vertex_local: [
++            slot_of(activation, vertex, "x", false).ok_or(true)?,
++            slot_of(activation, vertex, "y", false).ok_or(true)?,
++            slot_of(activation, vertex, "z", false).ok_or(true)?,
++        ],
++        vertex_transform_id: engine(activation, vertex, "transformId")?,
++        face_vtable: face.vtable().id(),
++        wrapper_vtable: wrapper.vtable().id(),
++        vertex_vtable: vertex.vtable().id(),
++    })
++}
++
++/// Что обход делает с каждой вершиной. Три метода `VG` отличаются только этим, остальное у них
++/// совпадает до инструкции.
++#[derive(Clone, Copy, PartialEq, Eq)]
++enum VgWalk {
++    /// `transformStruct`: перевести вершину матрицей, габариты не трогать.
++    Transform,
++    /// `b6deb45e`: перевести матрицей и раздвинуть габариты по переведённым координатам.
++    TransformAndBound,
++    /// `f5407f49`: матрицу не применять, раздвинуть габариты по собственным координатам вершины.
++    Bound,
++}
++
++/// Габариты, которые копит обход. Держатся в локальных переменных, а в поля `VG` пишутся один
++/// раз в конце: иначе на каждую вершину приходилось бы шесть чтений и до шести записей в объект.
++struct VgBounds {
++    min: [f64; 3],
++    max: [f64; 3],
++}
++
++/// Один узел дерева граней: цепочка `processNext`, у каждой грани цепочка звеньев, у каждого
++/// звена вершина. Возвращает `false`, если встретился объект неожиданного класса — тогда обход
++/// прекращается, но только до первой записи (см. `vg_struct_walk`).
++#[allow(clippy::too_many_arguments)]
++fn vg_walk_node<'gc>(
++    face: Object<'gc>,
++    slots: &VgSlots,
++    walk: VgWalk,
++    transform_id: i32,
++    matrix: &[f64; 12],
++    bounds: &mut VgBounds,
++    depth: u32,
++    mc: &Mutation<'gc>,
++) -> bool {
++    // Глубина дерева граней у живой сцены — десятки; ограничение стоит только на случай
++    // испорченной структуры, чтобы не уронить стек.
++    if depth > 512 || face.vtable().id() != slots.face_vtable {
++        return false;
++    }
++
++    let mut node = Some(face);
++    while let Some(current) = node {
++        if current.vtable().id() != slots.face_vtable {
++            return false;
++        }
++        let mut link = current.get_slot(slots.face_wrapper).as_object();
++        while let Some(wrapper) = link {
++            if wrapper.vtable().id() != slots.wrapper_vtable {
++                return false;
++            }
++            if let Some(vertex) = wrapper.get_slot(slots.wrapper_vertex).as_object() {
++                if vertex.vtable().id() != slots.vertex_vtable {
++                    return false;
++                }
++                // Вершина общая для соседних граней, поэтому её метят номером преобразования и
++                // второй раз не трогают.
++                let seen = matches!(
++                    vertex.get_slot(slots.vertex_transform_id),
++                    Value::Integer(id) if id == transform_id
++                );
++                if !seen {
++                    let coords = if walk == VgWalk::Bound {
++                        slots.vertex_local
++                    } else {
++                        slots.vertex_camera
++                    };
++                    let mut value = [0.0f64; 3];
++                    for at in 0..3 {
++                        // Поля объявлены как Number, поэтому нечисловым может оказаться только
++                        // ни разу не записанное — а его байткод при умножении тоже видит как NaN.
++                        value[at] = vertex
++                            .get_slot(coords[at])
++                            .try_as_f64()
++                            .unwrap_or(f64::NAN);
++                    }
++                    if walk != VgWalk::Bound {
++                        let (x, y, z) = (value[0], value[1], value[2]);
++                        value = [
++                            matrix[0] * x + matrix[1] * y + matrix[2] * z + matrix[3],
++                            matrix[4] * x + matrix[5] * y + matrix[6] * z + matrix[7],
++                            matrix[8] * x + matrix[9] * y + matrix[10] * z + matrix[11],
++                        ];
++                        for at in 0..3 {
++                            vertex.set_slot_no_coerce(
++                                slots.vertex_camera[at],
++                                Value::Number(value[at]),
++                                mc,
++                            );
++                        }
++                    }
++                    if walk != VgWalk::Transform {
++                        for at in 0..3 {
++                            // Сравнения повторяют байткод: там `ifnlt`/`ifngt`, то есть на NaN
++                            // габариты не двигаются.
++                            if value[at] < bounds.min[at] {
++                                bounds.min[at] = value[at];
++                            }
++                            if value[at] > bounds.max[at] {
++                                bounds.max[at] = value[at];
++                            }
++                        }
++                    }
++                    vertex.set_slot_no_coerce(
++                        slots.vertex_transform_id,
++                        Value::Integer(transform_id),
++                        mc,
++                    );
++                }
++            }
++            link = wrapper.get_slot(slots.wrapper_next).as_object();
++        }
++        node = current.get_slot(slots.face_next).as_object();
++    }
++
++    // Порядок обхода тот же, что в байткоде: сначала вся цепочка, потом отрицательное поддерево,
++    // потом положительное. На габариты порядок не влияет, но пусть совпадает буквально.
++    for child in [slots.face_negative, slots.face_positive] {
++        if let Some(child) = face.get_slot(child).as_object()
++            && !vg_walk_node(
++                child,
++                slots,
++                walk,
++                transform_id,
++                matrix,
++                bounds,
++                depth + 1,
++                mc,
++            )
++        {
++            return false;
++        }
++    }
++    true
++}
++
++/// `VG.transformStruct`, `VG.b6deb45e` и `VG.f5407f49` — три обхода структуры граней, из которых
++/// движок собирает габариты прозрачной геометрии перед её сортировкой. На стенде они вместе дают
++/// около двенадцати процентов кадра, а на машине владельца через них идёт вся ступень OOBB.
++///
++/// Тело переведено из байткода: порядок умножений и сложений сохранён, сравнения габаритов
++/// повторяют `ifnlt`/`ifngt` вместе с их поведением на NaN.
++fn vg_struct_walk<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++    walk: VgWalk,
++) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let face = activation.local_register(1).as_object()?;
++    let transform_id = match activation.local_register(2) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let mut matrix = [0.0f64; 12];
++    for (at, cell) in matrix.iter_mut().enumerate() {
++        *cell = activation.local_register(3 + at as u32).try_as_f64()?;
++    }
++
++    let slots = vg_slots(activation, declaring_class(method)?, this, face)?;
++
++    let mut bounds = VgBounds {
++        min: [0.0; 3],
++        max: [0.0; 3],
++    };
++    if walk != VgWalk::Transform {
++        for at in 0..3 {
++            bounds.min[at] = this.get_slot(slots.bound[at]).try_as_f64()?;
++            bounds.max[at] = this.get_slot(slots.bound[at + 3]).try_as_f64()?;
++        }
++    }
++
++    let mc = activation.gc();
++    if !vg_walk_node(
++        face,
++        &slots,
++        walk,
++        transform_id,
++        &matrix,
++        &mut bounds,
++        0,
++        mc,
++    ) {
++        // Обход прервался на объекте неожиданного класса. Часть вершин уже помечена номером
++        // преобразования, поэтому байткод их пропустит — но и пересчитывать там нечего: значения
++        // он получил бы те же самые. Габариты дописываем те, что успели собрать.
++        if walk != VgWalk::Transform {
++            for at in 0..3 {
++                set(this, slots.bound[at], bounds.min[at], mc);
++                set(this, slots.bound[at + 3], bounds.max[at], mc);
++            }
++        }
++        return Some(Value::Undefined);
++    }
++
++    if walk != VgWalk::Transform {
++        for at in 0..3 {
++            set(this, slots.bound[at], bounds.min[at], mc);
++            set(this, slots.bound[at + 3], bounds.max[at], mc);
++        }
++    }
++    Some(Value::Undefined)
++}
++
++/// Собирает в снимок всё, что обход структуры граней перезапишет: у каждой вершины три
++/// координаты и номер преобразования. Порядок обхода тот же, что у самого счёта, поэтому два
++/// снимка сравнимы поэлементно.
++fn vg_collect<'gc>(
++    face: Object<'gc>,
++    slots: &VgSlots,
++    fields: &mut Vec<(Place<'gc>, f64)>,
++    depth: u32,
++) {
++    if depth > 512 || face.vtable().id() != slots.face_vtable {
++        return;
++    }
++    let mut node = Some(face);
++    while let Some(current) = node {
++        if current.vtable().id() != slots.face_vtable {
++            return;
++        }
++        let mut link = current.get_slot(slots.face_wrapper).as_object();
++        while let Some(wrapper) = link {
++            if wrapper.vtable().id() != slots.wrapper_vtable {
++                return;
++            }
++            if let Some(vertex) = wrapper.get_slot(slots.wrapper_vertex).as_object()
++                && vertex.vtable().id() == slots.vertex_vtable
++            {
++                for at in 0..3 {
++                    fields.push((
++                        Place::Slot(vertex, slots.vertex_camera[at]),
++                        vertex
++                            .get_slot(slots.vertex_camera[at])
++                            .try_as_f64()
++                            .unwrap_or(f64::NAN),
++                    ));
++                }
++                fields.push((
++                    Place::IntSlot(vertex, slots.vertex_transform_id),
++                    vertex
++                        .get_slot(slots.vertex_transform_id)
++                        .try_as_f64()
++                        .unwrap_or(0.0),
++                ));
++            }
++            link = wrapper.get_slot(slots.wrapper_next).as_object();
++        }
++        node = current.get_slot(slots.face_next).as_object();
++    }
++    for child in [slots.face_negative, slots.face_positive] {
++        if let Some(child) = face.get_slot(child).as_object() {
++            vg_collect(child, slots, fields, depth + 1);
++        }
++    }
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -1320,6 +1696,8 @@ pub struct Snapshot<'gc> {
+ #[derive(Clone, Copy)]
+ enum Place<'gc> {
+     Slot(Object<'gc>, usize),
++    /// Целочисленное поле: восстанавливать его дробным нельзя, слот объявлен как `int`.
++    IntSlot(Object<'gc>, usize),
+     Element(Object<'gc>, usize),
+ }
+ 
+@@ -1329,6 +1707,9 @@ impl<'gc> Snapshot<'gc> {
+         for (place, value) in self.fields.iter() {
+             match place {
+                 Place::Slot(object, slot) => set(*object, *slot, *value, mc),
++                Place::IntSlot(object, slot) => {
++                    object.set_slot_no_coerce(*slot, Value::Integer(*value as i32), mc);
++                }
+                 Place::Element(object, at) => {
+                     if let Some(mut storage) = object.as_vector_storage_mut(mc) {
+                         storage.set_in_range(*at, Value::Number(*value));
+@@ -1376,6 +1757,23 @@ pub fn snapshot<'gc>(
+     native: NativeMethod,
+     method: Method<'gc>,
+ ) -> Option<Snapshot<'gc>> {
++    // Обходы структуры граней переписывают координаты у всех вершин дерева и габариты у самой
++    // `VG`: сверять их можно только по этим полям, метод ничего не возвращает.
++    if matches!(
++        native,
++        NativeMethod::VgTransform | NativeMethod::VgTransformBound | NativeMethod::VgBound
++    ) {
++        let this = activation.local_register(0).as_object()?;
++        let face = activation.local_register(1).as_object()?;
++        let slots = vg_slots(activation, declaring_class(method)?, this, face)?;
++        let mut fields = Vec::new();
++        for slot in slots.bound.iter() {
++            fields.push((Place::Slot(this, *slot), this.get_slot(*slot).try_as_f64()?));
++        }
++        vg_collect(face, &slots, &mut fields, 0);
++        return Some(Snapshot { fields });
++    }
++
+     // Загрузка констант не возвращает ничего, и весь её видимый итог — отрезок теневого набора.
+     if native == NativeMethod::SetProgramConstants {
+         let call = constants_call(activation)?;
+@@ -1424,7 +1822,10 @@ pub fn snapshot<'gc>(
+         | NativeMethod::BoxBoxOverlapOnAxis
+         | NativeMethod::BoxRectOverlapOnAxis
+         | NativeMethod::EllipsoidCollide
+-        | NativeMethod::SetProgramConstants => return None,
++        | NativeMethod::SetProgramConstants
++        | NativeMethod::VgTransform
++        | NativeMethod::VgTransformBound
++        | NativeMethod::VgBound => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -1485,6 +1886,11 @@ pub fn run<'gc>(
+         NativeMethod::CullingInCamera => culling_in_camera(activation, declaring_class(method)?),
+         NativeMethod::EllipsoidCollide => ellipsoid_collide(activation),
+         NativeMethod::SetProgramConstants => set_program_constants(activation),
++        NativeMethod::VgTransform => vg_struct_walk(activation, method, VgWalk::Transform),
++        NativeMethod::VgTransformBound => {
++            vg_struct_walk(activation, method, VgWalk::TransformAndBound)
++        }
++        NativeMethod::VgBound => vg_struct_walk(activation, method, VgWalk::Bound),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+diff --git a/core/src/avm2/method_stats.rs b/core/src/avm2/method_stats.rs
+index f3676729..0ba37751 100644
+--- a/core/src/avm2/method_stats.rs
++++ b/core/src/avm2/method_stats.rs
+@@ -39,6 +39,8 @@ thread_local! {
+     /// Попаданий и промахов по инлайн-кэшам за период.
+     static CACHE_HITS: Cell<u64> = const { Cell::new(0) };
+     static CACHE_MISSES: Cell<u64> = const { Cell::new(0) };
++    /// Имена нативных замен, чьи ответы режим сверки успел сравнить с байткодом.
++    static VALIDATED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+     /// Метод -> (инструкций, вызовов). Ключ — адрес метода, а не имя: счётчик обновляется на
+     /// КАЖДОМ вызове (у клиента около миллиона в секунду), и сборка имени строкой стоила там
+     /// дороже, чем всё остальное измерение вместе взятое.
+@@ -316,6 +318,21 @@ pub fn reset_frame() {
+     FRAME.with(|frame| frame.borrow_mut().clear());
+ }
+ 
++/// Какие нативные замены режим сверки действительно сравнил с байткодом. Без этого списка «ноль
++/// расхождений» ничего не значит: замена могла ни разу не сработать, и сравнивать было нечего.
++pub fn record_validated(name: &str) {
++    VALIDATED.with(|validated| {
++        let mut validated = validated.borrow_mut();
++        if !validated.iter().any(|known| known == name) {
++            validated.push(name.to_owned());
++        }
++    });
++}
++
++pub fn validated_methods() -> Vec<String> {
++    VALIDATED.with(|validated| validated.borrow().clone())
++}
++
+ /// Попадания и промахи инлайн-кэшей обращений к свойствам. Нужны, чтобы отличить «кэш работает»
+ /// от «кэш молотит вхолостую»: если по одному месту ходят объекты разных классов, ячейка на
+ /// каждом обращении перезаписывается и из ускорителя превращается в накладной расход.
+diff --git a/web/src/lib.rs b/web/src/lib.rs
+index d2d46161..7de2fd63 100644
+--- a/web/src/lib.rs
++++ b/web/src/lib.rs
+@@ -1234,6 +1234,14 @@ impl RuffleHandle {
+                         list.push(&row);
+                     }
+                     let _ = js_sys::Reflect::set(&stats, &JsValue::from_str("hotMethods"), &list);
++                    // Какие замены режим сверки реально сравнил: без этого «ноль расхождений»
++                    // может означать, что замена ни разу не сработала.
++                    let validated = js_sys::Array::new();
++                    for name in ruffle_core::method_stats::validated_methods() {
++                        validated.push(&JsValue::from_str(&name));
++                    }
++                    let _ =
++                        js_sys::Reflect::set(&stats, &JsValue::from_str("validated"), &validated);
+                     let _ = js_sys::Reflect::set(
+                         &stats,
+                         &JsValue::from_str("opsPerSecond"),
+-- 
+2.51.1.windows.1
+

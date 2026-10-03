@@ -1,0 +1,203 @@
+From 3a53d40253368af4b879a12bca3f055c4101537f Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 11:19:28 +0300
+Subject: [PATCH 2/3] core: native paint texture padding, skipped in validation
+ mode
+
+---
+ core/src/avm2/activation.rs |  13 ++--
+ core/src/avm2/fast_paths.rs | 117 +++++++++++++++++++++++++++++++++++-
+ 2 files changed, 124 insertions(+), 6 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index d936c279..fbb91ec5 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -672,13 +672,16 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+             && crate::avm2::method_stats::native_paths_enabled()
+         {
+             if crate::avm2::method_stats::validate_native_paths() {
+-                return self.run_actions_validating(method, native);
+-            }
+-            // Перевод, ещё не доказавший совпадение на живом бою, исполняется только в режиме
+-            // сверки — обычный запуск идёт байткодом.
+-            if !native.validate_only()
++                // Несравнимая замена (уничтожает вход) в режиме сверки не запускается вовсе —
++                // считает байткод, чтобы прогон со сверкой оставался эталонным.
++                if native.comparable() {
++                    return self.run_actions_validating(method, native);
++                }
++            } else if !native.validate_only()
+                 && let Some(result) = crate::avm2::fast_paths::run(self, native, method)
+             {
++                // Перевод, ещё не доказавший совпадение на живом бою, исполняется только в
++                // режиме сверки — обычный запуск идёт байткодом.
+                 return Ok(result);
+             }
+         }
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index acb910d9..80e35868 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -86,6 +86,8 @@ pub enum NativeMethod {
+     ConflictClip,
+     /// Сортировка списка граней по среднему Z вершин.
+     SortByAverageZ,
++    /// Рамка вокруг текстуры покраски с растяжкой крайних пикселей.
++    PadTexture,
+ }
+ 
+ impl NativeMethod {
+@@ -114,6 +116,9 @@ impl NativeMethod {
+             ("Wrapper", "create") | ("Wrapper", "createStatic") => Some(Self::WrapperCreate),
+             ("ConflictContainer", "e48c6fdc") => Some(Self::ConflictClip),
+             ("Camera3D", "sortByAverageZ") => Some(Self::SortByAverageZ),
++            // Утилита текстур покраски в library.swf: класс обфусцирован, имя метода — из
++            // отладочной записи метода.
++            ("521423108862310899123423632234", "padTextureDuplicated") => Some(Self::PadTexture),
+             _ => None,
+         }
+     }
+@@ -136,6 +141,13 @@ impl NativeMethod {
+     pub fn validate_only(self) -> bool {
+         matches!(self, Self::CalculateOobb)
+     }
++
++    /// Возможна ли сверка «выполнить оба прохода и сравнить». Рамка текстуры уничтожает вход
++    /// (dispose исходной картинки), и байткод после нативного прохода работал бы с пустым
++    /// объектом — такие замены в режиме сверки не запускаются вовсе.
++    pub fn comparable(self) -> bool {
++        !matches!(self, Self::PadTexture)
++    }
+ }
+ 
+ /// Номера слотов, по которым лежат нужные поля. Ищутся один раз: имена одинаковы для всех
+@@ -3767,6 +3779,107 @@ fn sort_faces_entry<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'
+     sort_by_average_z(activation, &slots, head).map(Value::Object)
+ }
+ 
++/// `padTextureDuplicated` — рамка вокруг текстуры покраски: новый холст на `pad` пикселей шире
++/// с каждой стороны, середина копируется, поля заполняются растяжкой крайних пикселей исходника.
++/// В байткоде это попиксельный цикл по ВСЕЙ картинке с вызовами getPixel32/setPixel32 — 340-385 мс
++/// заморозки на каждый спавн танка. Здесь те же операции зовутся нативно напрямую.
++///
++/// Сверка «выполнить оба» невозможна: метод уничтожает исходник (`dispose`), поэтому в режиме
++/// сверки замена не запускается вовсе (`NativeMethod::comparable`); проверка — визуальная.
++fn pad_texture<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let source_object = activation.local_register(1).as_object()?;
++    let pad = match activation.local_register(2) {
++        Value::Integer(value) => value,
++        _ => return None,
++    };
++    let source = source_object.as_bitmap_data()?;
++
++    let source_width = source.width() as i32;
++    let source_height = source.height() as i32;
++    // Арифметика повторяет multiply_i/add_i байткода, то есть переполнение заворачивается.
++    let out_width = source_width.wrapping_add(pad.wrapping_mul(2));
++    let out_height = source_height.wrapping_add(pad.wrapping_mul(2));
++
++    // Новый холст — настоящим конструктором: те же проверки размеров и та же инициализация.
++    // Ошибка конструктора (например, отрицательный размер) отдаёт весь метод байткоду, который
++    // бросит то же исключение; наблюдаемых следов к этому моменту ещё нет.
++    let out_value = activation
++        .avm2()
++        .classes()
++        .bitmapdata
++        .construct(
++            activation,
++            &[
++                out_width.into(),
++                out_height.into(),
++                false.into(),
++                0.into(),
++            ],
++        )
++        .ok()?;
++    let out_object = out_value.as_object()?;
++    let target = out_object.as_bitmap_data()?;
++
++    // out.copyPixels(src, src.rect, new Point(pad, pad))
++    crate::bitmap::operations::copy_pixels(
++        activation.context,
++        target,
++        source,
++        (0, 0, source_width, source_height),
++        (pad, pad),
++        false,
++    );
++
++    // Поля рамки: крайний пиксель исходника растягивается наружу. Байткод шёл циклом по всей
++    // картинке, пропуская середину, — набор записанных пикселей тот же.
++    for y in 0..out_height {
++        for x in 0..out_width {
++            if x >= pad
++                && x < pad.wrapping_add(source_width)
++                && y >= pad
++                && y < pad.wrapping_add(source_height)
++            {
++                continue;
++            }
++            let mut clamped_x = (source_width - 1).min(x - pad);
++            if clamped_x < 0 {
++                clamped_x = 0;
++            }
++            let mut clamped_y = (source_height - 1).min(y - pad);
++            if clamped_y < 0 {
++                clamped_y = 0;
++            }
++            let color = crate::bitmap::operations::get_pixel32(
++                source,
++                activation.context.renderer,
++                clamped_x as u32,
++                clamped_y as u32,
++            );
++            let mc = activation.gc();
++            crate::bitmap::operations::set_pixel32(
++                mc,
++                activation.context.renderer,
++                target,
++                x as u32,
++                y as u32,
++                color,
++            );
++        }
++    }
++
++    // src.dispose() — вместе с перезаливкой пустых текстур Stage3D, как в родной реализации
++    // (см. globals `BitmapData.dispose`): это последний момент, когда содержимое ещё доступно.
++    let stage3ds: Vec<_> = activation.context.stage.stage3ds().iter().copied().collect();
++    for stage3d in stage3ds {
++        if let Some(context3d) = stage3d.context3d() {
++            context3d.retry_empty_uploads(activation.context, true);
++        }
++    }
++    source.dispose(activation.gc());
++
++    Some(out_value)
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -4474,7 +4587,8 @@ pub fn snapshot<'gc>(
+         | NativeMethod::BspCollectFaces
+         | NativeMethod::WrapperCreate
+         | NativeMethod::ConflictClip
+-        | NativeMethod::SortByAverageZ => return None,
++        | NativeMethod::SortByAverageZ
++        | NativeMethod::PadTexture => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -4554,6 +4668,7 @@ pub fn run<'gc>(
+         NativeMethod::WrapperCreate => wrapper_create(activation, method),
+         NativeMethod::ConflictClip => conflict_clip(activation),
+         NativeMethod::SortByAverageZ => sort_faces_entry(activation),
++        NativeMethod::PadTexture => pad_texture(activation),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+-- 
+2.51.1.windows.1
+

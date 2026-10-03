@@ -1,0 +1,837 @@
+From 3ce031a2234e8bcd9976019f7f5a811c1cdf5f8b Mon Sep 17 00:00:00 2001
+From: Konstantin <38701987+SteepMans@users.noreply.github.com>
+Date: Tue, 18 Aug 2026 09:07:42 +0300
+Subject: [PATCH 2/2] core: native sphere tests, dynamic BSP face collection
+ and wrapper pool
+
+---
+ core/src/avm2/activation.rs |   2 +-
+ core/src/avm2/fast_paths.rs | 708 +++++++++++++++++++++++++++++++++++-
+ 2 files changed, 702 insertions(+), 8 deletions(-)
+
+diff --git a/core/src/avm2/activation.rs b/core/src/avm2/activation.rs
+index 0c8296c0..d936c279 100644
+--- a/core/src/avm2/activation.rs
++++ b/core/src/avm2/activation.rs
+@@ -709,7 +709,7 @@ impl<'a, 'gc> Activation<'a, 'gc> {
+         };
+         let native_wrote = crate::avm2::fast_paths::snapshot(self, native, method);
+         if let Some(before) = &before {
+-            before.restore(self.gc());
++            before.restore(self);
+         }
+ 
+         let interpreted = self.run_actions_inner(method, &mut executed_ops);
+diff --git a/core/src/avm2/fast_paths.rs b/core/src/avm2/fast_paths.rs
+index 070747e4..f884a194 100644
+--- a/core/src/avm2/fast_paths.rs
++++ b/core/src/avm2/fast_paths.rs
+@@ -74,6 +74,14 @@ pub enum NativeMethod {
+     SetTextureAt,
+     /// Установка вершинного буфера через теневое состояние устройства.
+     SetVertexBufferAt,
++    /// Пересечение габаритного ящика со сферой.
++    BoundIntersectSphere,
++    /// Сфера объекта по пяти точкам в его локальных координатах.
++    CalculateSphere,
++    /// Сбор граней динамического BSP, задетых сферой объекта.
++    BspCollectFaces,
++    /// Выдача звена из пула свободных.
++    WrapperCreate,
+ }
+ 
+ impl NativeMethod {
+@@ -94,6 +102,12 @@ impl NativeMethod {
+             ("VG", "calculateOOBB") => Some(Self::CalculateOobb),
+             ("Device", "setTextureAt") => Some(Self::SetTextureAt),
+             ("Device", "setVertexBufferAt") => Some(Self::SetVertexBufferAt),
++            ("Object3D", "boundIntersectSphere") => Some(Self::BoundIntersectSphere),
++            ("Object3D", "calculateSphere") => Some(Self::CalculateSphere),
++            ("BSP", "d33b25fe") => Some(Self::BspCollectFaces),
++            // У create и createStatic общий быстрый путь: оба выдают голову списка свободных,
++            // различаются они только веткой с пустым пулом, а её считает интерпретатор.
++            ("Wrapper", "create") | ("Wrapper", "createStatic") => Some(Self::WrapperCreate),
+             _ => None,
+         }
+     }
+@@ -107,6 +121,7 @@ impl NativeMethod {
+                 | Self::CalculateOobb
+                 | Self::SetTextureAt
+                 | Self::SetVertexBufferAt
++                | Self::BspCollectFaces
+         )
+     }
+ 
+@@ -2169,6 +2184,544 @@ fn calculate_oobb<'gc>(
+     Some(Value::Undefined)
+ }
+ 
++/// Номера слотов `flash.geom.Vector3D` (x, y, z, w). Класс один на всю программу, поэтому кэш
++/// без ключа: достаточно сверить таблицу методов конкретного объекта.
++#[derive(Clone, Copy)]
++struct Vector3dSlots {
++    coords: [usize; 4],
++    vtable: u32,
++}
++
++thread_local! {
++    static VECTOR3D_SLOTS: RefCell<Option<Vector3dSlots>> = const { RefCell::new(None) };
++    static VECTOR3D_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn vector3d_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    sample: Object<'gc>,
++) -> Option<Vector3dSlots> {
++    if let Some(slots) = VECTOR3D_SLOTS.with(|cache| *cache.borrow()) {
++        if sample.vtable().id() == slots.vtable {
++            return Some(slots);
++        }
++        return None;
++    }
++    if VECTOR3D_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++    let mut coords = [0usize; 4];
++    for (at, name) in ["x", "y", "z", "w"].iter().enumerate() {
++        match slot_of(activation, sample, name, false) {
++            Some(slot) => coords[at] = slot,
++            None => {
++                VECTOR3D_HOPELESS.with(|flag| flag.set(true));
++                return None;
++            }
++        }
++    }
++    let slots = Vector3dSlots {
++        coords,
++        vtable: sample.vtable().id(),
++    };
++    VECTOR3D_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++    Some(slots)
++}
++
++/// Четыре координаты Vector3D. Незаполненное поле Number читается как NaN — как и в байткоде.
++fn read_vector3d<'gc>(object: Object<'gc>, slots: &Vector3dSlots) -> [f64; 4] {
++    let mut out = [0.0f64; 4];
++    for at in 0..4 {
++        out[at] = object
++            .get_slot(slots.coords[at])
++            .try_as_f64()
++            .unwrap_or(f64::NAN);
++    }
++    out
++}
++
++/// `Object3D.boundIntersectSphere` — задевает ли сфера габаритный ящик. Шестьдесят восемь тысяч
++/// вызовов в секунду при вставке динамики в BSP/KD-дерево; сам метод — шесть сравнений.
++fn bound_intersect_sphere<'gc>(activation: &mut Activation<'_, 'gc>) -> Option<Value<'gc>> {
++    let sphere = activation.local_register(1).as_object()?;
++    let v3 = vector3d_slots(activation, sphere)?;
++    let mut bound = [0.0f64; 6];
++    for (at, cell) in bound.iter_mut().enumerate() {
++        *cell = activation.local_register(2 + at as u32).try_as_f64()?;
++    }
++    let [x, y, z, w] = read_vector3d(sphere, &v3);
++    // Порядок сравнений и их поведение на NaN повторяют байткод: && обрывается на первом false.
++    let hit = x + w > bound[0]
++        && x - w < bound[3]
++        && y + w > bound[1]
++        && y - w < bound[4]
++        && z + w > bound[2]
++        && z - w < bound[5];
++    Some(Value::Bool(hit))
++}
++
++/// Куда `calculateSphere` пишет ответ: в переданный Vector3D или в статическую заготовку класса.
++fn calculate_sphere_out<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++) -> Option<Object<'gc>> {
++    match activation.local_register(6) {
++        Value::Object(out) => Some(out),
++        Value::Null => {
++            let class_object: Object<'gc> = declaring_class(method)?.into();
++            let slot = slot_by_local_name(class_object, "f6e59469")?;
++            class_object.get_slot(slot).as_object()
++        }
++        _ => None,
++    }
++}
++
++/// `Object3D.calculateSphere` — сфера объекта: пять точек переводятся обратной матрицей в его
++/// локальные координаты, радиус — наибольшее расстояние от первой. Считается при каждой вставке
++/// динамики в дерево, около двадцати тысяч раз в секунду. Обратная матрица считается уже
++/// имеющимся нативным переводом.
++fn calculate_sphere<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let slots = matrix_slots(activation, declaring_class(method)?, this)?;
++
++    let mut points = [this; 5];
++    for (at, point) in points.iter_mut().enumerate() {
++        *point = activation.local_register(1 + at as u32).as_object()?;
++    }
++    let v3 = vector3d_slots(activation, points[0])?;
++    for point in points.iter() {
++        if point.vtable().id() != v3.vtable {
++            return None;
++        }
++    }
++    let out = calculate_sphere_out(activation, method)?;
++    if out.vtable().id() != v3.vtable {
++        return None;
++    }
++
++    let mc = activation.gc();
++    calculate_inverse_matrix(activation, this, &slots, mc)?;
++
++    let im_slots = [
++        slots.e_ima, slots.e_imb, slots.e_imc, slots.e_imd, slots.e_ime, slots.e_imf,
++        slots.e_img, slots.e_imh, slots.e_imi, slots.e_imj, slots.e_imk, slots.e_iml,
++    ];
++    let mut im = [0.0f64; 12];
++    for (at, slot) in im_slots.iter().enumerate() {
++        im[at] = this.get_slot(*slot).try_as_f64()?;
++    }
++
++    let mut local = [[0.0f64; 3]; 5];
++    for (at, point) in points.iter().enumerate() {
++        let [x, y, z, _] = read_vector3d(*point, &v3);
++        local[at] = [
++            im[0] * x + im[1] * y + im[2] * z + im[3],
++            im[4] * x + im[5] * y + im[6] * z + im[7],
++            im[8] * x + im[9] * y + im[10] * z + im[11],
++        ];
++    }
++
++    let center = local[0];
++    let mut best = {
++        let dx = local[1][0] - center[0];
++        let dy = local[1][1] - center[1];
++        let dz = local[1][2] - center[2];
++        dx * dx + dy * dy + dz * dz
++    };
++    for corner in local.iter().skip(2) {
++        let dx = corner[0] - center[0];
++        let dy = corner[1] - center[1];
++        let dz = corner[2] - center[2];
++        let dist = dx * dx + dy * dy + dz * dz;
++        // Сравнение повторяет `ifngt`: на NaN наибольшее не двигается.
++        if dist > best {
++            best = dist;
++        }
++    }
++
++    set(out, v3.coords[0], center[0], mc);
++    set(out, v3.coords[1], center[1], mc);
++    set(out, v3.coords[2], center[2], mc);
++    set(out, v3.coords[3], best.sqrt(), mc);
++    Some(Value::Object(out))
++}
++
++/// Номера слотов узла динамического BSP и матрицы объекта.
++#[derive(Clone, Copy)]
++struct BspSlots {
++    /// ma..ml на самом объекте (наследнике Object3D).
++    m: [usize; 12],
++    /// Узел: нормаль плоскости, смещение, поддеревья, цепочка граней.
++    node_normal: [usize; 3],
++    node_offset: usize,
++    node_positive: usize,
++    node_negative: usize,
++    node_face_list: usize,
++    node_vtable: u32,
++}
++
++/// Слоты грани, звена и вершины для обхода BSP. Разбираются отдельно: у пустого дерева живой
++/// грани нет, и этот разбор откладывается до первой встреченной.
++#[derive(Clone, Copy)]
++struct BspFaceSlots {
++    face_wrapper: usize,
++    face_next: usize,
++    face_vtable: u32,
++    wrapper_vertex: usize,
++    wrapper_next: usize,
++    wrapper_vtable: u32,
++    vertex_local: [usize; 3],
++    vertex_camera: [usize; 3],
++    vertex_vtable: u32,
++}
++
++thread_local! {
++    static BSP_SLOTS: RefCell<Option<(u32, BspSlots)>> = const { RefCell::new(None) };
++    static BSP_FACE_SLOTS: RefCell<Option<BspFaceSlots>> = const { RefCell::new(None) };
++    static BSP_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++fn bsp_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
++    this: Object<'gc>,
++    node: Object<'gc>,
++) -> Option<BspSlots> {
++    let key = class_object.vtable().id();
++    if let Some((known, slots)) = BSP_SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if BSP_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Option<BspSlots> {
++        let m_names = [
++            "ma", "mb", "mc", "md", "me", "mf", "mg", "mh", "mi", "mj", "mk", "ml",
++        ];
++        let mut m = [0usize; 12];
++        for at in 0..12 {
++            m[at] = slot_of(activation, this, m_names[at], true)?;
++        }
++        Some(BspSlots {
++            m,
++            node_normal: [
++                slot_of(activation, node, "normalX", false)?,
++                slot_of(activation, node, "normalY", false)?,
++                slot_of(activation, node, "normalZ", false)?,
++            ],
++            node_offset: slot_of(activation, node, "offset", false)?,
++            node_positive: slot_of(activation, node, "positive", false)?,
++            node_negative: slot_of(activation, node, "negative", false)?,
++            node_face_list: slot_of(activation, node, "faceList", false)?,
++            node_vtable: node.vtable().id(),
++        })
++    };
++    match resolve(activation) {
++        Some(slots) => {
++            BSP_SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++            Some(slots)
++        }
++        None => {
++            // Разбор опирается только на имена, поэтому неудача окончательна.
++            BSP_HOPELESS.with(|flag| flag.set(true));
++            None
++        }
++    }
++}
++
++fn bsp_face_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    face: Object<'gc>,
++) -> Option<BspFaceSlots> {
++    if let Some(slots) = BSP_FACE_SLOTS.with(|cache| *cache.borrow()) {
++        return Some(slots);
++    }
++    if BSP_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++
++    let resolve = |activation: &mut Activation<'_, 'gc>| -> Result<BspFaceSlots, bool> {
++        let face_wrapper = slot_of(activation, face, "wrapper", true).ok_or(true)?;
++        let wrapper = face
++            .get_slot(face_wrapper)
++            .as_object()
++            .ok_or(("звено ещё не заполнено", false).1)?;
++        let wrapper_vertex = slot_of(activation, wrapper, "vertex", true).ok_or(true)?;
++        let vertex = wrapper
++            .get_slot(wrapper_vertex)
++            .as_object()
++            .ok_or(("вершина ещё не заполнена", false).1)?;
++        Ok(BspFaceSlots {
++            face_wrapper,
++            face_next: slot_of(activation, face, "next", true).ok_or(true)?,
++            face_vtable: face.vtable().id(),
++            wrapper_vertex,
++            wrapper_next: slot_of(activation, wrapper, "next", true).ok_or(true)?,
++            wrapper_vtable: wrapper.vtable().id(),
++            vertex_local: [
++                slot_of(activation, vertex, "x", false).ok_or(true)?,
++                slot_of(activation, vertex, "y", false).ok_or(true)?,
++                slot_of(activation, vertex, "z", false).ok_or(true)?,
++            ],
++            vertex_camera: [
++                slot_of(activation, vertex, "cameraX", true).ok_or(true)?,
++                slot_of(activation, vertex, "cameraY", true).ok_or(true)?,
++                slot_of(activation, vertex, "cameraZ", true).ok_or(true)?,
++            ],
++            vertex_vtable: vertex.vtable().id(),
++        })
++    };
++    match resolve(activation) {
++        Ok(slots) => {
++            BSP_FACE_SLOTS.with(|cache| *cache.borrow_mut() = Some(slots));
++            Some(slots)
++        }
++        Err(hopeless) => {
++            if hopeless {
++                BSP_HOPELESS.with(|flag| flag.set(true));
++            }
++            None
++        }
++    }
++}
++
++/// Обход дерева BSP: по знаку расстояния сферы до плоскости узла спуск идёт в одно поддерево
++/// или, если сфера пересекает плоскость, забираются грани узла и спуск идёт в оба. Здесь только
++/// сбор и проверка классов — без единой записи: наполовину пройденный обход нельзя отдать
++/// байткоду, он продублировал бы грани в списке.
++fn bsp_scan<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    node: Object<'gc>,
++    slots: &BspSlots,
++    sphere: &[f64; 4],
++    depth: u32,
++    faces: &mut Vec<Object<'gc>>,
++) -> bool {
++    if depth > 512 || node.vtable().id() != slots.node_vtable {
++        return false;
++    }
++    let read = |slot: usize| node.get_slot(slot).try_as_f64().unwrap_or(f64::NAN);
++    let distance = read(slots.node_normal[0]) * sphere[0]
++        + read(slots.node_normal[1]) * sphere[1]
++        + read(slots.node_normal[2]) * sphere[2]
++        - read(slots.node_offset);
++
++    // Ветвление повторяет байткод, включая NaN: несравнимое расстояние ведёт в ветку граней.
++    if distance >= sphere[3] {
++        if let Some(positive) = node.get_slot(slots.node_positive).as_object() {
++            return bsp_scan(activation, positive, slots, sphere, depth + 1, faces);
++        }
++        return true;
++    }
++    if distance <= -sphere[3] {
++        if let Some(negative) = node.get_slot(slots.node_negative).as_object() {
++            return bsp_scan(activation, negative, slots, sphere, depth + 1, faces);
++        }
++        return true;
++    }
++
++    let mut face = node.get_slot(slots.node_face_list).as_object();
++    while let Some(current) = face {
++        let Some(face_slots) = bsp_face_slots(activation, current) else {
++            return false;
++        };
++        if current.vtable().id() != face_slots.face_vtable || faces.len() >= 200_000 {
++            return false;
++        }
++        let mut link = current.get_slot(face_slots.face_wrapper).as_object();
++        while let Some(wrapper) = link {
++            if wrapper.vtable().id() != face_slots.wrapper_vtable {
++                return false;
++            }
++            let Some(vertex) = wrapper.get_slot(face_slots.wrapper_vertex).as_object() else {
++                // Байткод на пустом звене бросил бы ошибку — пусть бросает сам.
++                return false;
++            };
++            if vertex.vtable().id() != face_slots.vertex_vtable {
++                return false;
++            }
++            link = wrapper.get_slot(face_slots.wrapper_next).as_object();
++        }
++        faces.push(current);
++        face = current.get_slot(face_slots.face_next).as_object();
++    }
++
++    for child_slot in [slots.node_positive, slots.node_negative] {
++        if let Some(child) = node.get_slot(child_slot).as_object()
++            && !bsp_scan(activation, child, slots, sphere, depth + 1, faces)
++        {
++            return false;
++        }
++    }
++    true
++}
++
++/// `BSP.d33b25fe` — сбор граней динамического BSP, задетых сферой вставляемого объекта: их
++/// вершины переводятся матрицей объекта, сами грани дописываются в список претендентов. В сценах
++/// с динамической сортировкой это до четверти кадра — шестьдесят с лишним тысяч вызовов в секунду.
++///
++/// Обход двухпроходный: сначала сбор с проверкой классов без единой записи, затем перевод вершин
++/// и дописывание. Порядок граней и значения совпадают с байткодом; чередование записей внутри
++/// обхода снаружи не наблюдаемо — метод не зовёт ничего чужого.
++fn bsp_collect_faces<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++) -> Option<Value<'gc>> {
++    let this = activation.local_register(0).as_object()?;
++    let node = activation.local_register(1).as_object()?;
++    let sphere = activation.local_register(2).as_object()?;
++    let list = activation.local_register(3).as_object()?;
++
++    let slots = bsp_slots(activation, declaring_class(method)?, this, node)?;
++    if node.vtable().id() != slots.node_vtable {
++        return None;
++    }
++    let v3 = vector3d_slots(activation, sphere)?;
++    {
++        let storage = list.as_vector_storage()?;
++        // Дописывание в вектор фиксированной длины байткод превращает в ошибку — уступаем ему.
++        if storage.is_fixed() {
++            return None;
++        }
++    }
++
++    let sphere_values = read_vector3d(sphere, &v3);
++    let mut matrix = [0.0f64; 12];
++    for (at, slot) in slots.m.iter().enumerate() {
++        matrix[at] = this.get_slot(*slot).try_as_f64()?;
++    }
++
++    let mut faces = Vec::new();
++    if !bsp_scan(activation, node, &slots, &sphere_values, 0, &mut faces) {
++        return None;
++    }
++
++    let mc = activation.gc();
++    if !faces.is_empty() {
++        let face_slots = BSP_FACE_SLOTS.with(|cache| *cache.borrow())?;
++        for face in faces.iter() {
++            let mut link = face.get_slot(face_slots.face_wrapper).as_object();
++            while let Some(wrapper) = link {
++                if let Some(vertex) = wrapper.get_slot(face_slots.wrapper_vertex).as_object() {
++                    let x = vertex
++                        .get_slot(face_slots.vertex_local[0])
++                        .try_as_f64()
++                        .unwrap_or(f64::NAN);
++                    let y = vertex
++                        .get_slot(face_slots.vertex_local[1])
++                        .try_as_f64()
++                        .unwrap_or(f64::NAN);
++                    let z = vertex
++                        .get_slot(face_slots.vertex_local[2])
++                        .try_as_f64()
++                        .unwrap_or(f64::NAN);
++                    let m = &matrix;
++                    set(
++                        vertex,
++                        face_slots.vertex_camera[0],
++                        m[0] * x + m[1] * y + m[2] * z + m[3],
++                        mc,
++                    );
++                    set(
++                        vertex,
++                        face_slots.vertex_camera[1],
++                        m[4] * x + m[5] * y + m[6] * z + m[7],
++                        mc,
++                    );
++                    set(
++                        vertex,
++                        face_slots.vertex_camera[2],
++                        m[8] * x + m[9] * y + m[10] * z + m[11],
++                        mc,
++                    );
++                }
++                link = wrapper.get_slot(face_slots.wrapper_next).as_object();
++            }
++        }
++        let mut storage = list.as_vector_storage_mut(mc)?;
++        for face in faces.iter() {
++            // Фиксированность проверена выше, ошибок push не даёт.
++            let _ = storage.push(Value::Object(*face), activation);
++        }
++    }
++    Some(Value::Undefined)
++}
++
++/// Номера слотов пула звеньев: статический список свободных на классе и `next` на звене.
++#[derive(Clone, Copy)]
++struct WrapperPoolSlots {
++    collector: usize,
++    next: usize,
++    wrapper_vtable: u32,
++}
++
++thread_local! {
++    static WRAPPER_POOL_SLOTS: RefCell<Option<(u32, WrapperPoolSlots)>> =
++        const { RefCell::new(None) };
++    static WRAPPER_POOL_HOPELESS: Cell<bool> = const { Cell::new(false) };
++}
++
++/// `Wrapper.create`/`createStatic` — выдача звена из списка свободных: шестьдесят пять тысяч
++/// вызовов в секунду при сборе прозрачной геометрии. Нативно распознаётся только непустой пул;
++/// пустой (нужен настоящий конструктор) уходит байткоду.
++fn wrapper_pool_slots<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    class_object: ClassObject<'gc>,
++    class_as_object: Object<'gc>,
++) -> Option<WrapperPoolSlots> {
++    let key = class_object.vtable().id();
++    if let Some((known, slots)) = WRAPPER_POOL_SLOTS.with(|cache| *cache.borrow())
++        && known == key
++    {
++        return Some(slots);
++    }
++    if WRAPPER_POOL_HOPELESS.with(|flag| flag.get()) {
++        return None;
++    }
++    let Some(collector) = slot_of(activation, class_as_object, "collector", true) else {
++        WRAPPER_POOL_HOPELESS.with(|flag| flag.set(true));
++        return None;
++    };
++    // next разбирается по живой голове пула: до первого возврата в пул её просто нет.
++    let head = class_as_object.get_slot(collector).as_object()?;
++    let Some(next) = slot_of(activation, head, "next", true) else {
++        WRAPPER_POOL_HOPELESS.with(|flag| flag.set(true));
++        return None;
++    };
++    let slots = WrapperPoolSlots {
++        collector,
++        next,
++        wrapper_vtable: head.vtable().id(),
++    };
++    WRAPPER_POOL_SLOTS.with(|cache| *cache.borrow_mut() = Some((key, slots)));
++    Some(slots)
++}
++
++fn wrapper_create<'gc>(
++    activation: &mut Activation<'_, 'gc>,
++    method: Method<'gc>,
++) -> Option<Value<'gc>> {
++    let class_object = declaring_class(method)?;
++    let class_as_object: Object<'gc> = class_object.into();
++    let slots = wrapper_pool_slots(activation, class_object, class_as_object)?;
++
++    let head = class_as_object.get_slot(slots.collector).as_object()?;
++    if head.vtable().id() != slots.wrapper_vtable {
++        return None;
++    }
++    let mc = activation.gc();
++    let next = head.get_slot(slots.next);
++    class_as_object.set_slot_no_coerce(slots.collector, next, mc);
++    head.set_slot_no_coerce(slots.next, Value::Null, mc);
++    Some(Value::Object(head))
++}
++
+ /// Поля `alternativa.gfx.core.Device`, через который движок грузит константы шейдера.
+ mod device_fields {
+     /// `RenderState` с теневыми наборами констант.
+@@ -2412,6 +2965,9 @@ pub struct Snapshot<'gc> {
+     /// списка — она переставляет `next` у всех звеньев, и без отката байткод считал бы уже не с
+     /// того входа.
+     links: Vec<(Object<'gc>, usize, Value<'gc>)>,
++    /// Векторы, которые метод дописывает, и их прежняя длина: откат укорачивает вектор, чтобы
++    /// байткод дописывал с того же места.
++    vectors: Vec<(Object<'gc>, usize)>,
+ }
+ 
+ /// Место, куда пишет заменяемый метод: поле объекта или элемент вектора.
+@@ -2428,7 +2984,15 @@ enum Place<'gc> {
+ 
+ impl<'gc> Snapshot<'gc> {
+     /// Вернуть поля в состояние до нативного счёта.
+-    pub fn restore(&self, mc: &Mutation<'gc>) {
++    pub fn restore(&self, activation: &mut Activation<'_, 'gc>) {
++        let mc = activation.gc();
++        for (vector, length) in self.vectors.iter() {
++            if let Some(mut storage) = vector.as_vector_storage_mut(mc) {
++                // Фиксированный вектор сюда не попадает: замены с дописыванием проверяют это до
++                // единственной записи.
++                let _ = storage.resize(*length, activation);
++            }
++        }
+         for (object, slot, value) in self.links.iter() {
+             object.set_slot_no_coerce(*slot, *value, mc);
+         }
+@@ -2513,7 +3077,7 @@ pub fn snapshot<'gc>(
+             links.push((current, slots.next, next));
+             node = next.as_object();
+         }
+-        return Some(Snapshot { fields, links });
++        return Some(Snapshot { fields, links, vectors: Vec::new() });
+     }
+ 
+     // Обходы структуры граней переписывают координаты у всех вершин дерева и габариты у самой
+@@ -2530,7 +3094,11 @@ pub fn snapshot<'gc>(
+             fields.push((Place::Slot(this, *slot), this.get_slot(*slot).try_as_f64()?));
+         }
+         vg_collect(face, &slots, &mut fields, 0);
+-        return Some(Snapshot { fields, links: Vec::new() });
++        return Some(Snapshot {
++            fields,
++            links: Vec::new(),
++            vectors: Vec::new(),
++        });
+     }
+ 
+     // Загрузка констант не возвращает ничего, и весь её видимый итог — отрезок теневого набора.
+@@ -2544,7 +3112,11 @@ pub fn snapshot<'gc>(
+                 shadow.get_optional(call.base + at)?.try_as_f64()?,
+             ));
+         }
+-        return Some(Snapshot { fields, links: Vec::new() });
++        return Some(Snapshot {
++            fields,
++            links: Vec::new(),
++            vectors: Vec::new(),
++        });
+     }
+ 
+     // Сборка ящика переписывает габариты и номер преобразования, координаты вершин дерева граней,
+@@ -2595,6 +3167,7 @@ pub fn snapshot<'gc>(
+         return Some(Snapshot {
+             fields,
+             links: Vec::new(),
++            vectors: Vec::new(),
+         });
+     }
+ 
+@@ -2613,7 +3186,116 @@ pub fn snapshot<'gc>(
+                 ));
+             }
+         }
+-        return Some(Snapshot { fields, links: Vec::new() });
++        return Some(Snapshot {
++            fields,
++            links: Vec::new(),
++            vectors: Vec::new(),
++        });
++    }
++
++    // Сфера объекта: пишутся обратная матрица и четыре координаты ответа; сам ответ сверяется
++    // ещё и по возвращённому объекту.
++    if native == NativeMethod::CalculateSphere {
++        let this = activation.local_register(0).as_object()?;
++        let slots = matrix_slots(activation, declaring_class(method)?, this)?;
++        let sample = activation.local_register(1).as_object()?;
++        let v3 = vector3d_slots(activation, sample)?;
++        let out = calculate_sphere_out(activation, method)?;
++        if out.vtable().id() != v3.vtable {
++            return None;
++        }
++        let im_slots = [
++            slots.e_ima, slots.e_imb, slots.e_imc, slots.e_imd, slots.e_ime, slots.e_imf,
++            slots.e_img, slots.e_imh, slots.e_imi, slots.e_imj, slots.e_imk, slots.e_iml,
++        ];
++        let mut fields = Vec::with_capacity(16);
++        for slot in im_slots {
++            fields.push((
++                Place::Slot(this, slot),
++                this.get_slot(slot).try_as_f64().unwrap_or(f64::NAN),
++            ));
++        }
++        for slot in v3.coords {
++            fields.push((
++                Place::Slot(out, slot),
++                out.get_slot(slot).try_as_f64().unwrap_or(f64::NAN),
++            ));
++        }
++        return Some(Snapshot {
++            fields,
++            links: Vec::new(),
++            vectors: Vec::new(),
++        });
++    }
++
++    // Сбор граней BSP: снимаются камерные координаты вершин задетых граней и длина списка
++    // претендентов; сам список откатывается до прежней длины, чтобы байткод дописывал с того же
++    // места. Набор задетых граней у сухого прохода тот же, что у счёта: он зависит только от
++    // сферы, матрицы и дерева, а их никто между снимками не меняет.
++    if native == NativeMethod::BspCollectFaces {
++        let this = activation.local_register(0).as_object()?;
++        let node = activation.local_register(1).as_object()?;
++        let sphere = activation.local_register(2).as_object()?;
++        let list = activation.local_register(3).as_object()?;
++        let slots = bsp_slots(activation, declaring_class(method)?, this, node)?;
++        if node.vtable().id() != slots.node_vtable {
++            return None;
++        }
++        let v3 = vector3d_slots(activation, sphere)?;
++        let length = list.as_vector_storage()?.length();
++        let sphere_values = read_vector3d(sphere, &v3);
++        let mut faces = Vec::new();
++        if !bsp_scan(activation, node, &slots, &sphere_values, 0, &mut faces) {
++            return None;
++        }
++        let mut fields = Vec::new();
++        if let Some(face_slots) = BSP_FACE_SLOTS.with(|cache| *cache.borrow()) {
++            for face in faces.iter() {
++                let mut link = face.get_slot(face_slots.face_wrapper).as_object();
++                while let Some(wrapper) = link {
++                    if let Some(vertex) =
++                        wrapper.get_slot(face_slots.wrapper_vertex).as_object()
++                    {
++                        for slot in face_slots.vertex_camera {
++                            fields.push((
++                                Place::Slot(vertex, slot),
++                                vertex.get_slot(slot).try_as_f64().unwrap_or(f64::NAN),
++                            ));
++                        }
++                    }
++                    link = wrapper.get_slot(face_slots.wrapper_next).as_object();
++                }
++            }
++        }
++        // Длина списка — сравнением: у обоих проходов она должна вырасти одинаково.
++        fields.push((Place::LinkAddress, length as f64));
++        return Some(Snapshot {
++            fields,
++            links: Vec::new(),
++            vectors: vec![(list, length)],
++        });
++    }
++
++    // Выдача звена из пула: откатываются голова пула и её `next`, а сверка идёт по возвращённому
++    // звену — оба прохода обязаны выдать один и тот же объект.
++    if native == NativeMethod::WrapperCreate {
++        let class_object = declaring_class(method)?;
++        let class_as_object: Object<'gc> = class_object.into();
++        let slots = wrapper_pool_slots(activation, class_object, class_as_object)?;
++        let head = class_as_object.get_slot(slots.collector).as_object()?;
++        let links = vec![
++            (
++                class_as_object,
++                slots.collector,
++                class_as_object.get_slot(slots.collector),
++            ),
++            (head, slots.next, head.get_slot(slots.next)),
++        ];
++        return Some(Snapshot {
++            fields: Vec::new(),
++            links,
++            vectors: Vec::new(),
++        });
+     }
+ 
+     // Методы, сверяемые по возвращённому числу, отсеиваются ДО разбора матричных слотов: разбор
+@@ -2639,7 +3321,11 @@ pub fn snapshot<'gc>(
+         | NativeMethod::ConflictSort
+         | NativeMethod::CalculateOobb
+         | NativeMethod::SetTextureAt
+-        | NativeMethod::SetVertexBufferAt => return None,
++        | NativeMethod::SetVertexBufferAt
++        | NativeMethod::BoundIntersectSphere
++        | NativeMethod::CalculateSphere
++        | NativeMethod::BspCollectFaces
++        | NativeMethod::WrapperCreate => return None,
+         NativeMethod::ComposeAndAppend => [
+             slots.e_ma,
+             slots.e_mb,
+@@ -2674,7 +3360,11 @@ pub fn snapshot<'gc>(
+     for slot in slots.iter() {
+         fields.push((Place::Slot(object, *slot), object.get_slot(*slot).try_as_f64()?));
+     }
+-    Some(Snapshot { fields, links: Vec::new() })
++    Some(Snapshot {
++        fields,
++        links: Vec::new(),
++        vectors: Vec::new(),
++    })
+ }
+ 
+ /// Объект класса, в котором объявлен выполняемый метод. Нужен ради статических полей движка
+@@ -2709,6 +3399,10 @@ pub fn run<'gc>(
+         NativeMethod::CalculateOobb => calculate_oobb(activation, method),
+         NativeMethod::SetTextureAt => set_texture_at(activation),
+         NativeMethod::SetVertexBufferAt => set_vertex_buffer_at(activation),
++        NativeMethod::BoundIntersectSphere => bound_intersect_sphere(activation),
++        NativeMethod::CalculateSphere => calculate_sphere(activation, method),
++        NativeMethod::BspCollectFaces => bsp_collect_faces(activation, method),
++        NativeMethod::WrapperCreate => wrapper_create(activation, method),
+         NativeMethod::ComposeAndAppend => {
+             let this = activation.local_register(0).as_object()?;
+             let parent = activation.local_register(1).as_object()?;
+-- 
+2.51.1.windows.1
+
